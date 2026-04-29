@@ -1,0 +1,6 @@
+[submodule "benchmarks/DCPerf"]
+	path = benchmarks/DCPerf
+	url = https://github.com/facebookresearch/DCPerf.git
+[submodule "benchmarks/fleetbench"]
+	path = benchmarks/fleetbench
+	url = git@github.com:google/fleetbench.git

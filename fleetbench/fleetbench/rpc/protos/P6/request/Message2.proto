@@ -1,0 +1,38 @@
+// Copyright 2023 The Fleetbench Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License" );
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an " AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// WARNING: DO NOT EDIT! This file is auto-generated.
+syntax = "proto2";
+
+package fleetbench.rpc.P6.request.Message2;
+
+message Message2 {
+  enum E1 {
+    E1_UNSPECIFIED = 0;
+    E1_CONST_1 = 63;
+    E1_CONST_2 = 17;
+    E1_CONST_3 = 79;
+    E1_CONST_4 = 11;
+    E1_CONST_5 = 36;
+  }
+  repeated E1 f_0 = 1 [packed = true];
+  message M1 {
+    optional int32 f_0 = 1;
+  }
+  repeated M1 f_2 = 2;
+  message M2 {
+    optional string f_0 = 1;
+  }
+  optional M2 f_3 = 3;
+}

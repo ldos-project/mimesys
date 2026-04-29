@@ -1,0 +1,24 @@
+optim:
+  optimizer: AdamW
+  lr: 2e-4
+  ema:
+    beta: 0.995
+    step_start_ema: 1000
+
+trainer:
+  trainer_model_name: ToyTrainer
+  max_epochs: 1000
+  precision: 16-mixed
+  strategy: ddp
+  accelerator: auto
+  devices: auto
+  gradient_clip_val: 1.0
+  check_val_every_n_epoch: 1
+  ckpt_path: ""
+
+callbacks:
+  checkpoint: 
+    save_top_k: -1
+    every_n_epochs: 500
+    monitor: val_loss_ema
+    dirpath: checkpoints/

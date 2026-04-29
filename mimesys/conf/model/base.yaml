@@ -1,0 +1,30 @@
+unet:
+    input_dim: 4
+    hidden_dim: 64
+    dropout: 0.1
+    dim_head: 32
+    num_heads: 4
+
+mlp:
+    input_dim: 4
+    hidden_dim: 64
+    dropout: 0.1
+
+diffusion:
+    n_timesteps: 25
+    clipped_denoised: True
+    cfg_args:
+        cfg_drop_prob: 0.2
+        cfg_guide_w: 3
+
+context:
+    input_dim: 800 # with additional
+    hidden_dim: 256
+    context_dim: 256
+
+clip:
+    modality1_input_dim: 25
+    modality2_input_dim: 23
+    modality1: transformer
+    modality2: transformer
+    embed_dim: 128

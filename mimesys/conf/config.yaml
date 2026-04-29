@@ -1,0 +1,6 @@
+defaults:
+  - model: base
+  - train: base
+  - data: base
+  - log: base
+  - profiler: base

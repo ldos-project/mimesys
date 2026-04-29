@@ -1,0 +1,85 @@
+// Copyright 2023 The Fleetbench Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License" );
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an " AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// WARNING: DO NOT EDIT! This file is auto-generated.
+syntax = "proto2";
+
+package fleetbench.rpc.P6.request.Message1;
+
+message Message1 {
+  enum E1 {
+    E1_UNSPECIFIED = 0;
+    E1_CONST_1 = 5;
+    E1_CONST_2 = 8;
+    E1_CONST_3 = 63;
+    E1_CONST_4 = 17;
+    E1_CONST_5 = 92;
+  }
+  repeated E1 f_0 = 1 [packed = true];
+  repeated bytes f_1 = 2 ;
+  optional fixed32 f_2 = 3;
+  repeated bytes f_3 = 4 ;
+  optional string f_4 = 6;
+  optional int32 f_5 = 7;
+  optional int32 f_6 = 8;
+  enum E2 {
+    E2_UNSPECIFIED = 0;
+    E2_CONST_1 = 7;
+    E2_CONST_2 = 77;
+    E2_CONST_3 = 2;
+    E2_CONST_4 = 1;
+    E2_CONST_5 = 114;
+  }
+  repeated E2 f_7 = 9 [packed = true];
+  enum E3 {
+    E3_UNSPECIFIED = 0;
+    E3_CONST_1 = 56;
+    E3_CONST_2 = 80;
+    E3_CONST_3 = 94;
+    E3_CONST_4 = 92;
+    E3_CONST_5 = 84;
+  }
+  repeated E3 f_8 = 11 [packed = true];
+  optional bool f_9 = 12;
+  optional string f_10 = 13;
+  optional int32 f_11 = 14;
+  repeated bytes f_12 = 15 ;
+  optional fixed32 f_13 = 16;
+  optional int32 f_14 = 17;
+  optional bool f_15 = 18;
+  optional string f_16 = 20;
+  optional int32 f_17 = 21;
+  optional fixed32 f_18 = 22;
+  optional bytes f_19 = 23;
+  message M1 {
+    enum E4 {
+      E4_UNSPECIFIED = 0;
+      E4_CONST_1 = 97;
+      E4_CONST_2 = 93;
+      E4_CONST_3 = 38;
+      E4_CONST_4 = 19;
+      E4_CONST_5 = 87;
+    }
+    repeated E4 f_0 = 1 [packed = true];
+  }
+  optional M1 f_25 = 25;
+  message M2 {
+    repeated bytes f_0 = 1 ;
+    optional fixed32 f_1 = 2;
+    optional fixed32 f_2 = 3;
+    optional bool f_3 = 4;
+    optional bool f_4 = 5;
+  }
+  optional M2 f_26 = 26;
+}

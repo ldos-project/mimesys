@@ -1,0 +1,81 @@
+# Copyright 2022 The Fleetbench Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Require c++17 for c++ files.
+build --cxxopt='-std=c++17'
+build --host_cxxopt='-std=c++17'
+
+# Enable libpfm (performance counters) by default. This corresponds to
+# the config setting in the benchmark library:
+# https://github.com/google/benchmark/blob/d99cdd7356de97b3056684d6b511189778d8a247/BUILD.bazel#L47
+build --define=pfm=1
+# Disable RLS and XDS support in gRPC. We don't need these and they take
+# a long time to build.
+build --@com_github_grpc_grpc//:disable_grpc_rls
+build --define=grpc_no_xds=true
+test --test_timeout=1500
+
+# Enable bounds-checking assertions in LLVM libcpp containers by default.
+build --copt='-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST'
+
+# Define the --config=asan-libfuzzer configuration.
+build:asan-libfuzzer --@rules_fuzzing//fuzzing:cc_engine=@rules_fuzzing//fuzzing/engines:libfuzzer
+build:asan-libfuzzer --@rules_fuzzing//fuzzing:cc_engine_instrumentation=libfuzzer
+build:asan-libfuzzer --@rules_fuzzing//fuzzing:cc_engine_sanitizer=asan
+
+# Common compiler flags.
+build --copt='-fno-exceptions'
+build --copt='-funsigned-char'
+build --copt='-fno-strict-aliasing'
+build --copt='-fno-omit-frame-pointer'
+
+# Compile for the native architecture. This can be overridden with
+# --config=haswell, --config=westmere or --copt=-march=xyz
+build --copt='-march=native'
+
+# Optimized build. Prefer this for benchmarking.
+build:opt --compilation_mode=opt
+build:opt --copt='-O3'
+build:opt --copt='-momit-leaf-frame-pointer'
+
+build:opt --force_pic
+
+# Clang-specific flags and settings.
+# Define --config=clang. clang must be in the PATH.
+build:clang --repo_env=CC=clang --repo_env=CXX=clang++
+# Prevent warnings about gcc-specific arguments from --fdo_optimize.
+build:clang --copt='-Wno-ignored-optimization-argument'
+# Allow instrprof_error::hash_mismatch profiles.
+build:clang --copt='-Wno-error=backend-plugin'
+build:clang --copt='-faligned-allocation'
+build:clang --copt='-fnew-alignment=8'
+
+# Cache clang artifacts in a different directory.
+build:clang --platform_suffix=clang
+
+# Architecture-specific optimizations.
+build:haswell --copt='-march=haswell'
+build:haswell --copt='-m64'
+build:haswell --copt='-maes'
+build:haswell --copt='-mprefer-vector-width=128'
+
+build:westmere --copt='-march=westmere'
+build:westmere --copt='-m64'
+build:westmere --copt='-maes'
+build:westmere --copt='-mcx16'
+build:westmere --copt='-mpclmul'
+build:westmere --copt='-mprefer-vector-width=128'
+build:westmere --copt='-msse4.2'
+
+build:arm --copt='-mtune=generic'

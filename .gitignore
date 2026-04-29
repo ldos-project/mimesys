@@ -1,0 +1,21 @@
+*.egg-info
+**/__pycache__
+generated_toy_data
+*.ckpt
+wandb/
+outputs/
+*.jpg
+*.png
+*.zip
+*.h5
+*.csv
+**/predicted/
+**/dataset/
+**/diffusion/
+**/predicted_actions/
+
+# uv / venv
+.venv/
+
+# logs
+*.log

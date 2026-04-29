@@ -1,0 +1,13 @@
+BM_COMPRESSION_ZSTD_DECOMPRESS_Fleet/compression_level:0/window_log:0
+BM_HASHING_Extendcrc32cinternal_Fleet_cold
+BM_HASHING_Computecrc32c_Fleet_cold
+BM_LIBC_Memcpy_Fleet_L1
+BM_SIMD_SerialDistanceComputation/num_blocks:256/enable_avx512:false/flush_cache:false
+BM_SIMD_SerialDistanceComputation/num_blocks:512/enable_avx512:false/flush_cache:false
+BM_SWISSMAP_InsertMiss_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:0
+BM_SWISSMAP_InsertManyOrdered_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:0
+BM_SWISSMAP_InsertManyOrdered_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:1
+BM_SWISSMAP_InsertManyUnordered_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:1
+BM_STRESS_NG_Readahead
+BM_STRESS_NG_Fallocate_4MB
+BM_STRESS_NG_Hdd_1MB
