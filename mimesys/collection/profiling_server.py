@@ -15,14 +15,10 @@ from typing import Optional
 import re
 import numpy as np
 
-from mimesys.preprocessing.parsers import parse_trace_file, process_trace, process_trace_fine_grained, aggregate_profiled_metrics, process_trace_all
+from mimesys.preprocessing.parsers import parse_trace_file, process_trace_all
 
-from mimesys.schema.constants import max_time_steps
 import json
-from scipy.stats import wasserstein_distance
 from collections import defaultdict
-import pickle
-import matplotlib.pyplot as plt
 import h5py
 import random
 
@@ -45,83 +41,6 @@ class ProfileRequest(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
-
-def visualize_system_traces(step: int, batch_idx: int, num_trials: int, validation_data_path: str, min_max_pkl: str = ""):
-    ground_truth_path = f"{validation_data_path}/step_{step}_batch_{batch_idx}/system_traces.json"
-
-    with open(ground_truth_path, "r") as f:
-        ground_truth = json.load(f)
-
-
-    predicted_traces_list = []
-    for trial_idx in range(num_trials):
-        predicted_path = f"{validation_data_path}/step_{step}_batch_{batch_idx}/system_traces_predicted_{trial_idx}.json"
-        with open(predicted_path, "r") as f:
-            predicted_traces = json.load(f)
-        predicted_traces_list.append(predicted_traces)
-
-
-    # Here you can implement your visualization logic, e.g., using matplotlib or seaborn
-    # For demonstration, we will just print the keys of the traces
-    # print(f"Ground Truth Traces: {list(ground_truth.keys())}")
-    # for trial_idx, predicted_traces in enumerate(predicted_traces_list):
-    #     print(f"Predicted Traces for Trial {trial_idx}: {list(predicted_traces.keys())}")
-
-    if min_max_pkl:
-        with open(min_max_pkl, "rb") as f:
-            min_max = pickle.load(f)
-
-    trace_types = list(ground_truth.keys())
-    num_traces = len(trace_types)
-
-    # fig, axes = plt.subplots(num_traces, 1, figsize=(10, 4 * num_traces), squeeze=False)
-    # axes = axes.flatten()
-
-    gt_predicted_traces = defaultdict(list)
-    for idx, trace_type in enumerate(trace_types):
-        # hardcoded bugfix
-        gt = ground_truth[trace_type]
-
-        if min_max:
-            min_val, max_val = min_max[trace_type]
-            gt = [(metric - min_val) / (max_val - min_val) * 100 for metric in gt]
-
-        gt_idx = idx
-
-        # ax = axes[gt_idx]
-        # ax.plot(gt, label="Ground Truth", linewidth=2, color="blue")
-
-        # ax = axes[idx]
-        for trial_idx, predicted_traces in enumerate(predicted_traces_list):
-            if trace_type in predicted_traces:
-                if min_max:
-                    min_val, max_val = min_max[trace_type]
-                    predicted_traces[trace_type] = [
-                        (metric - min_val) / (max_val - min_val) * 100
-                        for metric in predicted_traces[trace_type]
-                    ]
-                # ax.plot(predicted_traces[trace_type], label=f"Predicted {trial_idx}", linestyle="--", linewidth=2, color="orange")
-        # ax.set_title(trace_type)
-        # ax.legend()
-        # ax.set_ylim(0, 100)
-        # ax.set_xlabel("Time Step")
-        # ax.set_ylabel("Value")
-
-        gt_predicted_traces[idx].append(predicted_traces[trace_type])
-        gt_predicted_traces[gt_idx].append(gt)
-
-
-    emd_by_traces = defaultdict(float)
-    for idx, traces in gt_predicted_traces.items():
-        if len(traces) < 2:
-            continue
-        emd = wasserstein_distance(traces[0], traces[1])
-        emd_by_traces[idx] = emd
-
-    # plt.tight_layout()
-    # plt.savefig(f"{validation_data_path}/step_{step}_batch_{batch_idx}/traces_predicted.png")
-
-    return emd_by_traces
 
 
 class Profiler:
@@ -248,9 +167,10 @@ class Profiler:
         )
 
         print("Start collection command")
+        mimesys_iters = os.environ.get("MIMESYS_ITERS", "1")
         machine.run_command_background(
             client=client,
-            command=f"cd /users/{self.user_name} && bash collect_mimesys_metrics.sh {self.user_name} {self.my_hostname} {destination_path} {host_idx} > collect_mimesys_metrics.log 2>&1"
+            command=f"cd /users/{self.user_name} && MIMESYS_ITERS={mimesys_iters} bash collect_mimesys_metrics.sh {self.user_name} {self.my_hostname} {destination_path} {host_idx} > collect_mimesys_metrics.log 2>&1"
         )
 
         print("Sent collection command")
@@ -694,66 +614,3 @@ class Profiler:
         found_files = await self.wait_for_files([i for i in range(len(machines))], destination_path)
         plan_stat_pairs = self.parse_metrics_from_zip(found_files, destination_path, skip_parsing)
         return plan_stat_pairs
-
-if __name__ == "__main__":
-    emd_by_traces = defaultdict(list)
-    for step in range(70400, 70472):
-        for batch_idx in range(256):
-            emd = visualize_system_traces(
-                step=step,
-                batch_idx=batch_idx,
-                num_trials=1,
-                validation_data_path="/home/dhkim/workspace/stress_emulate/llm-app-generation/mimesys/stress_ng_dataloader/train/diffusion/stress_ng_training_10k_bs_1024_vis_lr5e-4_tacc_stats_3_rl/training",
-                min_max_pkl="/home/dhkim/tacc_stats_results/data/metrics_range_dict.pkl"
-            )
-
-            for trace_type, emd_value in emd.items():
-                emd_by_traces[trace_type].append(emd_value)
-
-        # Print the average EMD for each trace type
-        avg_emd_sum = 0
-        for trace_type, emd_values in emd_by_traces.items():
-            if emd_values:
-                avg_emd = sum(emd_values) / len(emd_values)
-                avg_emd_sum += avg_emd
-                print(f"Average EMD for {trace_type}: {avg_emd}")
-
-        print(f"Total Average EMD for step {step}: {avg_emd_sum / len(emd_by_traces)}")
-        with open("average_emd_results.txt", "a") as f:
-            f.write(f"{avg_emd_sum / len(emd_by_traces)}\n")
-        print("Profiler script executed successfully.")
-
-    exit(0)
-
-    # Prepare initialize parameters
-    initialize_params = {
-        "user_name": "dhkim",
-        "private_key_path": "/home/dhkim/.ssh/id_rsa_utns",
-        "worker_host_names": ["c220g2-010813.wisc.cloudlab.us"],
-        "my_hostname": "mew3"
-    }
-    # Prepare profile parameters
-    profile_params = {
-        "validation_data_path": "/home/dhkim/workspace/stress_emulate/llm-app-generation/mimesys/stress_ng_dataloader/train/diffusion/stress_ng_training_10k_bs_1024_vis_lr5e-4_tacc_stats_2",
-        "my_destination_path": "/home/dhkim/tacc_stats_results",
-        "step": 35200,
-        "num_batches": 10,
-        "num_trials": 5,
-    }
-
-    # Initialize Profiler
-    init_request = InitializeRequest(**initialize_params)
-    profiler = Profiler(init_request)
-
-    # Run async profile function
-    async def main():
-        profile_request = ProfileRequest(**profile_params)
-        await profiler.profile(profile_request)
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
-
-    pending = asyncio.all_tasks(loop=loop)
-    pending = [task for task in pending if not task.done()]
-    if pending:
-        loop.run_until_complete(asyncio.gather(*pending))

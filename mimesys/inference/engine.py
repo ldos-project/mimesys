@@ -32,6 +32,7 @@ import torch
 from mimesys.inference.baselines import (
     NearestNeighbor, LinearInterpolation, SingleStressor,
 )
+from mimesys.training.utils import initialize_diffusion_model
 
 # Action tensor dimensions: (STRESSORS, THREADS) = (13, 20)
 ACTION_STRESSORS: int = 13
@@ -102,7 +103,6 @@ class InferenceEngine:
         dataloader : CustomDataLoader instance (val_dataset used for baselines)
         device     : "cuda" or "cpu"
         """
-        from mimesys.training.utils import initialize_diffusion_model
 
         engine = cls()
         engine.device      = device
@@ -241,6 +241,7 @@ class InferenceEngine:
         traces:      list[dict[str, float]],
         n_chains:    int   = 3,
         cfg_guide_w: float = 3.0,
+        progress_cb=None,
     ) -> list[np.ndarray]:
         """
         Two-pass parallel generation — fully batched.
@@ -253,7 +254,7 @@ class InferenceEngine:
             [m2, a1] → a2',  [m3, a2] → a3',  ...,  [mT, a_{T-1}] → aT'
 
         Both passes run as a single p_sample_loop(batch_size=T) call, so the
-        total cost is 2 × n_chains denoising sweeps instead of 2×T.
+        total cost is 2 x n_chains denoising sweeps instead of 2xT.
 
         Returns the pass-2 predictions.
         """
@@ -265,7 +266,8 @@ class InferenceEngine:
         # ── Pass 1: all prev = -1 (None) ──────────────────────────────────────
         prev_none = -torch.ones(T, ACTION_STRESSORS, ACTION_THREADS, dtype=torch.float32)
         pass1_arr = self._diffusion_infer_batch(trace_norms, prev_none, n_chains, cfg_guide_w)
-        # pass1_arr: (T, STRESSORS, THREADS) in [0, 1]
+        if progress_cb:
+            progress_cb(1, 2)
 
         # ── Pass 2: prev[t] = pass1[t-1], keep pass1[0] for step 0 ───────────
         # Build prev tensor: slot 0 stays -1 (no predecessor), slots 1..T-1 use pass1[0..T-2]
@@ -275,17 +277,76 @@ class InferenceEngine:
             prev_pass2[1:] = torch.tensor(pass1_arr[:-1] * 2 - 1, dtype=torch.float32)
 
         pass2_arr = self._diffusion_infer_batch(trace_norms, prev_pass2, n_chains, cfg_guide_w)
+        if progress_cb:
+            progress_cb(2, 2)
         # step 0 had prev=-1 in both passes; override with pass1[0] for consistency
         pass2_arr[0] = pass1_arr[0]
 
         return [pass2_arr[t] for t in range(T)]
+
+    def generate_series_batch_parallel_refine(
+        self,
+        all_traces:  list[list[dict[str, float]]],
+        n_chains:    int   = 3,
+        cfg_guide_w: float = 3.0,
+        progress_cb=None,
+    ) -> list[list[np.ndarray]]:
+        """
+        Two-pass parallel generation for N jobs simultaneously.
+
+        All N jobs' time steps are concatenated into one flat batch of
+        shape (sum(T_i), trace_dim) so both passes cost a single
+        _diffusion_infer_batch call each — 2 total vs 2×N sequential calls.
+
+        Pass 1: all steps across all jobs with prev=-1.
+        Pass 2: per-job predecessor shift applied to the flat array, then one
+                more _diffusion_infer_batch call.
+        """
+        lengths = [len(t) for t in all_traces]
+        offsets = [sum(lengths[:i]) for i in range(len(lengths))]
+        total_T = sum(lengths)
+
+        # Flatten all traces from all jobs into one array
+        flat_norms = np.stack([
+            self.normalize_trace(trace)
+            for job_traces in all_traces
+            for trace in job_traces
+        ])  # (total_T, trace_dim)
+
+        # ── Pass 1: all prev = -1 ─────────────────────────────────────────────
+        prev_none = -torch.ones(total_T, ACTION_STRESSORS, ACTION_THREADS, dtype=torch.float32)
+        pass1_flat = self._diffusion_infer_batch(flat_norms, prev_none, n_chains, cfg_guide_w)
+        # (total_T, STRESSORS, THREADS) in [0, 1]
+        if progress_cb:
+            progress_cb(1, 2)
+
+        # ── Pass 2: prev[t] = pass1[t-1] per job, prev[0] = -1 ───────────────
+        prev_pass2 = -torch.ones(total_T, ACTION_STRESSORS, ACTION_THREADS, dtype=torch.float32)
+        for offset, length in zip(offsets, lengths):
+            if length > 1:
+                prev_pass2[offset + 1 : offset + length] = torch.tensor(
+                    pass1_flat[offset : offset + length - 1] * 2 - 1, dtype=torch.float32
+                )
+
+        pass2_flat = self._diffusion_infer_batch(flat_norms, prev_pass2, n_chains, cfg_guide_w)
+        if progress_cb:
+            progress_cb(2, 2)
+
+        # step 0 of each job: keep pass1[0] for consistency (no predecessor)
+        for offset in offsets:
+            pass2_flat[offset] = pass1_flat[offset]
+
+        return [
+            [pass2_flat[offset + t] for t in range(length)]
+            for offset, length in zip(offsets, lengths)
+        ]
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _encode_prev_action(
         self, prev_action: Optional[list[list[float]]]
     ) -> torch.Tensor:
-        """Convert [0,1]-valued list-of-lists → model-space tensor (−1 if None)."""
+        """Convert [0,1]-valued list-of-lists → model-space tensor (-1 if None)."""
         if prev_action is None:
             return -torch.ones(ACTION_STRESSORS, ACTION_THREADS, dtype=torch.float32)
         arr = np.array(prev_action, dtype=np.float32)
@@ -322,20 +383,25 @@ class InferenceEngine:
         prev_ts:     torch.Tensor, # (T, ACTION_STRESSORS, ACTION_THREADS)
         n_chains:    int,
         cfg_guide_w: float,
-        chunk_size:  int = 32,
+        chunk_size:  Optional[int] = None,
     ) -> np.ndarray:
         """
         Batched diffusion inference over T steps, processed in chunks to
         avoid OOM.  Runs n_chains passes per chunk and averages the results.
+
+        chunk_size defaults to T (full batch) and halves automatically on OOM.
 
         Returns
         -------
         np.ndarray of shape (T, ACTION_STRESSORS, ACTION_THREADS) in [0, 1].
         """
         T = trace_norms.shape[0]
+        if chunk_size is None:
+            chunk_size = T  # attempt full batch; halve on OOM
         self.model.cfg_guide_w = cfg_guide_w
         results = []
-        for start in range(0, T, chunk_size):
+        start = 0
+        while start < T:
             end = min(start + chunk_size, T)
             metric_t   = torch.tensor(
                 trace_norms[start:end], dtype=torch.float32
@@ -343,18 +409,90 @@ class InferenceEngine:
             prev_t_dev = prev_ts[start:end].to(self.device)
             B = end - start
             shape = (B, ACTION_STRESSORS, ACTION_THREADS)
-            with torch.no_grad():
-                preds = []
-                for _ in range(n_chains):
-                    chain = self.model.p_sample_loop(shape, {
-                        "metric":      metric_t,
-                        "prev_action": prev_t_dev,
-                    })
-                    preds.append(chain[-1].cpu())   # (B, STRESSORS, THREADS)
-            chunk_pred = torch.stack(preds).mean(0) # (B, STRESSORS, THREADS)
-            results.append(chunk_pred)
-        pred = torch.cat(results, dim=0)            # (T, STRESSORS, THREADS)
+            try:
+                with torch.no_grad():
+                    preds = []
+                    for _ in range(n_chains):
+                        chain = self.model.p_sample_loop(shape, {
+                            "metric":      metric_t,
+                            "prev_action": prev_t_dev,
+                        })
+                        preds.append(chain[-1].cpu())
+                chunk_pred = torch.stack(preds).mean(0)
+                results.append(chunk_pred)
+                start = end
+            except torch.cuda.OutOfMemoryError:
+                if chunk_size <= 1:
+                    raise
+                chunk_size = max(1, chunk_size // 2)
+                print(f"[engine] OOM — reducing chunk_size to {chunk_size}", flush=True)
+                torch.cuda.empty_cache()
+                # retry same start with smaller chunk
+        pred = torch.cat(results, dim=0)
         return ((pred.numpy() + 1) / 2.0).clip(0, 1)
+
+    def generate_series_batch(
+        self,
+        all_traces:           list[list[dict[str, float]]],
+        method:               str  = "diffusion",
+        initial_prev_actions: Optional[list] = None,
+        n_chains:             int   = 3,
+        cfg_guide_w:          float = 3.0,
+        progress_cb=None,
+    ) -> list[list[np.ndarray]]:
+        """
+        Generate plans for N jobs simultaneously using batched GPU inference.
+
+        For the diffusion method, all N jobs' step-t traces are stacked into
+        one (N, trace_dim) batch and passed through a single p_sample_loop call
+        at each step.  Total GPU calls = max_T  (vs  N x max_T  sequential).
+
+        Non-diffusion methods fall back to per-job generate_series (they are
+        already cheap O(1) lookups).
+
+        Returns list[N] of list[T_i] arrays, each (STRESSORS, THREADS) in [0,1].
+        """
+        N = len(all_traces)
+        if method != "diffusion":
+            return [
+                self.generate_series(traces, method, None, n_chains, cfg_guide_w)
+                for traces in all_traces
+            ]
+
+        max_T = max(len(t) for t in all_traces)
+
+        if initial_prev_actions is None:
+            initial_prev_actions = [None] * N
+        prev_ts = torch.stack([
+            self._encode_prev_action(ipa) for ipa in initial_prev_actions
+        ])  # (N, STRESSORS, THREADS)
+
+        all_preds: list[list[np.ndarray]] = [[] for _ in range(N)]
+
+        for step in range(max_T):
+            active = [step < len(job_traces) for job_traces in all_traces]
+
+            # Use last trace for jobs that ended early (won't be stored, just keeps batch full)
+            traces_at_step = np.stack([
+                self.normalize_trace(all_traces[i][min(step, len(all_traces[i]) - 1)])
+                for i in range(N)
+            ])  # (N, trace_dim)
+
+            preds_np = self._diffusion_infer_batch(
+                traces_at_step, prev_ts, n_chains, cfg_guide_w
+            )  # (N, STRESSORS, THREADS) in [0, 1]
+
+            for i in range(N):
+                if active[i]:
+                    all_preds[i].append(preds_np[i])
+
+            # Update prev for next step: [0,1] → model space [-1,1]
+            prev_ts = torch.tensor(preds_np * 2 - 1, dtype=torch.float32)
+
+            if progress_cb:
+                progress_cb(step + 1, max_T)
+
+        return all_preds
 
     def _build_baselines(self, dataloader) -> None:
         """Build cKDTree-backed predictors from the validation split."""

@@ -25,7 +25,6 @@ Examples
 """
 
 import argparse
-import torch
 import uvicorn
 
 from mimesys.inference.server import app, _state
@@ -42,8 +41,8 @@ def _parse_args() -> argparse.Namespace:
                    help="HTTP port (default: 8000)")
     p.add_argument("--host",             default="0.0.0.0",
                    help="Bind address (default: 0.0.0.0)")
-    p.add_argument("--exp",              default="stress_ng",
-                   help="Hydra experiment config name (default: stress_ng)")
+    p.add_argument("--exp",              default="pretrain",
+                   help="Hydra experiment config name (default: pretrain)")
     p.add_argument("--enable_profiling", action="store_true",
                    help="Enable POST /profile — requires CloudLab SSH access")
     p.add_argument("--device",           default=None,

@@ -3,14 +3,14 @@ FastAPI server for the stress-emulation inference service.
 
 Endpoints
 ---------
-  GET  /health                          – Liveness check
-  GET  /info                            – Model / hardware / config metadata
-  GET  /metrics                         – Supported input metrics with training-corpus ranges
-  POST /generate                        – Single time-step plan from one resource-usage snapshot
-  POST /generate/series                 – Long time-series: ordered list of traces → sequence of plans
-  POST /profile                         – Submit profiling job; returns job_id immediately
-  GET  /profile/jobs/{job_id}/stream    – SSE stream of progress events for a profiling job
-  GET  /profile/jobs/{job_id}/result    – Poll for the final result (or current status if pending)
+  GET  /health                          - Liveness check
+  GET  /info                            - Model / hardware / config metadata
+  GET  /metrics                         - Supported input metrics with training-corpus ranges
+  POST /generate                        - Single time-step plan from one resource-usage snapshot
+  POST /generate/series                 - Long time-series: ordered list of traces → sequence of plans
+  POST /profile                         - Submit profiling job; returns job_id immediately
+  GET  /profile/jobs/{job_id}/stream    - SSE stream of progress events for a profiling job
+  GET  /profile/jobs/{job_id}/result    - Poll for the final result (or current status if pending)
                                           (requires enable_profiling=True)
 
 Profile progress stages
@@ -20,15 +20,15 @@ Profile progress stages
 
 Generation methods
 ------------------
-  diffusion            – Pretrained diffusion model (autoregressive prev-action)
-  nearest_neighbor     – Closest training-set action by L2 trace distance
-  linear_interpolation – Inverse-distance-weighted blend of 5 nearest training actions
-  single_stressor      – Heuristic: map per-core CPU utilisation to the cpu stressor
+  diffusion            - Pretrained diffusion model (autoregressive prev-action)
+  nearest_neighbor     - Closest training-set action by L2 trace distance
+  linear_interpolation - Inverse-distance-weighted blend of 5 nearest training actions
+  single_stressor      - Heuristic: map per-core CPU utilisation to the cpu stressor
 """
 
 from __future__ import annotations
 
-import asyncio, io, json, os, tempfile, uuid, zipfile
+import asyncio, io, json, os, queue, tempfile, uuid, zipfile
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
@@ -39,6 +39,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+# Hydra config
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+
+from mimesys.schema.machine import Machine
+from mimesys.preprocessing.dataloader import CustomDataLoader
+from mimesys.preprocessing.parsers import parse_trace_file, process_trace_all
 from mimesys.inference.engine import (
     InferenceEngine,
     METRIC_KEYS, METRIC_UNITS, STRESSOR_NAMES,
@@ -53,9 +60,16 @@ _state: dict = {}
 # job_id → {stage, pct, message, result, error, events: asyncio.Queue}
 _jobs: dict[str, dict] = {}
 
+# batch_id → {job_ids, total}
+_batches: dict[str, dict] = {}
+
+# Thread-safe queue of available worker hostnames.  Populated at startup.
+# Each _profile_*_sync call pops one hostname (blocking), returns it when done.
+_worker_queue: queue.Queue = queue.Queue()
+
 TRAINING_HARDWARE = {
     "machine_type": "CloudLab c220g2",
-    "cpu":          "Intel Xeon E5-2660 v3 (2 sockets × 10 cores, 20 threads)",
+    "cpu":          "Intel Xeon E5-2660 v3 (2 sockets x 10 cores, 20 threads)",
     "memory":       "160 GB DDR4",
     "storage":      "480 GB SSD (Intel DC S3500)",
     "num_machines": 14,
@@ -69,7 +83,7 @@ TRAINING_HARDWARE = {
 METHOD_CHOICES = Literal[
     "diffusion", "nearest_neighbor", "linear_interpolation", "single_stressor"
 ]
-FORMAT_CHOICES = Literal["h5", "json", "stress_ng"]
+FORMAT_CHOICES = Literal["h5", "json"]
 STRATEGY_CHOICES = Literal["autoregressive", "parallel_refine"]
 
 
@@ -86,10 +100,10 @@ class GenerateRequest(BaseModel):
     method: METHOD_CHOICES = Field(
         "diffusion",
         description=(
-            "**diffusion** – pretrained diffusion model (best quality)  |  "
-            "**nearest_neighbor** – closest training-set action by L2 trace distance  |  "
-            "**linear_interpolation** – IDW blend of 5 nearest neighbours  |  "
-            "**single_stressor** – heuristic CPU-only baseline"
+            "**diffusion** - pretrained diffusion model (best quality)  |  "
+            "**nearest_neighbor** - closest training-set action by L2 trace distance  |  "
+            "**linear_interpolation** - IDW blend of 5 nearest neighbours  |  "
+            "**single_stressor** - heuristic CPU-only baseline"
         ),
     )
     prev_action: Optional[list[list[float]]] = Field(
@@ -104,9 +118,8 @@ class GenerateRequest(BaseModel):
     return_format: FORMAT_CHOICES = Field(
         "h5",
         description=(
-            "**h5** – HDF5 file (`execution_plan` shape (2, THREADS, STRESSORS))  |  "
-            "**json** – action tensor  |  "
-            "**stress_ng** – stress-ng CLI arguments"
+            "**h5** - HDF5 file (`execution_plan` shape (2, THREADS, STRESSORS))  |  "
+            "**json** - action tensor"
         ),
     )
 
@@ -131,9 +144,9 @@ class SeriesRequest(BaseModel):
     generation_strategy: STRATEGY_CHOICES = Field(
         "autoregressive",
         description=(
-            "**autoregressive** – each step uses the previous step's prediction as "
+            "**autoregressive** - each step uses the previous step's prediction as "
             "prev_action (default).  "
-            "**parallel_refine** – pass 1: all steps predicted with prev_action=None; "
+            "**parallel_refine** - pass 1: all steps predicted with prev_action=None; "
             "pass 2: all steps refined using the pass-1 predecessor as prev_action."
         ),
     )
@@ -164,8 +177,8 @@ class ProfileSeriesRequest(BaseModel):
     generation_strategy: STRATEGY_CHOICES = Field(
         "autoregressive",
         description=(
-            "**autoregressive** – each step uses the previous prediction as prev_action.  "
-            "**parallel_refine** – pass 1 with prev=None, pass 2 refined with pass-1 predecessor."
+            "**autoregressive** - each step uses the previous prediction as prev_action.  "
+            "**parallel_refine** - pass 1 with prev=None, pass 2 refined with pass-1 predecessor."
         ),
     )
     n_chains:            int   = Field(3, ge=1, le=10)
@@ -193,21 +206,6 @@ def _to_h5_bytes(actions: list[np.ndarray]) -> bytes:
     return buf.getvalue()
 
 
-def _to_stress_ng_text(actions: list[np.ndarray]) -> str:
-    """One commented line per time-step with the corresponding stress-ng arguments."""
-    lines = []
-    for t, act in enumerate(actions):
-        args = []
-        for s_idx, name in enumerate(STRESSOR_NAMES):
-            mean_act = float(act[s_idx].mean())
-            if mean_act < 0.05:
-                continue
-            n_workers = max(1, int(round(mean_act * ACTION_THREADS)))
-            args.append(f"--{name} {n_workers} --{name}-ops 10000")
-        lines.append(f"# t={t}  " + ("  ".join(args) if args else "(idle)"))
-    return "\n".join(lines)
-
-
 def _format_response(
     preds:       list[np.ndarray],
     fmt:         str,
@@ -229,8 +227,7 @@ def _format_response(
         body["action_shape"]   = [ACTION_STRESSORS, ACTION_THREADS]
         body["stressor_names"] = STRESSOR_NAMES
         return JSONResponse(body)
-    # stress_ng
-    return Response(content=_to_stress_ng_text(preds), media_type="text/plain")
+    return Response(status_code=400, content="Invalid format")
 
 
 # ---------------------------------------------------------------------------
@@ -245,9 +242,6 @@ async def lifespan(app: FastAPI):
     print(f"[server] Checkpoint : {args.ckpt}")
     print(f"[server] Device     : {device}")
 
-    # Hydra config
-    from hydra import compose, initialize_config_dir
-    from hydra.core.global_hydra import GlobalHydra
     _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     GlobalHydra.instance().clear()
     with initialize_config_dir(config_dir=os.path.join(_pkg_root, "conf"), version_base=None):
@@ -256,7 +250,6 @@ async def lifespan(app: FastAPI):
 
     # Dataloader (normalization ranges + baseline training data)
     print("[server] Building dataloader...")
-    from mimesys.preprocessing.dataloader import CustomDataLoader
     dl = CustomDataLoader(
         cfg.data.data_path, cfg.data.test_data_path,
         max_time_steps=2, batch_size=1, test_batch_size=1, aug_factor=1,
@@ -273,13 +266,15 @@ async def lifespan(app: FastAPI):
     _state["engine"] = engine
     print(
         f"[server] Ready — trace_dim={len(METRIC_KEYS)}, "
-        f"action=({ACTION_STRESSORS}×{ACTION_THREADS}), "
+        f"action=({ACTION_STRESSORS}x{ACTION_THREADS}), "
         f"epoch={engine.ckpt_meta['epoch']}"
     )
 
     _state["profiling_enabled"] = args.enable_profiling
     if args.enable_profiling:
-        print(f"[server] Remote profiling enabled ({len(cfg.data.test_machines)} workers)")
+        for h in cfg.data.test_machines:
+            _worker_queue.put(h)
+        print(f"[server] Remote profiling enabled — {_worker_queue.qsize()} workers in pool")
 
     yield
     print("[server] Shutting down.")
@@ -292,7 +287,7 @@ app = FastAPI(
     title="Stress-Emulation Inference Service",
     description=(
         "Diffusion-model inference service: accepts hardware resource-usage traces "
-        "and returns executable stress-ng execution plans for workload emulation."
+        "and returns executable execution plans for workload emulation."
     ),
     version="2.0.0",
     lifespan=lifespan,
@@ -344,7 +339,7 @@ def info():
         },
         "training": {
             "dataset":      "surrogate_v2 (CloudLab c220g2 profiling traces)",
-            "augmentation": "5× intra-socket permutation + 10× high-IO oversampling",
+            "augmentation": "5x intra-socket permutation + 10x high-IO oversampling",
             "hardware":     TRAINING_HARDWARE,
         },
         "methods": {
@@ -395,7 +390,7 @@ def metrics():
 @app.post(
     "/generate",
     summary="Generate a single-step execution plan from one resource-usage snapshot",
-    responses={200: {"description": "HDF5 binary / JSON / stress-ng text"}},
+    responses={200: {"description": "HDF5 binary / JSON"}},
 )
 def generate(req: GenerateRequest):
     """
@@ -405,8 +400,7 @@ def generate(req: GenerateRequest):
     | `return_format` | Content-Type | Description |
     |---|---|---|
     | `h5` | `application/octet-stream` | HDF5 with `execution_plan` (2, THREADS, STRESSORS) |
-    | `json` | `application/json` | Action tensor (STRESSORS × THREADS) in [0, 1] |
-    | `stress_ng` | `text/plain` | stress-ng CLI arguments |
+    | `json` | `application/json` | Action tensor (STRESSORS x THREADS) in [0, 1] |
     """
     engine: InferenceEngine = _state["engine"]
     try:
@@ -421,7 +415,7 @@ def generate(req: GenerateRequest):
 @app.post(
     "/generate/series",
     summary="Generate a time-series of execution plans from a sequence of traces",
-    responses={200: {"description": "HDF5 binary / JSON / stress-ng text"}},
+    responses={200: {"description": "HDF5 binary / JSON"}},
 )
 def generate_series(req: SeriesRequest):
     """
@@ -625,8 +619,6 @@ def _profile_sync(req: ProfileRequest, emit) -> dict:
     Blocking profiling pipeline.  Calls emit(stage, message, pct) at each
     milestone so the async layer can forward them as SSE events.
     """
-    from mimesys.schema.machine import Machine
-    from mimesys.preprocessing.parsers import parse_trace_file, process_trace_all
 
     engine: InferenceEngine = _state["engine"]
     cfg = _state["cfg"]
@@ -640,76 +632,79 @@ def _profile_sync(req: ProfileRequest, emit) -> dict:
     except ValueError as e:
         raise RuntimeError(str(e))
 
-    # ── 2. Package ───────────────────────────────────────────────────────────
+    # ── 2. Package + acquire worker ──────────────────────────────────────────
     emit("packaging", "Packaging execution plan into archive...", 12)
-    machines = [Machine.from_hostname(h) for h in cfg.data.test_machines]
-    machine  = machines[0]
+    emit("queued", "Waiting for an available worker...", 13)
+    hostname = _worker_queue.get(block=True)
+    machine  = Machine.from_hostname(hostname)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        plan_path = os.path.join(tmp, "plan_000000.h5")
-        prev_zeros = np.zeros((ACTION_THREADS, ACTION_STRESSORS), dtype=np.float32)
-        with h5py.File(plan_path, "w") as f:
-            f.create_dataset("execution_plan",
-                             data=np.stack([prev_zeros, pred.T], axis=0))
-        zip_path = os.path.join(tmp, "chunk_0.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(plan_path, "plan_000000.h5")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan_000000.h5")
+            prev_zeros = np.zeros((ACTION_THREADS, ACTION_STRESSORS), dtype=np.float32)
+            with h5py.File(plan_path, "w") as f:
+                f.create_dataset("execution_plan",
+                                 data=np.stack([prev_zeros, pred.T], axis=0))
+            zip_path = os.path.join(tmp, "chunk_0.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(plan_path, "plan_000000.h5")
 
-        # ── 3. Connect ───────────────────────────────────────────────────────
-        emit("connecting", f"Connecting to {machine.hostname}...", 18)
-        client, sftp_conn = machine.initialize_connection(
-            username=cfg.profiler.user_name,
-            private_key_path=cfg.profiler.private_key_path,
-        )
+            # ── 3. Connect ───────────────────────────────────────────────────
+            emit("connecting", f"Connecting to {machine.hostname}...", 18)
+            client, sftp_conn = machine.initialize_connection(
+                username=cfg.profiler.user_name,
+                private_key_path=cfg.profiler.private_key_path,
+            )
 
-        # ── 4. Transfer ──────────────────────────────────────────────────────
-        emit("transferring", f"Uploading execution plans to {machine.hostname}...", 25)
-        remote_zip = (f"/users/{cfg.profiler.user_name}/fleetbench/"
-                      f"execution_plans/chunk_0.zip")
-        machine.file_transfer(scp=sftp_conn, file_path=zip_path, destination=remote_zip)
-        machine.run_command(client=client, command=(
-            f"cd /users/{cfg.profiler.user_name}/fleetbench/execution_plans/ "
-            f"&& rm -f *.h5 && unzip -o chunk_0.zip && rm chunk_0.zip"
-        ))
+            # ── 4. Transfer ──────────────────────────────────────────────────
+            emit("transferring", f"Uploading execution plans to {machine.hostname}...", 25)
+            remote_zip = (f"/users/{cfg.profiler.user_name}/fleetbench/"
+                          f"execution_plans/chunk_0.zip")
+            machine.file_transfer(scp=sftp_conn, file_path=zip_path, destination=remote_zip)
+            machine.run_command(client=client, command=(
+                f"cd /users/{cfg.profiler.user_name}/fleetbench/execution_plans/ "
+                f"&& rm -f *.h5 && unzip -o chunk_0.zip && rm chunk_0.zip"
+            ))
 
-        # ── 5. Benchmark (stream stdout for per-batch progress) ──────────────
-        emit("benchmarking", "Starting benchmark on remote worker...", 30)
-        _run_benchmark_streaming(
-            client=client,
-            command=(
-                f"cd /users/{cfg.profiler.user_name}/fleetbench && "
-                f"bash collect_mimesys_data.sh 2>&1"
-            ),
-            emit=emit,
-        )
+            # ── 5. Benchmark ─────────────────────────────────────────────────
+            emit("benchmarking", "Starting benchmark on remote worker...", 30)
+            _run_benchmark_streaming(
+                client=client,
+                command=(
+                    f"cd /users/{cfg.profiler.user_name}/fleetbench && "
+                    f"bash collect_mimesys_data.sh 2>&1"
+                ),
+                emit=emit,
+            )
 
-        # ── 6. Collect results ───────────────────────────────────────────────
-        emit("collecting", "Downloading result files from worker...", 90)
-        result_dest = os.path.join(tmp, "results")
-        os.makedirs(result_dest, exist_ok=True)
-        _, stdout, _ = client.exec_command(
-            f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt 2>/dev/null"
-        )
-        sftp = client.open_sftp()
-        for rp in stdout.read().decode().strip().splitlines():
-            if rp.strip():
-                sftp.get(rp.strip(),
-                         os.path.join(result_dest, os.path.basename(rp.strip())))
-        sftp.close()
-        machine.close_connection(scp=sftp_conn, client=client)
+            # ── 6. Collect results ───────────────────────────────────────────
+            emit("collecting", "Downloading result files from worker...", 90)
+            result_dest = os.path.join(tmp, "results")
+            os.makedirs(result_dest, exist_ok=True)
+            _, stdout, _ = client.exec_command(
+                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt 2>/dev/null"
+            )
+            sftp = client.open_sftp()
+            for rp in stdout.read().decode().strip().splitlines():
+                if rp.strip():
+                    sftp.get(rp.strip(),
+                             os.path.join(result_dest, os.path.basename(rp.strip())))
+            sftp.close()
+            machine.close_connection(scp=sftp_conn, client=client)
 
-        # ── 7. Parse ─────────────────────────────────────────────────────────
-        emit("parsing", "Parsing hardware metric traces...", 95)
-        hw_metrics: dict = {}
-        for fname in os.listdir(result_dest):
-            _header, grouped_traces = parse_trace_file(os.path.join(result_dest, fname))
-            if not grouped_traces:
-                continue
-            res = process_trace_all(grouped_traces, include_aggregated_cpu=True)
-            if res:
-                # process_trace_all returns {k: [v0, v1, ...]} — return as-is
-                hw_metrics = {k: vals for k, vals in res.items()}
-                break
+            # ── 7. Parse ─────────────────────────────────────────────────────
+            emit("parsing", "Parsing hardware metric traces...", 95)
+            hw_metrics: dict = {}
+            for fname in os.listdir(result_dest):
+                _header, grouped_traces = parse_trace_file(os.path.join(result_dest, fname))
+                if not grouped_traces:
+                    continue
+                res = process_trace_all(grouped_traces, include_aggregated_cpu=True)
+                if res:
+                    hw_metrics = {k: vals for k, vals in res.items()}
+                    break
+    finally:
+        _worker_queue.put(hostname)
 
     return {
         "method":           req.method,
@@ -753,118 +748,116 @@ def _profile_series_sync(req: ProfileSeriesRequest, emit) -> dict:
     MIMESYS_ITERS=1 MIMESYS_SLEEP=0, and parses the resulting
     T diff intervals as a list of T hardware-metric dicts.
     """
-    from mimesys.schema.machine import Machine
-    from mimesys.preprocessing.parsers import parse_trace_file, process_trace_all
 
     engine: InferenceEngine = _state["engine"]
     cfg = _state["cfg"]
     T = len(req.traces)
-
-    # ── 1. Generate T actions ────────────────────────────────────────────────
     strategy = getattr(req, "generation_strategy", "autoregressive")
-    emit("generating_plan", f"Generating {T}-step plan (strategy={strategy})...", 5)
+
+    # ── 1. Wait for a worker before doing any GPU work ───────────────────────
+    # Acquiring the worker first prevents all batch jobs from piling up on the
+    # GPU simultaneously — only as many plans are generated as there are free
+    # remote workers, keeping machines busy.
+    emit("queued", "Waiting for an available worker...", 5)
+    hostname = _worker_queue.get(block=True)
+    machine  = Machine.from_hostname(hostname)
+
     try:
-        if strategy == "parallel_refine":
-            preds = engine.generate_series_parallel_refine(
-                req.traces, req.n_chains, req.cfg_guide_w,
-            )
-        else:
-            preds = engine.generate_series(
-                req.traces, req.method, req.initial_prev_action,
-                req.n_chains, req.cfg_guide_w,
-            )
-    except ValueError as e:
-        raise RuntimeError(str(e))
-
-    # ── 2. Package into single H5 (T+1 slots) ───────────────────────────────
-    emit("packaging", f"Packaging {T+1}-slot execution plan...", 12)
-    machines = [Machine.from_hostname(h) for h in cfg.data.test_machines]
-    machine  = machines[0]
-
-    with tempfile.TemporaryDirectory() as tmp:
-        plan_path = os.path.join(tmp, "plan_000000.h5")
-        h5_data = np.zeros((T + 1, ACTION_THREADS, ACTION_STRESSORS), dtype=np.float32)
-        for t, act in enumerate(preds):
-            h5_data[t + 1] = act.T   # (STRESSORS, THREADS) → (THREADS, STRESSORS)
-        with h5py.File(plan_path, "w") as f:
-            f.create_dataset("execution_plan", data=h5_data)
-        zip_path = os.path.join(tmp, "chunk_0.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(plan_path, "plan_000000.h5")
-
-        # ── 3. Connect ───────────────────────────────────────────────────────
-        emit("connecting", f"Connecting to {machine.hostname}...", 18)
-        client, sftp_conn = machine.initialize_connection(
-            username=cfg.profiler.user_name,
-            private_key_path=cfg.profiler.private_key_path,
-        )
-
-        # ── 4. Transfer ──────────────────────────────────────────────────────
-        emit("transferring", f"Uploading execution plans to {machine.hostname}...", 25)
-        remote_zip = (f"/users/{cfg.profiler.user_name}/fleetbench/"
-                      f"execution_plans/chunk_0.zip")
-        machine.file_transfer(scp=sftp_conn, file_path=zip_path, destination=remote_zip)
-        machine.run_command(client=client, command=(
-            f"cd /users/{cfg.profiler.user_name}/fleetbench/execution_plans/ "
-            f"&& rm -f *.h5 && unzip -o chunk_0.zip && rm chunk_0.zip"
-        ))
-
-        # ── 5. Benchmark — ITERS=1 SLEEP=0 (each slot once, no inter-slot sleep) ──
-        emit("benchmarking", "Starting time-series benchmark on remote worker...", 30)
-        bench_lines = _run_benchmark_streaming(
-            client=client,
-            command=(
-                f"cd /users/{cfg.profiler.user_name}/fleetbench && "
-                f"MIMESYS_ITERS=1 MIMESYS_SLEEP=0 "
-                f"bash collect_mimesys_data.sh 2>&1"
-            ),
-            emit=emit,
-        )
-
-        # ── 6. Collect results ───────────────────────────────────────────────
-        emit("collecting", "Downloading result files from worker...", 90)
-        result_dest = os.path.join(tmp, "results")
-        os.makedirs(result_dest, exist_ok=True)
-        _, stdout, _ = client.exec_command(
-            f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt 2>/dev/null"
-        )
-        sftp = client.open_sftp()
-        for rp in stdout.read().decode().strip().splitlines():
-            if rp.strip():
-                sftp.get(rp.strip(),
-                         os.path.join(result_dest, os.path.basename(rp.strip())))
-        # Write collected benchmark output as benchmark.log on the remote machine
-        log_content = "\n".join(bench_lines) + "\n"
+        # ── 2. Generate T actions ────────────────────────────────────────────
+        emit("generating_plan", f"Generating {T}-step plan (strategy={strategy})...", 10)
         try:
-            with sftp.open(f"/users/{cfg.profiler.user_name}/benchmark.log", "w") as rf:
-                rf.write(log_content)
-            print(f"[series] Wrote {len(bench_lines)} lines to remote benchmark.log "
-                  f"({len(log_content)} bytes)", flush=True)
-        except Exception as e:
-            print(f"[series] WARNING: failed to write benchmark.log: {e}", flush=True)
-        sftp.close()
-        machine.close_connection(scp=sftp_conn, client=client)
+            if strategy == "parallel_refine":
+                preds = engine.generate_series_parallel_refine(
+                    req.traces, req.n_chains, req.cfg_guide_w,
+                )
+            else:
+                preds = engine.generate_series(
+                    req.traces, req.method, req.initial_prev_action,
+                    req.n_chains, req.cfg_guide_w,
+                )
+        except ValueError as e:
+            raise RuntimeError(str(e))
 
-        # ── 7. Parse — each diff is one time-step ───────────────────────────
-        emit("parsing", "Parsing time-series hardware metric traces...", 95)
-        series_metrics: list[dict] = []
-        for fname in sorted(os.listdir(result_dest)):
-            _header, grouped_traces = parse_trace_file(os.path.join(result_dest, fname))
-            if not grouped_traces:
-                continue
-            res = process_trace_all(grouped_traces, include_aggregated_cpu=True)
-            if not res:
-                continue
-            # process_trace_all returns {k: [v0, v1, ..., v_N]}
-            # hpcperfstatsd begin writes an initial zero-snapshot, so with
-            # T+1 slots and ITERS=1 SLEEP=0 there are T+2 file entries and
-            # T+1 diffs.  diff[0] = idle baseline slot (zeros → slot0), so
-            # skip it; diffs[1..T] correspond to the T generated actions.
-            n_steps = len(next(iter(res.values())))
-            for step in range(1, n_steps):   # skip diff[0] = idle baseline
-                d = {k: float(vals[step]) for k, vals in res.items()}
-                series_metrics.append(d)
-            break  # one file per plan
+        # ── 3. Package into single H5 (T+1 slots) ───────────────────────────
+        emit("packaging", f"Packaging {T+1}-slot execution plan...", 18)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan_000000.h5")
+            h5_data = np.zeros((T + 1, ACTION_THREADS, ACTION_STRESSORS), dtype=np.float32)
+            for t, act in enumerate(preds):
+                h5_data[t + 1] = act.T   # (STRESSORS, THREADS) → (THREADS, STRESSORS)
+            with h5py.File(plan_path, "w") as f:
+                f.create_dataset("execution_plan", data=h5_data)
+            zip_path = os.path.join(tmp, "chunk_0.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(plan_path, "plan_000000.h5")
+
+            # ── 4. Connect ───────────────────────────────────────────────────
+            emit("connecting", f"Connecting to {machine.hostname}...", 22)
+            client, sftp_conn = machine.initialize_connection(
+                username=cfg.profiler.user_name,
+                private_key_path=cfg.profiler.private_key_path,
+            )
+
+            # ── 5. Transfer ──────────────────────────────────────────────────
+            emit("transferring", f"Uploading execution plans to {machine.hostname}...", 28)
+            remote_zip = (f"/users/{cfg.profiler.user_name}/fleetbench/"
+                          f"execution_plans/chunk_0.zip")
+            machine.file_transfer(scp=sftp_conn, file_path=zip_path, destination=remote_zip)
+            machine.run_command(client=client, command=(
+                f"cd /users/{cfg.profiler.user_name}/fleetbench/execution_plans/ "
+                f"&& rm -f *.h5 && unzip -o chunk_0.zip && rm chunk_0.zip"
+            ))
+
+            # ── 6. Benchmark — ITERS=1 SLEEP=0 ──────────────────────────────
+            emit("benchmarking", "Starting time-series benchmark on remote worker...", 33)
+            bench_lines = _run_benchmark_streaming(
+                client=client,
+                command=(
+                    f"cd /users/{cfg.profiler.user_name}/fleetbench && "
+                    f"MIMESYS_ITERS=1 MIMESYS_SLEEP=0 "
+                    f"bash collect_mimesys_data.sh 2>&1"
+                ),
+                emit=emit,
+            )
+
+            # ── 7. Collect results ───────────────────────────────────────────
+            emit("collecting", "Downloading result files from worker...", 90)
+            result_dest = os.path.join(tmp, "results")
+            os.makedirs(result_dest, exist_ok=True)
+            _, stdout, _ = client.exec_command(
+                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt 2>/dev/null"
+            )
+            sftp = client.open_sftp()
+            for rp in stdout.read().decode().strip().splitlines():
+                if rp.strip():
+                    sftp.get(rp.strip(),
+                             os.path.join(result_dest, os.path.basename(rp.strip())))
+            log_content = "\n".join(bench_lines) + "\n"
+            try:
+                with sftp.open(f"/users/{cfg.profiler.user_name}/benchmark.log", "w") as rf:
+                    rf.write(log_content)
+            except Exception as e:
+                print(f"[series] WARNING: failed to write benchmark.log: {e}", flush=True)
+            sftp.close()
+            machine.close_connection(scp=sftp_conn, client=client)
+
+            # ── 8. Parse — each diff is one time-step ───────────────────────
+            emit("parsing", "Parsing time-series hardware metric traces...", 95)
+            series_metrics: list[dict] = []
+            for fname in sorted(os.listdir(result_dest)):
+                _header, grouped_traces = parse_trace_file(os.path.join(result_dest, fname))
+                if not grouped_traces:
+                    continue
+                res = process_trace_all(grouped_traces, include_aggregated_cpu=True)
+                if not res:
+                    continue
+                n_steps = len(next(iter(res.values())))
+                for step in range(1, n_steps):
+                    d = {k: float(vals[step]) for k, vals in res.items()}
+                    series_metrics.append(d)
+                break
+    finally:
+        _worker_queue.put(hostname)
 
     return {
         "method":         req.method,
@@ -872,7 +865,303 @@ def _profile_series_sync(req: ProfileSeriesRequest, emit) -> dict:
         "T":              T,
         "actions":        [p.tolist() for p in preds],
         "action_shape":   [ACTION_STRESSORS, ACTION_THREADS],
-        "series_metrics": series_metrics,  # list of T dicts
+        "series_metrics": series_metrics,
+        "worker":         machine.hostname,
+    }
+
+
+class BatchProfileRequest(BaseModel):
+    jobs:                list[ProfileSeriesRequest]
+    method:              METHOD_CHOICES  = Field("diffusion")
+    generation_strategy: STRATEGY_CHOICES = Field("autoregressive")
+    n_chains:            int   = Field(3, ge=1, le=10)
+    cfg_guide_w:         float = Field(3.0, ge=0, le=10)
+
+
+@app.post(
+    "/profile/batch",
+    summary="Submit a batch of time-series profiling jobs; returns immediately",
+    status_code=202,
+)
+async def profile_batch(req: BatchProfileRequest):
+    """
+    Returns a batch_id immediately (HTTP 202).  Plan generation and SSH dispatch
+    run in the background.  Poll GET /profile/batch/{batch_id}/status for progress.
+
+    Stages: generating_plans → dispatching → (per-job: queued/connecting/benchmarking/…/done)
+    """
+    if not _state.get("profiling_enabled"):
+        raise HTTPException(503, "Remote profiling disabled. Restart with --enable_profiling.")
+
+    N = len(req.jobs)
+    batch_id = uuid.uuid4().hex[:8]
+    _batches[batch_id] = {
+        "job_ids":  [],
+        "total":    N,
+        "stage":    "generating_plans",
+        "pct":      0,
+        "message":  f"Generating plans for {N} jobs...",
+    }
+
+    loop = asyncio.get_event_loop()
+    asyncio.create_task(_run_batch(batch_id, req, loop))
+
+    return {
+        "batch_id":   batch_id,
+        "total":      N,
+        "status_url": f"/profile/batch/{batch_id}/status",
+    }
+
+
+async def _run_batch(batch_id: str, req: BatchProfileRequest, loop: asyncio.AbstractEventLoop):
+    """Background task: generate all plans (batched), then dispatch SSH jobs."""
+    engine: InferenceEngine = _state["engine"]
+    batch = _batches[batch_id]
+
+    # Resolve per-job settings
+    merged_jobs: list[ProfileSeriesRequest] = []
+    for job_req in req.jobs:
+        merged_jobs.append(ProfileSeriesRequest(
+            traces              = job_req.traces,
+            method              = job_req.method if job_req.method != "diffusion" else req.method,
+            generation_strategy = (job_req.generation_strategy
+                                   if job_req.generation_strategy != "autoregressive"
+                                   else req.generation_strategy),
+            n_chains            = job_req.n_chains    if job_req.n_chains    != 3   else req.n_chains,
+            cfg_guide_w         = job_req.cfg_guide_w if job_req.cfg_guide_w != 3.0 else req.cfg_guide_w,
+            initial_prev_action = job_req.initial_prev_action,
+        ))
+
+    strategy    = merged_jobs[0].generation_strategy if merged_jobs else "autoregressive"
+    method      = merged_jobs[0].method if merged_jobs else req.method
+    n_chains    = merged_jobs[0].n_chains
+    cfg_guide_w = merged_jobs[0].cfg_guide_w
+    max_T       = max(len(j.traces) for j in merged_jobs) if merged_jobs else 0
+
+    def on_progress(step: int, total: int):
+        batch["pct"]     = int(step / total * 100)
+        batch["message"] = f"Generating plans: step {step}/{total}"
+
+    try:
+        if strategy == "parallel_refine":
+            def on_progress(pass_num: int, total_passes: int):
+                batch["pct"]     = int(pass_num / total_passes * 100)
+                batch["message"] = f"Generating plans: pass {pass_num}/{total_passes}"
+
+            all_preds: list = await loop.run_in_executor(
+                None,
+                lambda: engine.generate_series_batch_parallel_refine(
+                    [j.traces for j in merged_jobs],
+                    n_chains=n_chains,
+                    cfg_guide_w=cfg_guide_w,
+                    progress_cb=on_progress,
+                ),
+            )
+        else:
+            all_preds = await loop.run_in_executor(
+                None,
+                lambda: engine.generate_series_batch(
+                    [j.traces for j in merged_jobs],
+                    method=method,
+                    initial_prev_actions=[j.initial_prev_action for j in merged_jobs],
+                    n_chains=n_chains,
+                    cfg_guide_w=cfg_guide_w,
+                    progress_cb=on_progress,
+                ),
+            )
+    except Exception as exc:
+        batch["stage"]   = "error"
+        batch["message"] = str(exc)
+        print(f"[batch {batch_id}] plan generation failed: {exc}", flush=True)
+        return
+
+    batch["stage"]   = "dispatching"
+    batch["pct"]     = 100
+    batch["message"] = f"Plans ready — dispatching {len(merged_jobs)} jobs to workers"
+    print(f"[batch {batch_id}] plans generated, dispatching {len(merged_jobs)} jobs", flush=True)
+
+    job_ids: list[str] = []
+    for merged, preds in zip(merged_jobs, all_preds):
+        job_id = uuid.uuid4().hex[:8]
+        _jobs[job_id] = {
+            "stage":    "queued",
+            "pct":      0,
+            "message":  "Plan ready, waiting for worker",
+            "result":   None,
+            "error":    None,
+            "events":   asyncio.Queue(),
+            "batch_id": batch_id,
+        }
+        asyncio.create_task(_run_profile_series_job_with_plan(job_id, merged, preds, loop))
+        job_ids.append(job_id)
+
+    batch["job_ids"] = job_ids
+    batch["stage"]   = "running"
+    batch["message"] = f"All {len(job_ids)} jobs dispatched"
+
+
+@app.get("/profile/batch/{batch_id}/status", summary="Poll status of a batch job")
+def batch_status(batch_id: str):
+    if batch_id not in _batches:
+        raise HTTPException(404, f"Batch {batch_id!r} not found")
+    batch = _batches[batch_id]
+    batch_stage = batch.get("stage", "unknown")
+
+    counts = {"done": 0, "error": 0, "queued": 0, "running": 0}
+    statuses: dict = {}
+    for job_id in batch["job_ids"]:
+        job = _jobs.get(job_id, {})
+        stage = job.get("stage", "unknown")
+        statuses[job_id] = {
+            "stage":   stage,
+            "pct":     job.get("pct", 0),
+            "message": job.get("message", ""),
+            "worker":  (job.get("result") or {}).get("worker"),
+        }
+        if stage == "done":
+            counts["done"] += 1
+        elif stage == "error":
+            counts["error"] += 1
+        elif stage == "queued":
+            counts["queued"] += 1
+        else:
+            counts["running"] += 1
+
+    dispatched = len(batch["job_ids"])
+    all_done = (batch_stage not in ("generating_plans", "dispatching", "error")
+                and dispatched == batch["total"]
+                and counts["done"] + counts["error"] == dispatched)
+    return {
+        "batch_id":     batch_id,
+        "total":        batch["total"],
+        "batch_stage":  batch_stage,
+        "batch_pct":    batch.get("pct", 0),
+        "batch_message": batch.get("message", ""),
+        "workers_free": _worker_queue.qsize(),
+        **counts,
+        "all_done":     all_done,
+        "job_statuses": statuses,
+    }
+
+
+async def _run_profile_series_job_with_plan(
+    job_id: str,
+    req:    ProfileSeriesRequest,
+    preds:  list,
+    loop:   asyncio.AbstractEventLoop,
+):
+    """Async wrapper for SSH/benchmark work when plans are already generated."""
+    job = _jobs[job_id]
+
+    def emit(stage: str, message: str, pct: int):
+        job["stage"]   = stage
+        job["pct"]     = pct
+        job["message"] = message
+        asyncio.run_coroutine_threadsafe(
+            job["events"].put({"stage": stage, "pct": pct, "message": message}), loop
+        )
+
+    try:
+        result = await loop.run_in_executor(
+            None, lambda: _profile_series_sync_with_plan(req, preds, emit)
+        )
+        job["result"] = result
+        emit("done", "Time-series profiling complete.", 100)
+    except Exception as exc:
+        job["error"] = str(exc)
+        emit("error", str(exc), job["pct"])
+
+
+def _profile_series_sync_with_plan(
+    req:   ProfileSeriesRequest,
+    preds: list,
+    emit,
+) -> dict:
+    """SSH/benchmark pipeline with a pre-generated plan — no GPU inference."""
+    cfg = _state["cfg"]
+    T   = len(req.traces)
+    strategy = getattr(req, "generation_strategy", "autoregressive")
+
+    emit("queued", "Waiting for an available worker...", 5)
+    hostname = _worker_queue.get(block=True)
+    machine  = Machine.from_hostname(hostname)
+
+    try:
+        emit("packaging", f"Packaging {T+1}-slot execution plan...", 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = os.path.join(tmp, "plan_000000.h5")
+            h5_data = np.zeros((T + 1, ACTION_THREADS, ACTION_STRESSORS), dtype=np.float32)
+            for t, act in enumerate(preds):
+                h5_data[t + 1] = act.T
+            with h5py.File(plan_path, "w") as f:
+                f.create_dataset("execution_plan", data=h5_data)
+            zip_path = os.path.join(tmp, "chunk_0.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(plan_path, "plan_000000.h5")
+
+            emit("connecting", f"Connecting to {machine.hostname}...", 22)
+            client, sftp_conn = machine.initialize_connection(
+                username=cfg.profiler.user_name,
+                private_key_path=cfg.profiler.private_key_path,
+            )
+
+            emit("transferring", f"Uploading to {machine.hostname}...", 28)
+            remote_zip = (f"/users/{cfg.profiler.user_name}/fleetbench/"
+                          f"execution_plans/chunk_0.zip")
+            machine.file_transfer(scp=sftp_conn, file_path=zip_path, destination=remote_zip)
+            machine.run_command(client=client, command=(
+                f"cd /users/{cfg.profiler.user_name}/fleetbench/execution_plans/ "
+                f"&& rm -f *.h5 && unzip -o chunk_0.zip && rm chunk_0.zip"
+            ))
+
+            emit("benchmarking", "Starting benchmark on remote worker...", 33)
+            bench_lines = _run_benchmark_streaming(
+                client=client,
+                command=(
+                    f"cd /users/{cfg.profiler.user_name}/fleetbench && "
+                    f"MIMESYS_ITERS=1 MIMESYS_SLEEP=0 "
+                    f"bash collect_mimesys_data.sh 2>&1"
+                ),
+                emit=emit,
+            )
+
+            emit("collecting", "Downloading result files...", 90)
+            result_dest = os.path.join(tmp, "results")
+            os.makedirs(result_dest, exist_ok=True)
+            _, stdout, _ = client.exec_command(
+                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt 2>/dev/null"
+            )
+            sftp = client.open_sftp()
+            for rp in stdout.read().decode().strip().splitlines():
+                if rp.strip():
+                    sftp.get(rp.strip(),
+                             os.path.join(result_dest, os.path.basename(rp.strip())))
+            sftp.close()
+            machine.close_connection(scp=sftp_conn, client=client)
+
+            emit("parsing", "Parsing time-series hardware metric traces...", 95)
+            series_metrics: list[dict] = []
+            for fname in sorted(os.listdir(result_dest)):
+                _header, grouped_traces = parse_trace_file(os.path.join(result_dest, fname))
+                if not grouped_traces:
+                    continue
+                res = process_trace_all(grouped_traces, include_aggregated_cpu=True)
+                if not res:
+                    continue
+                n_steps = len(next(iter(res.values())))
+                for step in range(1, n_steps):
+                    series_metrics.append({k: float(vals[step]) for k, vals in res.items()})
+                break
+    finally:
+        _worker_queue.put(hostname)
+
+    return {
+        "method":         req.method,
+        "strategy":       strategy,
+        "T":              T,
+        "actions":        [p.tolist() for p in preds],
+        "action_shape":   [ACTION_STRESSORS, ACTION_THREADS],
+        "series_metrics": series_metrics,
         "worker":         machine.hostname,
     }
 
@@ -920,12 +1209,6 @@ def _run_benchmark_streaming(client, command: str, emit) -> list:
             emit("benchmarking", line, 88)
 
         else:
-            # Forward other stdout (bazel output, stress-ng lines) as info
             emit("benchmarking", line, 50)
 
     return collected_lines
-
-    exit_status = stdout.channel.recv_exit_status()
-    if exit_status != 0:
-        err = stderr.read().decode().strip()
-        raise RuntimeError(f"Benchmark exited with status {exit_status}: {err}")

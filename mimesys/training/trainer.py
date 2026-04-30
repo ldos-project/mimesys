@@ -455,63 +455,6 @@ class MimesysTrainer(pl.LightningModule):
         else:
             asyncio.run(coro)
 
-    def test_step(self, batch, batch_idx):
-        if not self.trainer.is_global_zero:
-            return
-        max_samples = 48
-        global_offset = batch_idx * self.cfg.data.test_batch_size
-        if global_offset >= max_samples:
-            return
-        print("Batch idx:", batch_idx)
-
-        test_dirname = os.path.join(self.cfg.train.callbacks.checkpoint.dirpath, "tests")
-        os.makedirs(test_dirname, exist_ok=True)
-
-        for iter_idx in range(1):
-            actions_trainer, _, _ = self.compute_val(self.trainer_model, batch)
-            actions_ema, _, _ = self.compute_val(self.ema_model, batch)
-
-            for sample_idx, (action_trainer, action_ema) in enumerate(
-                zip(actions_trainer, actions_ema)
-            ):
-                global_idx = global_offset + sample_idx
-                if global_idx >= max_samples:
-                    break
-                print("Saving results for sample", global_idx)
-                dirname = os.path.join(
-                    test_dirname, f"step_{self.global_step}_batch_{global_idx}"
-                )
-                if iter_idx == 0:
-                    os.makedirs(dirname, exist_ok=True)
-                    self.write_system_traces_to_file(dirname, batch["clean_trace"][sample_idx])
-
-                write_fleetbench_actions_to_h5_file(
-                    action_trainer[np.newaxis],
-                    os.path.join(dirname, f"predicted_actions_trainer_{iter_idx}.h5"),
-                )
-                write_fleetbench_actions_to_h5_file(
-                    action_ema[np.newaxis],
-                    os.path.join(dirname, f"predicted_actions_ema_{iter_idx}.h5"),
-                )
-
-    def on_test_batch_end(self, outputs, batch, batch_idx):
-        if not self.trainer.is_global_zero:
-            return
-        if batch_idx != len(self.trainer.test_dataloaders) - 1:
-            return
-
-        max_samples = 48
-        profile_request = ProfileRequest(
-            validation_data_path=f"{self.cfg.train.callbacks.checkpoint.dirpath}/tests",
-            my_destination_path=self.cfg.profiler.validation_destination_path,
-            step=self.global_step,
-            num_batches=max_samples,
-            num_trials=1,
-            logger=self.trainer.logger,
-        )
-        print("Profile request:", profile_request)
-        asyncio.run(self.profiler.profile(profile_request, self.cfg.data.trace_range))
-
     def on_before_zero_grad(self, optimizer):
         if self.global_rank == 0:
             self.ema.step_ema(self.ema_model, self.trainer_model)
