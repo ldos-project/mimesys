@@ -315,17 +315,85 @@ For benchmarks not covered by Memstrata, we incorporate additional suites (such 
 
 A subset of collected traces from CloudLab c220g2 machines, along with model checkpoints trained on c220g2, is provided under `artifacts/`.
 
-Using the inference server and client described above, generate synthetic workloads from these traces and profile the results:
+
+### Trace Similarities
+Using the inference server and client described above, generate synthetic workloads from the provided traces and profile the results:
 
 ```bash
 uv run python -m mimesys.inference.client profile-batch \
-    --files /artifacts/traces/* \
+    --files artifacts/traces/* \
     --method diffusion \
     --generation_strategy parallel_refine \
     --poll_interval 15 \
     --output batch_diffusion.png
 ```
 
-The output figure reports aggregated normalized DTW per resource type. To evaluate baselines, replace `--method diffusion` with `nearest_neighbor` or `linear_interpolation`.
+The output figure reports aggregated normalized DTW per resource type. To evaluate baselines, replace `--method diffusion` with `nearest_neighbor` or `linear_interpolation` and remove `--generation_strategy`.
 
+### Reproducing Noisy Neighbors
 To measure how benchmark applications (e.g., TPC-C on Silo) are affected by co-located resource contention, run them alongside the synthetic workloads generated as described [above](#5-inference-server--client).
+
+Workload running scripts are provided in `artifacts/benchmarks/memstrata`. On the remote machines, create VMs, install dependencies inside the VMs, and run multiple workloads concurrently following the scripts in that directory. Synthetic workloads for each baseline and our model are shared under `synthetic_workloads/`.
+
+Run the following commands to measure application performance under both real and synthetic co-located workloads:
+
+```bash
+# cd artifacts/benchmarks/memstrata
+bash create_vm.sh
+bash vm_install_workloads.sh
+python generate_noisy_neighbor_exps_synt.py  # one real application + synthetic workloads
+python generate_noisy_neighbor_exps.py       # mix of real applications
+```
+
+### Effectiveness of Mimesys Techniques
+To understand the benefit of individual techniques in Mimesys, run the `Trace Similarities` experiment with different checkpoints. When starting the inference server, change the checkpoint path to the desired checkpoint (e.g., `pretrain_prev_none.ckpt`):
+
+```bash
+# Server
+uv run python -m mimesys.inference \
+    --ckpt artifacts/checkpoints/pretrain_prev_none.ckpt \
+    --exp surrogate_v2_pretrain \
+    --enable_profiling \
+    --device cuda
+
+# Client
+uv run python -m mimesys.inference.client profile-batch \
+    --files artifacts/traces/* \
+    --method diffusion \
+    --generation_strategy parallel_refine \
+    --poll_interval 15 \
+    --output batch_diffusion.png
+```
+
+### Sensitivity to Input Traces
+To understand how Mimesys behaves when input traces are incomplete, we run sensitivity analysis by dropping portions of the input resource usage metrics.
+
+**Random dropping** — randomly zero out a fraction of all metric values across all timesteps:
+
+```bash
+uv run python -m mimesys.inference.client sensitivity-random \
+    --file /path/to/stats-workload.txt \
+    --drop_rate 0.2 \
+    --method diffusion \
+    --output metrics.png
+```
+
+**Per-metric dropping** — drop a specific metric type entirely (or partially for CPU):
+
+```bash
+# Drop 50% of per-core CPU readings (default)
+uv run python -m mimesys.inference.client sensitivity-per-metric \
+    --file /path/to/stats-workload.txt --metric cpu
+
+# Drop all memory bandwidth data
+uv run python -m mimesys.inference.client sensitivity-per-metric \
+    --file /path/to/stats-workload.txt --metric memory_bandwidth
+
+# Drop all LLC traffic
+uv run python -m mimesys.inference.client sensitivity-per-metric \
+    --file /path/to/stats-workload.txt --metric llc
+
+# Drop all disk I/O data
+uv run python -m mimesys.inference.client sensitivity-per-metric \
+    --file /path/to/stats-workload.txt --metric io
+```

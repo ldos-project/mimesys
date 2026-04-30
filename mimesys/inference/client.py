@@ -9,13 +9,15 @@ Usage
 
 Commands
 --------
-  health             Check server liveness
-  info               Show model / hardware / config metadata
-  metrics            List supported input metrics with training ranges
-  generate-series    Generate a time-series of execution plans
-  profile-series     Profile a time-series on a remote worker (with live progress)
-  profile-from-file  Profile using a TACC stats trace file as input
-  profile-result     Fetch result of a previously submitted profile job
+  health                 Check server liveness
+  info                   Show model / hardware / config metadata
+  metrics                List supported input metrics with training ranges
+  generate-series        Generate a time-series of execution plans
+  profile-series         Profile a time-series on a remote worker (with live progress)
+  profile-from-file      Profile using a TACC stats trace file as input
+  profile-result         Fetch result of a previously submitted profile job
+  sensitivity-random     Sensitivity analysis: randomly drop metric values before profiling
+  sensitivity-per-metric Sensitivity analysis: drop a specific metric type before profiling
 
 Global options
 --------------
@@ -37,11 +39,23 @@ Examples
   python -m mimesys.inference.client profile-from-file \\
       --file /path/to/stats-workload.txt \\
       --method diffusion --output metrics.png
+
+  python -m mimesys.inference.client sensitivity-random \\
+      --file /path/to/stats-workload.txt \\
+      --drop_rate 0.2 --method diffusion --output metrics.png
+
+  python -m mimesys.inference.client sensitivity-per-metric \\
+      --file /path/to/stats-workload.txt \\
+      --metric cpu --drop_fraction 0.5 --method diffusion --output metrics.png
+
+  python -m mimesys.inference.client sensitivity-per-metric \\
+      --file /path/to/stats-workload.txt \\
+      --metric io --method diffusion --output metrics.png
 """
 
 from __future__ import annotations
 
-import time, os
+import time, os, random
 import argparse, json, sys
 from typing import Optional
 from mimesys.preprocessing.parsers import parse_trace_file, process_trace_fine_grained
@@ -645,6 +659,165 @@ def _save_batch_summary_plot(
     plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# Sensitivity-analysis helpers
+# ---------------------------------------------------------------------------
+
+# Metric name → key prefix in the trace dict
+_METRIC_DROP_PREFIXES = {
+    "cpu":              "avg_cpu_utilizations_core_",
+    "memory_bandwidth": "memory_bandwidth",
+    "llc":              "l3_cache_usage",
+    "io":               "io",
+}
+
+# Default drop fraction per metric (matches paper: 50% for CPU, 100% for others)
+_METRIC_DROP_DEFAULTS = {
+    "cpu":              0.5,
+    "memory_bandwidth": 1.0,
+    "llc":              1.0,
+    "io":               1.0,
+}
+
+
+def _apply_random_drop(steps: list[dict], drop_rate: float,
+                       seed: Optional[int] = None) -> list[dict]:
+    """Zero out a random fraction of individual (timestep × metric) values.
+
+    Each metric value in each timestep is independently zeroed with probability
+    `drop_rate`.  A fixed `seed` makes the drop deterministic.
+    """
+    if drop_rate <= 0:
+        return steps
+    rng = random.Random(seed)
+    result = []
+    for d in steps:
+        new_d = {k: (0.0 if rng.random() < drop_rate else v) for k, v in d.items()}
+        result.append(new_d)
+    return result
+
+
+def _apply_metric_drop(steps: list[dict], metric: str,
+                       drop_fraction: Optional[float] = None,
+                       seed: Optional[int] = None) -> list[dict]:
+    """Zero out a specific metric type across all timesteps.
+
+    metric        : one of 'cpu', 'memory_bandwidth', 'llc', 'io'
+    drop_fraction : fraction of matching keys to zero (default from
+                    _METRIC_DROP_DEFAULTS — 0.5 for cpu, 1.0 for others).
+    seed          : random seed (only used for fractional / cpu drops).
+
+    For 'cpu': randomly selects `drop_fraction` of the per-core keys and
+    zeros them for every timestep.
+    For other metrics: zeros all matching keys in every timestep (when
+    drop_fraction == 1.0) or randomly zeros timestep-level values otherwise.
+    """
+    if metric not in _METRIC_DROP_PREFIXES:
+        raise ValueError(
+            f"Unknown metric '{metric}'. "
+            f"Choose from: {', '.join(_METRIC_DROP_PREFIXES)}"
+        )
+    prefix = _METRIC_DROP_PREFIXES[metric]
+    if drop_fraction is None:
+        drop_fraction = _METRIC_DROP_DEFAULTS[metric]
+
+    rng = random.Random(seed)
+
+    if metric == "cpu":
+        # Determine which per-core keys exist (consistent across steps)
+        core_keys = sorted(k for k in steps[0] if k.startswith(prefix))
+        n_drop = max(1, int(round(len(core_keys) * drop_fraction)))
+        keys_to_drop = set(rng.sample(core_keys, min(n_drop, len(core_keys))))
+        return [
+            {k: (0.0 if k in keys_to_drop else v) for k, v in d.items()}
+            for d in steps
+        ]
+    else:
+        # Exact-prefix match for non-cpu metrics (e.g. "io" key must equal prefix)
+        def _matches(k: str) -> bool:
+            return k == prefix or k.startswith(prefix + "_")
+
+        if drop_fraction >= 1.0:
+            return [
+                {k: (0.0 if _matches(k) else v) for k, v in d.items()}
+                for d in steps
+            ]
+        else:
+            result = []
+            for d in steps:
+                new_d = {
+                    k: (0.0 if _matches(k) and rng.random() < drop_fraction else v)
+                    for k, v in d.items()
+                }
+                result.append(new_d)
+            return result
+
+
+def cmd_sensitivity_random(url: str, raw: bool,
+                           file: str, method: str,
+                           drop_rate: float,
+                           seed: Optional[int],
+                           initial_prev_action: Optional[str],
+                           n_chains: int, cfg_guide_w: float,
+                           generation_strategy: Optional[str],
+                           output: Optional[str], **_):
+    """Parse a TACC stats file, randomly drop metric values, then profile."""
+    steps = _parse_trace_file_to_steps(file)
+    print(f"  Parsed {len(steps)} time steps from {file}")
+
+    n_cells_total = sum(len(d) for d in steps)
+    dropped_steps = _apply_random_drop(steps, drop_rate, seed=seed)
+    n_zeroed = sum(
+        1 for orig, new in zip(steps, dropped_steps)
+        for k in orig if new[k] == 0.0 and orig[k] != 0.0
+    )
+    print(f"  Random drop rate : {drop_rate*100:.1f}%  "
+          f"(~{n_zeroed}/{n_cells_total} values zeroed, seed={seed})")
+
+    body: dict = {
+        "traces":      dropped_steps,
+        "method":      method,
+        "n_chains":    n_chains,
+        "cfg_guide_w": cfg_guide_w,
+    }
+    if initial_prev_action:
+        body["initial_prev_action"] = json.loads(initial_prev_action)
+    if generation_strategy:
+        body["generation_strategy"] = generation_strategy
+    _submit_and_stream_profile(url, body, raw, output)
+
+
+def cmd_sensitivity_per_metric(url: str, raw: bool,
+                               file: str, method: str,
+                               metric: str,
+                               drop_fraction: Optional[float],
+                               seed: Optional[int],
+                               initial_prev_action: Optional[str],
+                               n_chains: int, cfg_guide_w: float,
+                               generation_strategy: Optional[str],
+                               output: Optional[str], **_):
+    """Parse a TACC stats file, drop a specific metric type, then profile."""
+    steps = _parse_trace_file_to_steps(file)
+    print(f"  Parsed {len(steps)} time steps from {file}")
+
+    effective_frac = drop_fraction if drop_fraction is not None else _METRIC_DROP_DEFAULTS[metric]
+    dropped_steps = _apply_metric_drop(steps, metric, drop_fraction=drop_fraction, seed=seed)
+    print(f"  Metric drop      : {metric}  "
+          f"(drop_fraction={effective_frac:.2f}, seed={seed})")
+
+    body: dict = {
+        "traces":      dropped_steps,
+        "method":      method,
+        "n_chains":    n_chains,
+        "cfg_guide_w": cfg_guide_w,
+    }
+    if initial_prev_action:
+        body["initial_prev_action"] = json.loads(initial_prev_action)
+    if generation_strategy:
+        body["generation_strategy"] = generation_strategy
+    _submit_and_stream_profile(url, body, raw, output)
+
+
 def cmd_profile_result(url: str, raw: bool, job: str, **_):
     """Fetch the result of a previously submitted profile job."""
     result = _get(f"{url}/profile/jobs/{job}/result").json()
@@ -984,6 +1157,47 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Fetch result of a previously submitted profile job")
     pres.add_argument("--job", required=True, help="Job ID returned by 'profile-series'")
 
+    # sensitivity-random
+    sr = sub.add_parser("sensitivity-random",
+                        help="Sensitivity analysis: randomly drop metric values before profiling")
+    sr.add_argument("--file",              required=True,
+                    help="Path to a TACC stats trace file")
+    sr.add_argument("--drop_rate",         type=float, required=True,
+                    help="Fraction of (timestep, metric) values to zero out [0.0–1.0]")
+    sr.add_argument("--seed",              type=int, default=None,
+                    help="Random seed for reproducibility (optional)")
+    sr.add_argument("--method",            default="diffusion",
+                    choices=["diffusion","nearest_neighbor","linear_interpolation","single_stressor"])
+    sr.add_argument("--initial_prev_action", default=None)
+    sr.add_argument("--n_chains",          type=int,   default=3)
+    sr.add_argument("--cfg_guide_w",       type=float, default=3.0)
+    sr.add_argument("--generation_strategy", default=None,
+                    choices=["autoregressive", "parallel_refine"])
+    sr.add_argument("--output",            default=None,
+                    help="Path to save time-series plot PNG (optional)")
+
+    # sensitivity-per-metric
+    sm = sub.add_parser("sensitivity-per-metric",
+                        help="Sensitivity analysis: drop a specific metric type before profiling")
+    sm.add_argument("--file",              required=True,
+                    help="Path to a TACC stats trace file")
+    sm.add_argument("--metric",            required=True,
+                    choices=list(_METRIC_DROP_PREFIXES),
+                    help="Metric type to drop: cpu | memory_bandwidth | llc | io")
+    sm.add_argument("--drop_fraction",     type=float, default=None,
+                    help="Fraction to drop (default: 0.5 for cpu, 1.0 for others)")
+    sm.add_argument("--seed",              type=int, default=None,
+                    help="Random seed (used for cpu fractional drop, optional)")
+    sm.add_argument("--method",            default="diffusion",
+                    choices=["diffusion","nearest_neighbor","linear_interpolation","single_stressor"])
+    sm.add_argument("--initial_prev_action", default=None)
+    sm.add_argument("--n_chains",          type=int,   default=3)
+    sm.add_argument("--cfg_guide_w",       type=float, default=3.0)
+    sm.add_argument("--generation_strategy", default=None,
+                    choices=["autoregressive", "parallel_refine"])
+    sm.add_argument("--output",            default=None,
+                    help="Path to save time-series plot PNG (optional)")
+
     return p
 
 
@@ -997,15 +1211,17 @@ def main():
     cmd    = kwargs.pop("command")
 
     dispatch = {
-        "health":            cmd_health,
-        "info":              cmd_info,
-        "metrics":           cmd_metrics,
-        "generate-series":   cmd_generate_series,
-        "generate-from-file": cmd_generate_from_file,
-        "profile-series":    cmd_profile_series,
-        "profile-from-file": cmd_profile_from_file,
-        "profile-batch":     cmd_profile_batch,
-        "profile-result":    cmd_profile_result,
+        "health":                  cmd_health,
+        "info":                    cmd_info,
+        "metrics":                 cmd_metrics,
+        "generate-series":         cmd_generate_series,
+        "generate-from-file":      cmd_generate_from_file,
+        "profile-series":          cmd_profile_series,
+        "profile-from-file":       cmd_profile_from_file,
+        "profile-batch":           cmd_profile_batch,
+        "profile-result":          cmd_profile_result,
+        "sensitivity-random":      cmd_sensitivity_random,
+        "sensitivity-per-metric":  cmd_sensitivity_per_metric,
     }
 
     fn = dispatch.get(cmd)

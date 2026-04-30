@@ -1,0 +1,6 @@
+[submodule "linux"]
+	path = linux
+	url = https://github.com/yuhong-zhong/linux.git
+[submodule "qemu"]
+	path = qemu
+	url = https://github.com/yuhong-zhong/qemu.git

@@ -1,0 +1,1 @@
+X(block)  X(cpu)  X(ib)  X(ib_ext)  X(ib_sw)  X(intel_hsw_cbo)  X(intel_hsw_hau)  X(intel_hsw_imc)  X(intel_hsw_qpi)  X(intel_hsw_r2pci)  X(mem)  X(net)  X(numa)  X(ps)  X(sysv_shm)  X(tmpfs)  X(vfs)  X(vm)
