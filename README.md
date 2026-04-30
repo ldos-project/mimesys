@@ -13,7 +13,6 @@ Diffusion-based system emulation framework. Trains a conditional diffusion model
 - [3. Training](#3-training)
 - [4. RL Fine-tuning](#4-rl-fine-tuning)
 - [5. Inference Server & Client](#5-inference-server--client)
-- [6. Reproducing Evaluation Results](#6-reproducing-evaluation-results)
 
 ---
 
@@ -305,27 +304,3 @@ uv run python -m mimesys.inference.client profile-from-file \
     --output metrics.png
 ```
 
----
-
-## 6. Reproducing Evaluation Results
-
-We evaluate Mimesys on workload mixes derived from existing benchmark suites. To collect metrics for these mixes, we extend [Memstrata](https://bitbucket.org/yuhong_zhong/memstrata/)’s VM creation and workload execution scripts.
-
-For benchmarks not covered by Memstrata, we incorporate additional suites (such as [MLPerf Inference](https://docs.mlcommons.org/inference/)) into our candidate pool.
-
-A subset of collected traces from CloudLab c220g2 machines, along with model checkpoints trained on c220g2, is provided under `artifacts/`.
-
-Using the inference server and client described above, generate synthetic workloads from these traces and profile the results:
-
-```bash
-uv run python -m mimesys.inference.client profile-batch \
-    --files /artifacts/traces/* \
-    --method diffusion \
-    --generation_strategy parallel_refine \
-    --poll_interval 15 \
-    --output batch_diffusion.png
-```
-
-The output figure reports aggregated normalized DTW per resource type. To evaluate baselines, replace `--method diffusion` with `nearest_neighbor` or `linear_interpolation`.
-
-To measure how benchmark applications (e.g., TPC-C on Silo) are affected by co-located resource contention, run them alongside the synthetic workloads generated as described [above](#5-inference-server--client).
