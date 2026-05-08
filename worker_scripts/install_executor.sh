@@ -40,13 +40,13 @@ bazel version
 
 HOME_PATH=${HOME_PATH:-/users/USERNAME}
 cd $HOME_PATH
-GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone git@github.com:ldos-project/llm-app-generation.git
-cd llm-app-generation && git checkout refactoring # TODO: remove this after refactoring is done
+GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone git@github.com:ldos-project/mimesys.git
+cd mimesys
 
 cd $HOME_PATH
-mv llm-app-generation/fleetbench fleetbench
+mv mimesys/fleetbench fleetbench
 cd fleetbench
-mkdir fleetbench/mimesys/execution_plans
+mkdir -p fleetbench/mimesys/execution_plans
 touch fleetbench/mimesys/execution_plans/plan_0.h5
 
 TACC_STATS_DIR=$HOME_PATH/HPCPerfStats/monitor/src sudo bazel run --config=clang --config=opt fleetbench/mimesys:mimesys_benchmark -- --benchmark_filter="BM_Mimesys"

@@ -48,22 +48,15 @@ sys.path.insert(0, REPO_ROOT)
 
 OUTPUT_PATH = os.path.expanduser("~/mimesys_training_data/surrogate_v2")
 
-PROFILING_MACHINES = [
-    "c220g2-011110.wisc.cloudlab.us",
-    "c220g2-030631.wisc.cloudlab.us",
-    "c220g2-011327.wisc.cloudlab.us",
-    "c220g2-010832.wisc.cloudlab.us",
-    "c220g2-011009.wisc.cloudlab.us",
-    "c220g2-011332.wisc.cloudlab.us",
-    "c220g2-011101.wisc.cloudlab.us",
-    "c220g2-010820.wisc.cloudlab.us",
-    "c220g2-010632.wisc.cloudlab.us",
-    "c220g2-011027.wisc.cloudlab.us",
-    "c220g2-010607.wisc.cloudlab.us",
-    "c220g2-011013.wisc.cloudlab.us",
-    "c220g2-011324.wisc.cloudlab.us",
-    "c220g2-011025.wisc.cloudlab.us",
-]
+_DEFAULT_PROFILING_MACHINES = []
+
+# Allow overriding the worker pool from the environment so we can target a
+# subset (e.g. one c220g5 host for a smoke test) without editing the file.
+_env_machines = os.environ.get("MIMESYS_PROFILING_MACHINES", "").strip()
+PROFILING_MACHINES = (
+    [h.strip() for h in _env_machines.split(",") if h.strip()]
+    if _env_machines else _DEFAULT_PROFILING_MACHINES
+)
 
 # SSH credentials — override via env vars for CI / different users
 SSH_USER     = os.environ.get("MIMESYS_SSH_USER",     "dhkim")
@@ -72,7 +65,8 @@ MY_HOSTNAME  = os.environ.get("MIMESYS_MY_HOSTNAME",  "mew3")
 
 NUM_ACTIONS    = 13
 NUM_THREADS    = 20
-BATCH_SIZE     = 16 * len(PROFILING_MACHINES)   # 224 per active-learning round
+_PER_MACHINE_BATCH = int(os.environ.get("MIMESYS_PER_MACHINE_BATCH", "16"))
+BATCH_SIZE     = _PER_MACHINE_BATCH * len(PROFILING_MACHINES)   # active-learning round size
 NUM_METRICS    = 26
 
 # 3:7:0 ratio parameters (30% hull, 70% fps, no IO mutation)

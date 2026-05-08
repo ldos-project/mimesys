@@ -172,11 +172,38 @@ def get_timestamp(grouped_trace):
     return float(grouped_trace["timestamp"][0].split()[0])
 
 
+# Trace-type fallbacks: across machine generations the IMC / LLC counter names
+# differ (Haswell: intel_hsw_*, Broadwell: intel_bdw_*, Skylake: intel_skx_*).
+_IMC_TRACE_TYPES = ("intel_hsw_imc", "intel_bdw_imc", "intel_skx_imc")
+_LLC_TRACE_TYPES = ("intel_hsw_cbo", "intel_bdw_cbo", "intel_skx_cha")
+
+
+def _select_traces(grouped_trace, candidate_keys):
+    for key in candidate_keys:
+        traces = grouped_trace.get(key)
+        if traces:
+            return traces
+    return []
+
+
+def detect_system_spec_from_trace(grouped_trace):
+    """Pick the right system_specs entry by inspecting which uncore counter
+    families are present.  c220g2 and c220g5 both expose 20 physical cores so
+    falling back to system_by_num_cores alone misclassifies c220g5 as c220g2.
+    """
+    if "intel_skx_imc" in grouped_trace or "intel_skx_cha" in grouped_trace:
+        return system_specs["c220g5"]
+    if "intel_hsw_imc" in grouped_trace or "intel_hsw_cbo" in grouped_trace:
+        num_cpu_cores = len(grouped_trace.get("cpu", []))
+        return system_by_num_cores.get(num_cpu_cores, system_specs["c220g2"])
+    num_cpu_cores = len(grouped_trace.get("cpu", []))
+    return system_by_num_cores.get(num_cpu_cores)
+
+
 def get_memory_bandwidth_from_grouped_trace(grouped_trace):
     total_bandwidth_bytes = 0
     timestamp = float(grouped_trace["timestamp"][0].split()[0])
-    imc_traces = grouped_trace.get("intel_hsw_imc", []) or grouped_trace.get("intel_bdw_imc", [])
-    for channel in imc_traces:
+    for channel in _select_traces(grouped_trace, _IMC_TRACE_TYPES):
         data = channel.split()
         if len(data) < 10:
             continue
@@ -185,7 +212,7 @@ def get_memory_bandwidth_from_grouped_trace(grouped_trace):
 
 
 def get_memory_bandwidth_from_grouped_trace_per_socket(grouped_trace):
-    imc_traces = grouped_trace.get("intel_hsw_imc", []) or grouped_trace.get("intel_bdw_imc", [])
+    imc_traces = _select_traces(grouped_trace, _IMC_TRACE_TYPES)
     traces_by_socket = defaultdict(lambda: defaultdict(int))
     for channel in imc_traces:
         data = channel.split()
@@ -201,7 +228,7 @@ def get_memory_bandwidth_from_grouped_trace_per_socket(grouped_trace):
 def get_l3_cache_usage_from_grouped_trace(grouped_trace):
     total = 0
     timestamp = float(grouped_trace["timestamp"][0].split()[0])
-    for channel in grouped_trace.get("intel_hsw_cbo", []):
+    for channel in _select_traces(grouped_trace, _LLC_TRACE_TYPES):
         data = channel.split()
         total += sum(int(x) for x in data[-4:])
     return timestamp, total
@@ -209,7 +236,7 @@ def get_l3_cache_usage_from_grouped_trace(grouped_trace):
 
 def get_l3_cache_usage_from_grouped_trace_per_socket(grouped_trace):
     traces_by_socket = defaultdict(lambda: defaultdict(int))
-    for channel in grouped_trace.get("intel_hsw_cbo", []):
+    for channel in _select_traces(grouped_trace, _LLC_TRACE_TYPES):
         data = channel.split()
         socket_id = data[1].split("/")[0]
         traces_by_socket[socket_id]["l3_cache_usage"] += sum(int(x) for x in data[-4:])
@@ -363,7 +390,7 @@ def process_trace(parsed_traces, period, duration):
         return []
 
     num_cpu_cores = len(parsed_traces[0]["cpu"])
-    system_spec = system_by_num_cores.get(num_cpu_cores)
+    system_spec = detect_system_spec_from_trace(parsed_traces[0])
 
     prev = defaultdict(int)
     prev["timestamp"] = 0
@@ -466,7 +493,7 @@ def process_trace_granular(
         return None
 
     num_cpu_cores = len(parsed_traces[0]["cpu"])
-    system_spec = system_by_num_cores.get(num_cpu_cores)
+    system_spec = detect_system_spec_from_trace(parsed_traces[0])
 
     prev = defaultdict(int)
     metrics = defaultdict(list)
@@ -612,160 +639,3 @@ def aggregate_profiled_metrics(profiled_metrics: Dict[str, List]):
         result_median[metric_name] = np.median(arr)
         result_std[metric_name] = np.std(arr)
     return result_median, result_std
-
-
-# ===========================================================================
-# Section 3 – PCM (Intel Performance Counter Monitor)
-# ===========================================================================
-
-import os as _os
-
-
-def _read_pcm_header(header_path):
-    with open(header_path, "r") as f:
-        core_header = f.readline().strip().split(",")
-        metric_header = f.readline().strip().split(",")
-    return core_header, metric_header
-
-
-def parse_pcm_trace_file(file_path):
-    """Parse a PCM CSV stats file. NOTE: not yet fully implemented."""
-    header_path = _os.path.dirname(file_path)
-    core_header, metric_header = _read_pcm_header(header_path + "/stats_header.txt")
-    header = [f"{core}_{metric}" for core, metric in zip(core_header, metric_header)]
-
-    with open(file_path, "r") as f:
-        lines = f.readlines()
-    trimmed_lines = lines[1:-1]
-    if not trimmed_lines:
-        return None, []
-
-    df = pl.DataFrame([line.strip().split(",") for line in trimmed_lines], schema=header)
-
-    available_metrics = ["System_Time"]
-    socket_metrics = ["LLCRDMISSLAT (ns)_SKT0"]
-    core_metrics = [
-        "Core0 (Socket 0)_IPC", "Core0 (Socket 0)_CFREQ",
-        "Core0 (Socket 0)_L3MPI", "Core0 (Socket 0)_L2MPI",
-        "Core0 (Socket 0)_L3OCC", "Core0 (Socket 0)_INST",
-    ]
-    df = df.select(available_metrics + socket_metrics + core_metrics)
-    df = df.with_columns([
-        pl.col(col).str.strip_chars() if df.schema[col] == pl.String else pl.col(col)
-        for col in df.columns
-    ])
-    df = df.with_columns([
-        pl.col(col).cast(pl.Float64) for col in df.columns if col != "System_Time"
-    ])
-    df = df.filter(pl.col("Core0 (Socket 0)_INST") > 2)
-    raise NotImplementedError("parse_pcm_trace_file is not yet fully implemented.")
-
-
-def process_pcm_trace(parsed_traces, period, duration):
-    """Aggregate system-wide metrics from PCM traces (richer output than TACC variant)."""
-    if not parsed_traces:
-        return []
-
-    num_cpu_cores = len(parsed_traces[0]["cpu"])
-    system_spec = system_by_num_cores.get(num_cpu_cores)
-
-    prev = defaultdict(int)
-    prev["timestamp"] = 0
-    metrics = {
-        "memory_bandwidths": [], "l3_cache_usages": [], "qpi_usages": [],
-        "pcie_usages": [], "memory_utilizations": [], "net_utilizations": [],
-        "avg_cpu_utilizations": [], "read_kb_sums": [], "write_kb_sums": [],
-        "numa_hits": [], "numa_misses": [],
-    }
-
-    for trace in parsed_traces:
-        if not trace:
-            continue
-        timestamp, memory_bandwidth = get_memory_bandwidth_from_grouped_trace(trace)
-        _, l3_cache_usage = get_l3_cache_usage_from_grouped_trace(trace)
-        qpi_usage = get_qpi_usage_from_grouped_trace(trace)
-        pcie_usage = get_pcie_usage_from_grouped_trace(trace)
-        cpu_utilization = calculate_cpu_utilization_from_list(trace["cpu"])
-        mem_utilization = calculate_memory_utilization_from_list(trace["mem"])
-        net_utilization = calculate_network_utilization_from_list(trace["net"])
-        read_kb_sum, write_kb_sum = calculate_io_utilization_from_list(trace["block"])
-        numa_hit, numa_miss = calculate_numa_miss_from_list(trace["numa"])
-
-        if prev["timestamp"] == 0:
-            prev.update({
-                "timestamp": timestamp, "memory_bandwidth": memory_bandwidth,
-                "l3_cache_usage": l3_cache_usage, "qpi_usage": qpi_usage,
-                "pcie_usage": pcie_usage, "net_utilization": net_utilization,
-                "cpu_utilization": cpu_utilization, "read_kb_sum": read_kb_sum,
-                "write_kb_sum": write_kb_sum, "numa_hit": numa_hit, "numa_miss": numa_miss,
-            })
-            continue
-
-        delta_time = timestamp - prev["timestamp"]
-        if delta_time <= period:
-            continue
-
-        bandwidth_diff = (memory_bandwidth - prev["memory_bandwidth"]) / 1e9
-        l3_cache_diff  = (l3_cache_usage  - prev["l3_cache_usage"])  / 1e6
-        qpi_diff       = (qpi_usage        - prev["qpi_usage"])       / 1e6
-        pcie_diff      = (pcie_usage       - prev["pcie_usage"])      / 1e6
-        cpu_util_per_core = average_cpu_utilization(prev["cpu_utilization"], cpu_utilization)
-
-        metrics["memory_bandwidths"].append(
-            min(100, bandwidth_diff / delta_time / float(system_spec["Memory BW"]) * 100)
-        )
-        metrics["l3_cache_usages"].append(l3_cache_diff / delta_time)
-        metrics["qpi_usages"].append(qpi_diff / delta_time)
-        metrics["pcie_usages"].append(pcie_diff / delta_time)
-        metrics["memory_utilizations"].append(mem_utilization[1] / mem_utilization[0] * 100)
-        metrics["net_utilizations"].append(
-            (net_utilization - prev["net_utilization"]) * 8 / 1e9 / delta_time
-            / float(system_spec["Network"] * 100)
-        )
-        metrics["avg_cpu_utilizations"].append(
-            min(150, sum(cpu_util_per_core) / len(cpu_util_per_core) * num_cpu_cores / int(system_spec["CPU"]))
-        )
-        metrics["read_kb_sums"].append((read_kb_sum  - prev["read_kb_sum"])  / delta_time)
-        metrics["write_kb_sums"].append((write_kb_sum - prev["write_kb_sum"]) / delta_time)
-        metrics["numa_hits"].append((numa_hit  - prev["numa_hit"])  / delta_time)
-        metrics["numa_misses"].append((numa_miss - prev["numa_miss"]) / delta_time)
-
-        prev.update({
-            "timestamp": timestamp, "memory_bandwidth": memory_bandwidth,
-            "l3_cache_usage": l3_cache_usage, "qpi_usage": qpi_usage,
-            "pcie_usage": pcie_usage, "net_utilization": net_utilization,
-            "cpu_utilization": cpu_utilization, "read_kb_sum": read_kb_sum,
-            "write_kb_sum": write_kb_sum, "numa_hit": numa_hit, "numa_miss": numa_miss,
-        })
-
-    if duration > 0:
-        _pad_or_truncate(metrics, int(duration / period))
-
-    return {
-        "cpu_util":       metrics["avg_cpu_utilizations"],
-        "memory_util":    metrics["memory_utilizations"],
-        "memory_bw":      metrics["memory_bandwidths"],
-        "io_read":        metrics["read_kb_sums"],
-        "io_write":       metrics["write_kb_sums"],
-        "l3_cache_usage": metrics["l3_cache_usages"],
-        "qpi_usage":      metrics["qpi_usages"],
-        "pcie_usage":     metrics["pcie_usages"],
-    }
-
-
-def get_pcm_stats_and_energy_from_benchmark_name(
-    base_path: str,
-    benchmark_name: str,
-    stats_file_format: str = "stats-{}.txt",
-    energy_file_format: str = "power-{}.log",
-):
-    tacc_stats_path = f"{base_path}/{stats_file_format.format(benchmark_name)}"
-    energy_path = f"{base_path}/{energy_file_format.format(benchmark_name)}"
-    _, parsed_traces = parse_pcm_trace_file(tacc_stats_path)
-    energy_traces = parse_energy_trace(energy_path)
-    period = 5
-    metrics_output = process_pcm_trace(parsed_traces, period=period, duration=-1)
-    energy_traces = get_energy_usage_time_series(energy_traces, period=period)
-    if energy_traces:
-        metrics_output["power"] = [e / period for e in energy_traces]
-    return metrics_output
