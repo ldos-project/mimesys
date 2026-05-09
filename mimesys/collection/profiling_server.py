@@ -5,6 +5,8 @@ import asyncio
 import concurrent.futures
 import tempfile
 
+import paramiko
+
 from mimesys.schema.machine import Machine
 import shutil
 import zipfile
@@ -36,7 +38,6 @@ class ProfileRequest(BaseModel):
     num_trials: int
     logger: Optional[Logger] = None
     model_type: str = "ema"
-    io_reward_weight: float = 1.0  # multiply IO metric's L1 loss by this weight in reward
     low_resource_penalty_weight: float = 0.0  # blend in relative L1 to penalize low-target errors more
 
     class Config:
@@ -178,44 +179,115 @@ class Profiler:
         machine.close_connection(scp=scp, client=client)
 
     def get_found_files(self, chunk_indices, destination_path):
-        file_paths = []
-        for chunk_idx in sorted(chunk_indices):
-            file_paths.append(f"validation-{chunk_idx}.zip")
-
-        found_files = {}
-        dest_files = []
-        for root, _, files in os.walk(destination_path):
-            for file in files:
-                dest_files.append(file)
-
-        for fname in dest_files:
-            for chunk_idx, watch_file in enumerate(file_paths):
-                if fname.endswith(watch_file):
-                    found_files[chunk_idx] = fname
-
-        # Sort found_files by chunk_idx (key)
-        found_files = {k: found_files[k] for k in sorted(found_files.keys())}
-
-        if len(list(found_files.values())) == len(file_paths):
-            return found_files
+        """Return chunk_idx => zip filename for every chunk whose validation-*.zip
+        has arrived at destination_path. Returns the dict only when all chunks
+        are present, else None (kept for legacy callers that rely on this all-or-
+        nothing semantics)."""
+        partial = self._scan_found_files(chunk_indices, destination_path)
+        if len(partial) == len(list(chunk_indices)):
+            return partial
         return None
 
-    async def wait_for_files(self, chunk_indices, destination_path, timeout=60000):
-        # file_paths = []
-        # for chunk_idx in sorted(chunk_indices):
-        #     file_paths.append(f"validation-{chunk_idx}.zip")
+    def _scan_found_files(self, chunk_indices, destination_path):
+        """Like get_found_files but returns whatever has arrived so far."""
+        watch = {ci: f"validation-{ci}.zip" for ci in sorted(chunk_indices)}
+        found = {}
+        for root, _, files in os.walk(destination_path):
+            for fname in files:
+                for ci, suffix in watch.items():
+                    if fname.endswith(suffix):
+                        found[ci] = fname
+        return dict(sorted(found.items()))
+
+    def _count_local_plans(self, destination_path, chunk_idx):
+        plans_dir = os.path.join(destination_path, f"chunk_{chunk_idx}", "plans")
+        if not os.path.isdir(plans_dir):
+            return 0
+        return sum(1 for f in os.listdir(plans_dir) if f.endswith(".h5"))
+
+    def _poll_remote_progress(self, pending_chunks):
+        """SSH each pending chunk's worker and count stats-plan_*.txt files in
+        /users/{user}/results — the in-progress signal that the benchmark is
+        emitting per-plan stats. Returns {chunk_idx: count_or_-1}.
+
+        Runs queries in parallel (one short-lived SSH per host) and swallows
+        per-host errors as -1 so a single flaky host never silences the whole
+        progress report."""
+        if not pending_chunks:
+            return {}
+
+        def _query(ci):
+            try:
+                hostname = self.worker_host_names[ci]
+            except IndexError:
+                return ci, -1
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                key = paramiko.RSAKey.from_private_key_file(self.private_key_path)
+                client.connect(hostname, username=self.user_name, pkey=key, timeout=10)
+                _, stdout, _ = client.exec_command(
+                    f"ls /users/{self.user_name}/results/stats-plan_*.txt 2>/dev/null | wc -l"
+                )
+                return ci, int(stdout.read().decode().strip() or "0")
+            except Exception:
+                return ci, -1
+            finally:
+                client.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(pending_chunks))) as ex:
+            return dict(ex.map(_query, pending_chunks))
+
+    async def wait_for_files(self, chunk_indices, destination_path,
+                             timeout=60000, poll_interval=30):
+        """Poll for validation-{idx}.zip per chunk. Prints a per-poll progress
+        line so the user can see how many plans each worker has finished and
+        which workers are still going."""
+        chunks = sorted(chunk_indices)
+        plan_totals = {ci: self._count_local_plans(destination_path, ci) for ci in chunks}
         start_time = time.time()
+        round_label = os.path.basename(destination_path.rstrip("/")) or "round"
+        first_done_ts = {}
+
+        def _short(host):
+            return host.split(".")[0]
+
         while True:
-            # from "my_destination_path", iterate all files and check if file name suffix matches
-            # file_path in file_paths.
-            found_files = self.get_found_files(chunk_indices, destination_path)
-            print(found_files)
-            if found_files:
+            elapsed = int(time.time() - start_time)
+            arrived = self._scan_found_files(chunks, destination_path)
+            done_now = set(arrived) - set(first_done_ts)
+            for ci in done_now:
+                first_done_ts[ci] = elapsed
+
+            pending = [ci for ci in chunks if ci not in arrived]
+            remote = self._poll_remote_progress(pending) if pending else {}
+
+            bits = []
+            for ci in chunks:
+                host = (self.worker_host_names[ci]
+                        if ci < len(self.worker_host_names) else f"chunk{ci}")
+                tag = _short(host)
+                tot = plan_totals.get(ci, "?")
+                if ci in arrived:
+                    bits.append(f"{tag}=DONE@{first_done_ts[ci]}s")
+                else:
+                    cnt = remote.get(ci, "?")
+                    if cnt == -1:
+                        bits.append(f"{tag}=ssh_err")
+                    else:
+                        bits.append(f"{tag}={cnt}/{tot}")
+            print(f"  [{round_label} elapsed={elapsed:5d}s done={len(arrived)}/{len(chunks)}] "
+                  + "  ".join(bits), flush=True)
+
+            if len(arrived) == len(chunks):
+                # legacy: extra sleep to let final scp/zip flush before parsing
                 await asyncio.sleep(10)
-                return found_files
+                return arrived
             if time.time() - start_time > timeout:
+                print(f"  [{round_label}] timeout after {timeout}s "
+                      f"({len(arrived)}/{len(chunks)} done)", flush=True)
                 return None
-            await asyncio.sleep(10)
+            await asyncio.sleep(poll_interval)
 
     def parse_metrics_from_zip(self, found_files: dict[int, str], destination_path: str, skip_parsing: bool = False):
         def get_plan_stat_pairs(chunk_idx, file_name):
@@ -514,9 +586,7 @@ class Profiler:
                                 ) / n
                                 w = req.low_resource_penalty_weight
                                 l1 = (1.0 - w) * l1 + w * rel_l1
-                            # Weight IO metric more heavily to encourage better IO prediction
-                            weight = req.io_reward_weight if target_metric == "io" else 1.0
-                            emd_error[target_metric] = l1 * weight
+                            emd_error[target_metric] = l1
 
                             if target_metric == "memory_bandwidth":
                                 print(f"batch={batch_idx} {target_metric}: gt={ground_truth[target_metric]} "

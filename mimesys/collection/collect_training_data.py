@@ -1,5 +1,5 @@
 """
-collect_surrogate_v2.py
+collect_training_data.py
 =======================
 Active-learning data collection with 13-action space
 (10 non-IO + Readahead[10] + Fallocate_4MB[11] + Hdd_1MB[12]).
@@ -10,11 +10,11 @@ Rounds 1+: hull:fps = 5:5 (io mutation disabled)
            - 50 % from hull interpolation  }
            - 50 % from fps novelty          } via propose_by_hull_mixed_fps_hybrid (hull_fps_ratio=1)
 
-Output:    ~/mimesys_training_data/surrogate_v2
+Output:    ~/mimesys_training_data/training_data_v1
 
 Usage:
   cd mimesys/collection/scripts
-  python collect_surrogate_v2.py [--rounds 50] [--restart]
+  python collect_training_data.py [--rounds 50] [--restart]
   # --rounds  : active-learning rounds after round 0 (default: 50)
   # --restart : delete any existing rounds and start fresh from round 0
 """
@@ -46,27 +46,24 @@ sys.path.insert(0, REPO_ROOT)
 # Config
 # ---------------------------------------------------------------------------
 
-OUTPUT_PATH = os.path.expanduser("~/mimesys_training_data/surrogate_v2")
+# Pull SSH credentials, worker host list, and controller hostname from the
+# same worker_scripts/config.py that install_remote_dependencies.py uses, so
+# there is one source of truth for "which hosts is this controller talking to".
+_WORKER_SCRIPTS_DIR = os.path.join(REPO_ROOT, "worker_scripts")
+if _WORKER_SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _WORKER_SCRIPTS_DIR)
+import config as worker_config
 
-_DEFAULT_PROFILING_MACHINES = []
+OUTPUT_PATH = os.path.expanduser("~/mimesys_training_data/training_data_v1")
 
-# Allow overriding the worker pool from the environment so we can target a
-# subset (e.g. one c220g5 host for a smoke test) without editing the file.
-_env_machines = os.environ.get("MIMESYS_PROFILING_MACHINES", "").strip()
-PROFILING_MACHINES = (
-    [h.strip() for h in _env_machines.split(",") if h.strip()]
-    if _env_machines else _DEFAULT_PROFILING_MACHINES
-)
-
-# SSH credentials — override via env vars for CI / different users
-SSH_USER     = os.environ.get("MIMESYS_SSH_USER",     "dhkim")
-SSH_KEY_PATH = os.environ.get("MIMESYS_SSH_KEY",      os.path.expanduser("~/.ssh/id_rsa_utns"))
-MY_HOSTNAME  = os.environ.get("MIMESYS_MY_HOSTNAME",  "mew3")
+PROFILING_MACHINES = list(worker_config.HOSTNAMES)
+SSH_USER           = worker_config.USERNAME
+SSH_KEY_PATH       = os.path.expanduser(worker_config.PRIVATE_KEY_PATH)
+MY_HOSTNAME        = worker_config.MY_HOSTNAME
 
 NUM_ACTIONS    = 13
 NUM_THREADS    = 20
-_PER_MACHINE_BATCH = int(os.environ.get("MIMESYS_PER_MACHINE_BATCH", "16"))
-BATCH_SIZE     = _PER_MACHINE_BATCH * len(PROFILING_MACHINES)   # active-learning round size
+BATCH_SIZE     = worker_config.PER_MACHINE_BATCH * len(PROFILING_MACHINES)   # active-learning round size
 NUM_METRICS    = 26
 
 # 3:7:0 ratio parameters (30% hull, 70% fps, no IO mutation)
@@ -690,59 +687,6 @@ def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
 
 
 # ---------------------------------------------------------------------------
-# Build verification
-# ---------------------------------------------------------------------------
-
-def verify_build(machines, user_name, private_key_path):
-    """
-    SSH into each machine in parallel and run a quick bazel build to confirm
-    the benchmark compiles cleanly.  Prints a per-machine pass/fail summary
-    and returns True only if every machine succeeds.
-    """
-    import concurrent.futures
-
-    build_cmd = (
-        "cd ~/fleetbench && "
-        "bazel build --config=clang --config=opt "
-        "fleetbench/mimesys:mimesys_benchmark 2>&1 | tail -3 && "
-        "echo BUILD_OK"
-    )
-
-    def _check_one(hostname):
-        machine = Machine.from_hostname(hostname)
-        try:
-            client, sftp = machine.initialize_connection(user_name, private_key_path)
-            _, stdout, stderr = client.exec_command(build_cmd)
-            exit_status = stdout.channel.recv_exit_status()
-            out = stdout.read().decode().strip()
-            machine.close_connection(sftp, client)
-            if exit_status == 0 and "BUILD_OK" in out:
-                print(f"  [OK]   {hostname}  — {out.splitlines()[-1] if out else 'build OK'}")
-                return hostname, True
-            else:
-                err = stderr.read().decode().strip()
-                print(f"  [FAIL] {hostname}  — exit={exit_status}  {err[-200:]}")
-                return hostname, False
-        except Exception as exc:
-            print(f"  [ERR]  {hostname}  — {exc}")
-            return hostname, False
-
-    print(f"\n=== Build verification ({len(machines)} machines, parallel) ===")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(machines)) as executor:
-        futures = [executor.submit(_check_one, h) for h in machines]
-        results = dict(f.result() for f in concurrent.futures.as_completed(futures))
-
-    n_ok   = sum(results.values())
-    n_fail = len(results) - n_ok
-    print(f"\nBuild check: {n_ok}/{len(machines)} passed, {n_fail} failed")
-    if n_fail:
-        failed = [h for h, ok in results.items() if not ok]
-        print(f"  Failed machines: {failed}")
-        print("  Fix the build on failed machines before running collection.")
-    return n_fail == 0
-
-
-# ---------------------------------------------------------------------------
 # Round loading helper
 # ---------------------------------------------------------------------------
 
@@ -801,11 +745,6 @@ def run_collection(n_rounds: int, restart: bool = False):
         worker_host_names=PROFILING_MACHINES,
         my_hostname=MY_HOSTNAME,
     ))
-
-    # ── Build verification (skipped) ─────────────────────────────────────────
-    # build_ok = verify_build(PROFILING_MACHINES, SSH_USER, SSH_KEY_PATH)
-    # if not build_ok:
-    #     raise SystemExit("Aborting: one or more machines failed the build check.")
 
     # ── Optional restart: wipe existing rounds ────────────────────────────────
     if restart:
@@ -928,7 +867,7 @@ if __name__ == "__main__":
                         help="Delete all existing round dirs and start fresh from round 0")
     args = parser.parse_args()
 
-    print(f"collect_surrogate_v2: round 0 (initial_candidates) + {args.rounds} "
+    print(f"collect_training_data: round 0 (initial_candidates) + {args.rounds} "
           f"active rounds → {OUTPUT_PATH}"
           + (" [RESTART]" if args.restart else ""))
     run_collection(n_rounds=args.rounds, restart=args.restart)
