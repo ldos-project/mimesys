@@ -32,7 +32,7 @@ legacy/                # the original bash + python drivers, kept for reference
 
 ## Five things you can do
 
-### 0. (CloudLab only) Resize the root disk
+### 0a. (CloudLab only) Resize the root disk
 CloudLab images ship with a small root partition.  Grow partition 3 to fill
 the device and then `resize2fs`:
 ```
@@ -41,6 +41,15 @@ the device and then `resize2fs`:
 ```
 This is destructive to the partition table; `--yes` is required.  Skip this
 step on any host where the root FS already spans the disk.
+
+### 0b. Create the virtiofs share directory
+Every VM mounts `$SHARED_DIR` (default `/dev/shm/shared`) as
+`/home/ubuntu/shared`.  Create it once on each host:
+```
+./mimebench.py init shared-dir
+```
+`vms create` calls this implicitly, so you only need it explicitly if you
+want to populate the share before any VMs exist.
 
 ### 1. Create VMs
 ```
@@ -58,9 +67,26 @@ Wraps `create_vm.sh`. After this, each VM has a virtiofs share mounted at
 ./mimebench.py install --vm vm3 deathstarbench    # DSB social + media
 ./mimebench.py install --vm vm9 ml                # MLPerf (sdxl, resnet50)
 ./mimebench.py install --vm vm10 graph            # GAPBS
+
+# Or, every real stack in one VM (long: hours):
+./mimebench.py install --vm vm1 --all
 ```
 SPEC, DLRM, and TPC-H require manual install steps; their stubs explain what
-to do (`install/spec.sh`, `install/dlrm.sh`, `install/tpch.sh`).
+to do (`install/spec.sh`, `install/dlrm.sh`, `install/tpch.sh`).  `--all`
+skips them — pass them explicitly alongside `--all` if you really want.
+
+Different VMs can be installed in parallel safely (different rootfs, different
+apt lock).  Same VM, multiple stacks: sequence them.
+
+Pass a CSV to `--vm` to fan out one detached child per VM, each writing to
+`/tmp/mimebench_logs/<vm>.log`:
+```
+./mimebench.py install --vm vm2,vm3,vm4,vm5,vm6,vm7,vm8,vm9 --all
+# returns immediately; tail -f /tmp/mimebench_logs/vm*.log to follow
+```
+Add `--wait` to block until every child finishes.  Each child uses
+`start_new_session=True` (Python equivalent of `setsid`) so installs survive
+the parent shell exiting.
 
 ### 3. Run a workload mix and profile every N seconds
 ```

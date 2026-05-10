@@ -50,17 +50,22 @@ def load_registry() -> dict[str, dict[str, str]]:
     return out
 
 
+def host_env_value(key: str, default: str = "") -> str:
+    """Read $KEY from the environment, falling back to its default in host.env."""
+    raw = os.environ.get(key)
+    if raw is not None:
+        return raw
+    needle = f': "${{{key}:='
+    for line in HOST_ENV.read_text().splitlines():
+        line = line.strip()
+        if line.startswith(needle):
+            return line[len(needle):].rstrip('}"')
+    return default
+
+
 def vm_pool_for_type(wtype: str) -> list[int]:
     """Read VM_POOL_<TYPE> from host.env (or current env)."""
-    raw = os.environ.get(f"VM_POOL_{wtype.upper()}")
-    if raw is None:
-        # Fall back to parsing host.env directly.
-        for line in HOST_ENV.read_text().splitlines():
-            line = line.strip()
-            key = f"VM_POOL_{wtype.upper()}"
-            if line.startswith(f': "${{{key}:='):
-                raw = line.split(":=", 1)[1].rstrip('}"')
-                break
+    raw = host_env_value(f"VM_POOL_{wtype.upper()}")
     if not raw:
         return []
     return [int(x) for x in raw.split(",") if x.strip()]
@@ -119,6 +124,30 @@ def run_mix(
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: init shared-dir
+# ---------------------------------------------------------------------------
+
+def ensure_shared_dir(path: str | None = None) -> str:
+    """Create the virtiofs share dir (host side) and make it world-writable.
+
+    `accessmode=passthrough` on the virtiofs mount means host UIDs are
+    presented to the guest verbatim, so the in-guest `ubuntu` user (uid 1000)
+    needs to be able to write here even though the host user is typically a
+    different uid.
+    """
+    target = path or host_env_value("SHARED_DIR", "/dev/shm/shared")
+    run(["sudo", "mkdir", "-p", target])
+    run(["sudo", "chmod", "777", target])
+    return target
+
+
+def cmd_init_shared_dir(args: argparse.Namespace) -> int:
+    target = ensure_shared_dir(args.path)
+    print(f"shared dir ready: {target}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: init resize-disk
 # ---------------------------------------------------------------------------
 
@@ -161,6 +190,9 @@ def cmd_init_resize_disk(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_vms_create(args: argparse.Namespace) -> int:
+    # create_vm.sh attaches a virtiofs share rooted at SHARED_DIR; bail if it
+    # isn't there yet.  Cheap and idempotent, so just do it.
+    ensure_shared_dir()
     for name in args.names:
         rc = run(["sudo", "bash", str(ROOT / "create_vm.sh"), name], check=False)
         if rc != 0:
@@ -173,31 +205,112 @@ def cmd_vms_create(args: argparse.Namespace) -> int:
 # Subcommand: install
 # ---------------------------------------------------------------------------
 
-def cmd_install(args: argparse.Namespace) -> int:
-    """Push install/ to /home/ubuntu/install and run install.sh STACK ... inside the VM."""
-    ssh_opts = os.environ.get("SSH_OPTS",
-                              "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR").split()
-    # Find the VM IP.
-    out = subprocess.check_output(
-        ["sudo", "virsh", "domifaddr", args.vm], text=True)
+# Real installers (each builds something).  Stubs (spec, dlrm, tpch) require
+# manual artifacts and are excluded from --all.
+ALL_STACKS = ["database", "bigdata", "kvstore", "web", "deathstarbench", "ml", "graph"]
+
+DEFAULT_INSTALL_LOG_DIR = "/tmp/mimebench_logs"
+
+
+def _install_one(vm: str, stacks: list[str]) -> int:
+    """Push install/ into a single VM and run the dispatcher there."""
+    ssh_opts = os.environ.get(
+        "SSH_OPTS",
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    ).split()
+
+    out = subprocess.check_output(["sudo", "virsh", "domifaddr", vm], text=True)
     ip = None
     for line in out.splitlines():
         if "vnet" in line:
             ip = line.split()[3].split("/")[0]
             break
     if not ip:
-        print(f"could not resolve IP for {args.vm}", file=sys.stderr)
+        print(f"[{vm}] could not resolve IP", file=sys.stderr)
         return 2
 
-    # rsync install/ into the VM.
-    rsync_cmd = ["rsync", "-az", "-e", "ssh " + " ".join(ssh_opts),
+    rsync_cmd = ["sudo", "rsync", "-az", "-e", "ssh " + " ".join(ssh_opts),
                  f"{INSTALL}/", f"ubuntu@{ip}:/home/ubuntu/install/"]
     run(rsync_cmd)
 
-    # Run installer.
-    ssh_cmd = ["ssh", *ssh_opts, f"ubuntu@{ip}",
-               "bash /home/ubuntu/install/install.sh " + " ".join(args.stacks)]
+    ssh_cmd = ["sudo", "ssh", *ssh_opts, f"ubuntu@{ip}",
+               "bash /home/ubuntu/install/install.sh " + " ".join(stacks)]
     return run(ssh_cmd, check=False)
+
+
+def _install_parallel(vms: list[str], stacks: list[str],
+                      log_dir: Path, wait: bool) -> int:
+    """Fan out: one detached child per VM, each writing to log_dir/<vm>.log.
+
+    Mirrors the pattern:
+        setsid bash -c "./mimebench.py install --vm vmN ..." </dev/null \\
+            >/tmp/mimebench_logs/vmN.log 2>&1 &
+    `start_new_session=True` is the Python equivalent of setsid -- the child
+    is detached from this terminal, so it survives even if mimebench.py is
+    killed.  Each child re-enters cmd_install with a single VM and runs the
+    foreground path.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print(f"launching {len(vms)} parallel installs, logs under {log_dir}/",
+          file=sys.stderr)
+
+    procs: list[tuple[str, subprocess.Popen, Path]] = []
+    for vm in vms:
+        log_path = log_dir / f"{vm}.log"
+        log_f = open(log_path, "wb")
+        cmd = [sys.executable, str(ROOT / "mimebench.py"),
+               "install", "--vm", vm, *stacks]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        procs.append((vm, proc, log_path))
+        print(f"  {vm}: pid={proc.pid} log={log_path}", file=sys.stderr)
+
+    if not wait:
+        print("detached; not waiting.  Tail logs in "
+              f"{log_dir}/ to follow progress.", file=sys.stderr)
+        return 0
+
+    rc = 0
+    for vm, proc, log_path in procs:
+        proc.wait()
+        if proc.returncode == 0:
+            print(f"  {vm}: done", file=sys.stderr)
+        else:
+            print(f"  {vm}: FAILED (rc={proc.returncode}) — see {log_path}",
+                  file=sys.stderr)
+            rc = proc.returncode
+    return rc
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Push install/ to /home/ubuntu/install and run install.sh STACK ... inside the VM(s)."""
+    stacks = list(args.stacks)
+    if args.all:
+        stacks = list(dict.fromkeys(ALL_STACKS + stacks))  # --all + extras, deduped
+    if not stacks:
+        print("nothing to install: pass STACK names or --all", file=sys.stderr)
+        return 2
+
+    vms = [v for v in args.vm.split(",") if v]
+    if not vms:
+        print("--vm must name at least one VM", file=sys.stderr)
+        return 2
+    parallel = args.parallel or len(vms) > 1
+
+    if not parallel:
+        return _install_one(vms[0], stacks)
+
+    return _install_parallel(
+        vms=vms,
+        stacks=stacks,
+        log_dir=Path(args.log_dir or DEFAULT_INSTALL_LOG_DIR),
+        wait=args.wait,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +494,14 @@ def build_parser() -> argparse.ArgumentParser:
     # init (optional one-shot host setup steps)
     pin = sub.add_parser("init", help="one-shot host setup steps")
     pin_sub = pin.add_subparsers(dest="init_cmd", required=True)
+
+    pis = pin_sub.add_parser(
+        "shared-dir",
+        help="create the virtiofs share dir (default $SHARED_DIR, /dev/shm/shared)")
+    pis.add_argument("--path", default=None,
+                     help="override SHARED_DIR from config/host.env")
+    pis.set_defaults(func=cmd_init_shared_dir)
+
     pir = pin_sub.add_parser(
         "resize-disk",
         help="(cloudlab) delete + recreate root partition to span the disk, then resize2fs")
@@ -401,9 +522,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     # install
     pi = sub.add_parser("install", help="rsync install/ into a VM and run install.sh STACK ...")
-    pi.add_argument("--vm", required=True, help="libvirt domain name (e.g. vm1)")
-    pi.add_argument("stacks", nargs="+",
-                    help="stack name(s) under install/: database, bigdata, kvstore, web, ml, graph, deathstarbench, dlrm, tpch, spec")
+    pi.add_argument("--vm", required=True,
+                    help="libvirt domain name, or a comma-separated list "
+                         "(e.g. vm2,vm3,vm4) to fan out one detached child per VM, "
+                         "each logging to --log-dir/<vm>.log.")
+    pi.add_argument("--all", action="store_true",
+                    help="install every real stack (database, bigdata, kvstore, web, "
+                         "deathstarbench, ml, graph); excludes stubs (dlrm, tpch, spec)")
+    pi.add_argument("--parallel", action="store_true",
+                    help="force the parallel/detached path even for a single --vm")
+    pi.add_argument("--wait", action="store_true",
+                    help="(parallel mode) block until every child finishes; "
+                         "default is to return immediately so the parent shell can exit")
+    pi.add_argument("--log-dir", default=None,
+                    help=f"(parallel mode) per-VM log directory (default {DEFAULT_INSTALL_LOG_DIR})")
+    pi.add_argument("stacks", nargs="*", default=[],
+                    help="stack name(s) under install/: database, bigdata, kvstore, web, "
+                         "ml, graph, deathstarbench, dlrm, tpch, spec")
     pi.set_defaults(func=cmd_install)
 
     # run-mix
