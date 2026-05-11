@@ -47,13 +47,17 @@ EOF
 </configuration>
 EOF
 
+    # Wipe stale HDFS state from any prior failed install: -force still prompts
+    # to confirm wiping previously-formatted state, and with stdin closed it
+    # spins on the prompt forever.
+    rm -rf /tmp/hadoop-ubuntu /home/ubuntu/hdfs/datanode
     mkdir -p /home/ubuntu/hdfs/datanode
     chmod -R 777 /home/ubuntu/hdfs/datanode
     [ -f ~/.ssh/id_rsa ] || ssh-keygen -t rsa -P '' -f ~/.ssh/id_rsa
     cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
     chmod 0600 ~/.ssh/authorized_keys
 
-    bin/hdfs namenode -format
+    bin/hdfs namenode -format -force </dev/null
     echo 'export PDSH_RCMD_TYPE=ssh' >> ~/.bashrc
 
     sed -i "s|<configuration>||"  etc/hadoop/mapred-site.xml
@@ -89,7 +93,7 @@ echo 'export PATH=$PATH:$SPARK_HOME/bin'            >> ~/.bashrc
 
 cd "$BASE_PATH"
 if [ ! -d "apache-maven" ]; then
-    wget https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz
+    wget https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz
     tar -xzvf apache-maven-3.9.11-bin.tar.gz
     mv apache-maven-3.9.11 apache-maven
 fi
@@ -106,15 +110,28 @@ if [ ! -d "HiBench" ]; then
 fi
 cd HiBench
 
-# Patch broken upstream URLs (preserved from the original installer).
+# Patch broken upstream URLs.
+# Upstream pom.xml files reference http://archive.apache.org (and, for mahout,
+# http://archive.cloudera.com — which is paywalled and dead). Apache only mirrors
+# *current* releases on closer.cgi, and the download-maven-plugin doesn't follow
+# Apache's mirror-picker HTML, so closer.cgi rewrites silently fail with
+# "Could not get content". Use archive.apache.org over https directly.
 for f in hadoopbench/nutchindexing/pom.xml hadoopbench/sql/pom.xml hadoopbench/mahout/pom.xml; do
     [ -f "$f.bak" ] || cp "$f" "$f.bak"
+    cp "$f.bak" "$f"  # restore before patching so the seds are idempotent
 done
-sed -i 's|<url>http://archive.apache.org/dist/nutch/apache-nutch-1.2-bin.tar.gz</url>|<url>https://www.apache.org/dyn/closer.cgi/nutch/apache-nutch-1.2-bin.tar.gz</url>|' hadoopbench/nutchindexing/pom.xml
-sed -i 's|<repo>http://archive.apache.org</repo>|<repo>https://www.apache.org/dyn/closer.cgi</repo>|;s|<file>dist/hive|<file>hive|' hadoopbench/sql/pom.xml
-sed -i 's|<repo1>http://archive.apache.org</repo1>|<repo1>https://www.apache.org/dyn/closer.cgi</repo1>|;s|<file1>dist/mahout|<file1>mahout|;s|<checksum1>32bb8d9429671c651ff8233676739f1f</checksum1>|<checksum1>19a1ef32c1580d27a3ac14749d0f515a</checksum1>|;s|<repo2>http://archive.cloudera.com</repo2>|<repo2>https://www.apache.org/dyn/closer.cgi</repo2>|;s|cdh5/cdh/5/mahout-0.9-cdh5.1.0.tar.gz|mahout/0.9/mahout-distribution-0.9.tar.gz|;s|aa953e0353ac104a22d314d15c88d78f|c2dac576f5ee3e16ff74bda9aec8b816|' hadoopbench/mahout/pom.xml
+sed -i 's|<url>http://archive.apache.org/dist/nutch/apache-nutch-1.2-bin.tar.gz</url>|<url>https://archive.apache.org/dist/nutch/apache-nutch-1.2-bin.tar.gz</url>|' hadoopbench/nutchindexing/pom.xml
+sed -i 's|<repo>http://archive.apache.org</repo>|<repo>https://archive.apache.org</repo>|' hadoopbench/sql/pom.xml
+sed -i 's|<repo1>http://archive.apache.org</repo1>|<repo1>https://archive.apache.org</repo1>|;s|<repo2>http://archive.cloudera.com</repo2>|<repo2>https://archive.apache.org</repo2>|;s|cdh5/cdh/5/mahout-0.9-cdh5.1.0.tar.gz|dist/mahout/0.11.0/apache-mahout-distribution-0.11.0.tar.gz|;s|aa953e0353ac104a22d314d15c88d78f|32bb8d9429671c651ff8233676739f1f|' hadoopbench/mahout/pom.xml
 
-mvn -Phadoopbench -Psparkbench -Dspark=2.4 -Dscala=2.11 clean package
+# HiBench builds into the shared dir. If we're the Nth VM to install and an
+# earlier VM has already produced the final assembly jar, skip the mvn run --
+# concurrent `mvn ... clean package` invocations on the same shared tree race
+# on target/maven-status files and fail with "createdFiles.lst: No such file
+# or directory".
+if [ ! -f "sparkbench/assembly/target/sparkbench-assembly-7.1.1-dist.jar" ]; then
+    mvn -Phadoopbench -Psparkbench -Dspark=2.4 -Dscala=2.11 clean package
+fi
 
 cp conf/hadoop.conf.template conf/hadoop.conf
 sed -i "s|^hibench.hadoop.home.*|hibench.hadoop.home /home/ubuntu/hadoop|" conf/hadoop.conf

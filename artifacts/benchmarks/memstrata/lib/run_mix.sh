@@ -170,7 +170,8 @@ for idx in "${!vm_arr[@]}"; do
     vm_scp_to "$dom" "$exp/prepare_exp.sh" "/home/ubuntu/prepare_exp.sh"
     vm_scp_to "$dom" "$exp/run_exp.sh"     "/home/ubuntu/run_exp.sh"
 
-    vm_ssh "$dom" "mkdir -p /home/ubuntu/shared && sudo mount -t virtiofs shared /home/ubuntu/shared || true"
+    # util-linux 2.34 on focal mis-resolves the virtiofs tag; call mount(2) directly.
+    vm_ssh "$dom" "mkdir -p /home/ubuntu/shared && if ! findmnt -t virtiofs /home/ubuntu/shared >/dev/null 2>&1; then sudo python3 -c \"import ctypes,os,sys; l=ctypes.CDLL('libc.so.6',use_errno=True); r=l.mount(b'shared',b'/home/ubuntu/shared',b'virtiofs',0,None); sys.exit(0 if r==0 else 'mount(2) failed: '+os.strerror(ctypes.get_errno()))\"; fi"
     vm_ssh "$dom" "bash /home/ubuntu/shared/create_symbolic_links.sh || true"
     vm_ssh "$dom" "source ~/.bashrc; bash /home/ubuntu/prepare_exp.sh"
 done

@@ -16,8 +16,13 @@ if [ ! -d "FASTER" ]; then
 fi
 mkdir -p FASTER/cc/build/Release
 cd FASTER/cc/build/Release
-cmake -DCMAKE_BUILD_TYPE=Release ../..
-make pmem_benchmark
+# Skip cmake+make if a previous VM already produced the binary on the shared
+# tree -- concurrent cmake configures race on writing CMakeCache.txt and the
+# generated build files.
+if [ ! -x pmem_benchmark ]; then
+    cmake -DCMAKE_BUILD_TYPE=Release ../..
+    make pmem_benchmark
+fi
 
 # Redis
 cd "$BASE_PATH"
@@ -33,7 +38,7 @@ sed -i -e '$a save ""' redis.conf
 # Maven (for YCSB)
 cd "$BASE_PATH"
 if [ ! -d "apache-maven" ]; then
-    wget https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz
+    wget https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz
     tar -xzvf apache-maven-3.9.11-bin.tar.gz
     mv apache-maven-3.9.11 apache-maven
 fi
@@ -48,5 +53,11 @@ if [ ! -d "YCSB" ]; then
     git clone https://github.com/brianfrankcooper/YCSB.git
 fi
 cd YCSB
-mvn -pl site.ycsb:redis-binding     -am clean package
-mvn -pl site.ycsb:memcached-binding -am clean package
+# Skip mvn build if the per-binding jars already exist -- concurrent mvn clean
+# package on the same shared tree races on target/maven-status files.
+if ! ls redis/target/redis-binding-*.jar >/dev/null 2>&1; then
+    mvn -pl site.ycsb:redis-binding -am clean package
+fi
+if ! ls memcached/target/memcached-binding-*.jar >/dev/null 2>&1; then
+    mvn -pl site.ycsb:memcached-binding -am clean package
+fi
