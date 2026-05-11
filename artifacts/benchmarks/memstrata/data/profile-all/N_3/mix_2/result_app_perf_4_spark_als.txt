@@ -1,0 +1,2 @@
+Type         Date       Time     Input_data_size      Duration(s)          Throughput(bytes/s)  Throughput/node     
+ALS          2026-05-11 07:36:19 120555808            87.277               1381301              1381301             

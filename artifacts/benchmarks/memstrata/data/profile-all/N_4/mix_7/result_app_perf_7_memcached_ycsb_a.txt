@@ -1,0 +1,224 @@
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -B -pl site.ycsb:memcached-binding -am package -DskipTests dependency:list -DoutputAbsoluteArtifactFilename -DappendOutput=false -DoutputFile=/tmp/tmp6vhXuq'
+[INFO] Scanning for projects...
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Build Order:
+[INFO] 
+[INFO] YCSB Root                                                          [pom]
+[INFO] Core YCSB                                                          [jar]
+[INFO] Per Datastore Binding descriptor                                   [jar]
+[INFO] YCSB Datastore Binding Parent                                      [pom]
+[INFO] memcached binding                                                  [jar]
+[INFO] 
+[INFO] ---------------------------< site.ycsb:root >---------------------------
+[INFO] Building YCSB Root 0.18.0-SNAPSHOT                                 [1/5]
+[INFO]   from pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ root ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ root ---
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ root ---
+[INFO] 
+[INFO] ---------------------------< site.ycsb:core >---------------------------
+[INFO] Building Core YCSB 0.18.0-SNAPSHOT                                 [2/5]
+[INFO]   from core/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ core ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ core ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ core ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] The encoding used to copy filtered properties files have not been set. This means that the same encoding will be used to copy filtered properties files as when copying other filtered resources. This might not be what you want! Run your build with --debug to see which files might be affected. Read more at https://maven.apache.org/plugins/maven-resources-plugin/examples/filtering-properties-files.html
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ core ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 63 source files to /home/ubuntu/shared/YCSB/core/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ core ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/core/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ core ---
+[INFO] Nothing to compile - all classes are up to date
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ core ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ core ---
+[INFO] Building jar: /home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ core ---
+[INFO] 
+[INFO] --------------< site.ycsb:datastore-specific-descriptor >---------------
+[INFO] Building Per Datastore Binding descriptor 0.18.0-SNAPSHOT          [3/5]
+[INFO]   from binding-parent/datastore-specific-descriptor/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ datastore-specific-descriptor ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ datastore-specific-descriptor ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ datastore-specific-descriptor ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/binding-parent/datastore-specific-descriptor/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ datastore-specific-descriptor ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ datastore-specific-descriptor ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] ----------------------< site.ycsb:binding-parent >----------------------
+[INFO] Building YCSB Datastore Binding Parent 0.18.0-SNAPSHOT             [4/5]
+[INFO]   from binding-parent/pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ binding-parent ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ binding-parent ---
+[INFO] 
+[INFO] --- dependency:2.10:copy-dependencies (stage-dependencies) @ binding-parent ---
+[INFO] 
+[INFO] --- dependency:2.10:list (default-cli) @ binding-parent ---
+[INFO] 
+[INFO] --------------------< site.ycsb:memcached-binding >---------------------
+[INFO] Building memcached binding 0.18.0-SNAPSHOT                         [5/5]
+[INFO]   from memcached/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ memcached-binding ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ memcached-binding ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ memcached-binding ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/memcached/src/main/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ memcached-binding ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 2 source files to /home/ubuntu/shared/YCSB/memcached/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ memcached-binding ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/memcached/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ memcached-binding ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ memcached-binding ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ memcached-binding ---
+[INFO] Building jar: /home/ubuntu/shared/YCSB/memcached/target/memcached-binding-0.18.0-SNAPSHOT.jar
+[INFO] 
+[INFO] --- dependency:2.10:copy-dependencies (stage-dependencies) @ memcached-binding ---
+[INFO] Copying /home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar to /home/ubuntu/shared/YCSB/memcached/target/dependency/core-0.18.0-SNAPSHOT.jar
+[INFO] org.apache.htrace:htrace-core4:jar:4.1.0-incubating already exists in destination.
+[INFO] org.hdrhistogram:HdrHistogram:jar:2.1.12 already exists in destination.
+[INFO] log4j:log4j:jar:1.2.17 already exists in destination.
+[INFO] org.codehaus.jackson:jackson-mapper-asl:jar:1.9.13 already exists in destination.
+[INFO] net.spy:spymemcached:jar:2.11.4 already exists in destination.
+[INFO] org.codehaus.jackson:jackson-core-asl:jar:1.9.4 already exists in destination.
+[INFO] 
+[INFO] --- assembly:2.5.5:single (default) @ memcached-binding ---
+[INFO] Building tar: /home/ubuntu/shared/YCSB/memcached/target/ycsb-memcached-binding-0.18.0-SNAPSHOT.tar.gz
+[INFO] 
+[INFO] --- dependency:2.10:list (default-cli) @ memcached-binding ---
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary for YCSB Root 0.18.0-SNAPSHOT:
+[INFO] 
+[INFO] YCSB Root .......................................... SUCCESS [  2.555 s]
+[INFO] Core YCSB .......................................... SUCCESS [  3.576 s]
+[INFO] Per Datastore Binding descriptor ................... SUCCESS [  0.384 s]
+[INFO] YCSB Datastore Binding Parent ...................... SUCCESS [  0.731 s]
+[INFO] memcached binding .................................. SUCCESS [  1.955 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  10.074 s
+[INFO] Finished at: 2026-05-11T09:34:36Z
+[INFO] ------------------------------------------------------------------------
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /home/ubuntu/shared/YCSB/memcached/conf:/home/ubuntu/shared/YCSB/memcached/target/memcached-binding-0.18.0-SNAPSHOT.jar:/home/ubuntu/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/home/ubuntu/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/home/ubuntu/.m2/repository/log4j/log4j/1.2.17/log4j-1.2.17.jar:/home/ubuntu/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.13/jackson-mapper-asl-1.9.13.jar:/home/ubuntu/.m2/repository/net/spy/spymemcached/2.11.4/spymemcached-2.11.4.jar:/home/ubuntu/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.MemcachedClient -s -P workloads/workloada -p memcached.hosts=127.0.0.1 -p threadcount=2 -t
+Command line: -db site.ycsb.db.MemcachedClient -s -P workloads/workloada -p memcached.hosts=127.0.0.1 -p threadcount=2 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+log4j:WARN No appenders could be found for logger (org.apache.htrace.core.Tracer).
+log4j:WARN Please initialize the log4j system properly.
+log4j:WARN See http://logging.apache.org/log4j/1.2/faq.html#noconfig for more info.
+Starting test.
+2026-05-11 09:34:37:347 0 sec: 0 operations; est completion in 0 second 
+2026-05-11 09:34:37.546 INFO net.spy.memcached.MemcachedConnection:  Added {QA sa=/127.0.0.1:11211, #Rops=0, #Wops=0, #iq=0, topRop=null, topWop=null, toWrite=0, interested=0} to connect queue
+2026-05-11 09:34:37.547 INFO net.spy.memcached.MemcachedConnection:  Added {QA sa=/127.0.0.1:11211, #Rops=0, #Wops=0, #iq=0, topRop=null, topWop=null, toWrite=0, interested=0} to connect queue
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-05-11 09:34:47:346 10 sec: 163488 operations; 16348.8 current ops/sec; est completion in 4 minutes [READ: Count=81970, Max=22879, Min=68, Avg=116.17, 50=98, 90=135, 99=429, 99.9=1651, 99.99=6855] [UPDATE: Count=81711, Max=82687, Min=71, Avg=114.82, 50=93, 90=131, 99=448, 99.9=1541, 99.99=10543] 
+2026-05-11 09:34:57:346 20 sec: 368337 operations; 20484.9 current ops/sec; est completion in 4 minutes [READ: Count=102524, Max=27391, Min=62, Avg=96.82, 50=93, 90=113, 99=185, 99.9=459, 99.99=4235] [UPDATE: Count=102198, Max=28111, Min=64, Avg=92.98, 50=86, 90=106, 99=184, 99.9=488, 99.99=5855] 
+2026-05-11 09:35:07:346 30 sec: 592515 operations; 22417.8 current ops/sec; est completion in 3 minutes [READ: Count=112155, Max=8943, Min=63, Avg=89.4, 50=84, 90=106, 99=147, 99.9=569, 99.99=2315] [UPDATE: Count=111993, Max=5215, Min=64, Avg=84.84, 50=82, 90=98, 99=138, 99.9=406, 99.99=2233] 
+2026-05-11 09:35:17:346 40 sec: 807399 operations; 21488.4 current ops/sec; est completion in 3 minutes [READ: Count=107259, Max=29311, Min=61, Avg=92.92, 50=87, 90=110, 99=179, 99.9=287, 99.99=1948] [UPDATE: Count=107702, Max=29535, Min=64, Avg=89.14, 50=83, 90=104, 99=171, 99.9=321, 99.99=3231] 
+2026-05-11 09:35:27:346 50 sec: 1027864 operations; 22046.5 current ops/sec; est completion in 3 minutes [READ: Count=110224, Max=24463, Min=62, Avg=90.1, 50=86, 90=105, 99=217, 99.9=270, 99.99=2587] [UPDATE: Count=110315, Max=24527, Min=61, Avg=86.9, 50=81, 90=99, 99=239, 99.9=291, 99.99=2219] 
+2026-05-11 09:35:37:346 60 sec: 1248701 operations; 22083.7 current ops/sec; est completion in 3 minutes [READ: Count=110434, Max=24447, Min=61, Avg=90.32, 50=86, 90=105, 99=177, 99.9=216, 99.99=1922] [UPDATE: Count=110258, Max=25007, Min=63, Avg=86.72, 50=82, 90=99, 99=170, 99.9=218, 99.99=1386] 
+2026-05-11 09:35:47:346 70 sec: 1478268 operations; 22956.7 current ops/sec; est completion in 2 minutes [READ: Count=114723, Max=12975, Min=63, Avg=86.77, 50=84, 90=104, 99=135, 99.9=194, 99.99=1806] [UPDATE: Count=114843, Max=13247, Min=64, Avg=83.4, 50=77, 90=96, 99=131, 99.9=201, 99.99=2109] 
+2026-05-11 09:35:57:346 80 sec: 1708203 operations; 22993.5 current ops/sec; est completion in 2 minutes [READ: Count=115039, Max=5047, Min=61, Avg=86.45, 50=85, 90=100, 99=134, 99.9=222, 99.99=2653] [UPDATE: Count=115000, Max=9631, Min=63, Avg=83.51, 50=80, 90=93, 99=129, 99.9=227, 99.99=3201] 
+2026-05-11 09:36:07:346 90 sec: 1932394 operations; 22419.1 current ops/sec; est completion in 2 minutes [READ: Count=112008, Max=26431, Min=61, Avg=88.83, 50=84, 90=105, 99=220, 99.9=328, 99.99=3495] [UPDATE: Count=112223, Max=26079, Min=62, Avg=85.65, 50=79, 90=106, 99=232, 99.9=372, 99.99=3309] 
+2026-05-11 09:36:17:348 100 sec: 2137494 operations; 20510 current ops/sec; est completion in 2 minutes [READ: Count=102334, Max=19119, Min=60, Avg=96.69, 50=83, 90=119, 99=266, 99.9=414, 99.99=2181] [UPDATE: Count=102710, Max=19343, Min=63, Avg=94.16, 50=77, 90=117, 99=272, 99.9=400, 99.99=2239] 
+2026-05-11 09:36:27:346 110 sec: 2368549 operations; 23105.5 current ops/sec; est completion in 2 minutes [READ: Count=115494, Max=4175, Min=61, Avg=86.03, 50=85, 90=100, 99=132, 99.9=250, 99.99=2241] [UPDATE: Count=115452, Max=9479, Min=63, Avg=82.77, 50=82, 90=93, 99=127, 99.9=283, 99.99=2745] 
+2026-05-11 09:36:37:346 120 sec: 2599212 operations; 23066.3 current ops/sec; est completion in 1 minute [READ: Count=115473, Max=11775, Min=61, Avg=86.11, 50=85, 90=101, 99=124, 99.9=217, 99.99=3449] [UPDATE: Count=115274, Max=11911, Min=62, Avg=83.12, 50=84, 90=97, 99=121, 99.9=220, 99.99=3313] 
+2026-05-11 09:36:47:346 130 sec: 2804234 operations; 20502.2 current ops/sec; est completion in 1 minute [READ: Count=102547, Max=31087, Min=62, Avg=96.84, 50=83, 90=123, 99=267, 99.9=300, 99.99=3571] [UPDATE: Count=102488, Max=31583, Min=63, Avg=94.05, 50=77, 90=121, 99=274, 99.9=318, 99.99=4127] 
+2026-05-11 09:36:57:346 140 sec: 3029464 operations; 22523 current ops/sec; est completion in 1 minute [READ: Count=112667, Max=11855, Min=61, Avg=88.12, 50=85, 90=107, 99=126, 99.9=211, 99.99=3229] [UPDATE: Count=112582, Max=11855, Min=63, Avg=85.24, 50=80, 90=109, 99=121, 99.9=239, 99.99=2499] 
+2026-05-11 09:37:07:346 150 sec: 3255502 operations; 22603.8 current ops/sec; est completion in 1 minute [READ: Count=112978, Max=7155, Min=59, Avg=87.91, 50=85, 90=104, 99=146, 99.9=308, 99.99=3919] [UPDATE: Count=113005, Max=7579, Min=63, Avg=84.91, 50=84, 90=97, 99=142, 99.9=349, 99.99=3849] 
+2026-05-11 09:37:17:346 160 sec: 3488609 operations; 23310.7 current ops/sec; est completion in 1 minute [READ: Count=116481, Max=13639, Min=62, Avg=84.94, 50=80, 90=104, 99=134, 99.9=181, 99.99=2819] [UPDATE: Count=116611, Max=22479, Min=64, Avg=82.8, 50=73, 90=97, 99=130, 99.9=177, 99.99=3089] 
+2026-05-11 09:37:27:346 170 sec: 3716229 operations; 22762 current ops/sec; est completion in 59 seconds [READ: Count=113909, Max=9663, Min=60, Avg=86.98, 50=83, 90=101, 99=163, 99.9=292, 99.99=3101] [UPDATE: Count=113661, Max=34207, Min=62, Avg=84.66, 50=81, 90=98, 99=159, 99.9=315, 99.99=2773] 
+2026-05-11 09:37:37:346 180 sec: 3940765 operations; 22453.6 current ops/sec; est completion in 49 seconds [READ: Count=112568, Max=8071, Min=60, Avg=88.56, 50=86, 90=101, 99=132, 99.9=560, 99.99=3711] [UPDATE: Count=111963, Max=6615, Min=63, Avg=85.56, 50=85, 90=97, 99=129, 99.9=525, 99.99=3193] 
+2026-05-11 09:37:47:346 190 sec: 4155872 operations; 21510.7 current ops/sec; est completion in 39 seconds [READ: Count=107304, Max=7127, Min=56, Avg=92.51, 50=86, 90=118, 99=172, 99.9=315, 99.99=3449] [UPDATE: Count=107826, Max=10095, Min=60, Avg=89.48, 50=85, 90=117, 99=167, 99.9=306, 99.99=3533] 
+2026-05-11 09:37:57:346 200 sec: 4375393 operations; 21952.1 current ops/sec; est completion in 29 seconds [READ: Count=109943, Max=15535, Min=58, Avg=90.82, 50=86, 90=101, 99=152, 99.9=908, 99.99=4335] [UPDATE: Count=109555, Max=8127, Min=60, Avg=87.13, 50=84, 90=97, 99=147, 99.9=614, 99.99=3463] 
+2026-05-11 09:38:06.290 INFO net.spy.memcached.MemcachedConnection:  Shut down memcached client
+2026-05-11 09:38:07:346 210 sec: 4573987 operations; 19859.4 current ops/sec; est completion in 20 seconds [READ: Count=98922, Max=23727, Min=62, Avg=94.91, 50=89, 90=104, 99=161, 99.9=557, 99.99=6391] [CLEANUP: Count=1, Max=5859, Min=5856, Avg=5858, 50=5859, 90=5859, 99=5859, 99.9=5859, 99.99=5859] [UPDATE: Count=99712, Max=11095, Min=64, Avg=91.19, 50=86, 90=99, 99=158, 99.9=583, 99.99=4423] 
+2026-05-11 09:38:17:346 220 sec: 4698376 operations; 12438.9 current ops/sec; est completion in 15 seconds [READ: Count=61877, Max=13167, Min=61, Avg=79.53, 50=75, 90=92, 99=149, 99.9=521, 99.99=4215] [CLEANUP: Count=0, Max=0, Min=0, Avg=0, 50=0, 90=0, 99=0, 99.9=0, 99.99=0] [UPDATE: Count=62480, Max=15415, Min=59, Avg=78.16, 50=70, 90=86, 99=148, 99.9=756, 99.99=4479] 
+2026-05-11 09:38:27:346 230 sec: 4820073 operations; 12169.7 current ops/sec; est completion in 9 second [READ: Count=60965, Max=13879, Min=58, Avg=81.68, 50=76, 90=90, 99=152, 99.9=790, 99.99=3045] [CLEANUP: Count=0, Max=0, Min=0, Avg=0, 50=0, 90=0, 99=0, 99.9=0, 99.99=0] [UPDATE: Count=60713, Max=7747, Min=62, Avg=79.53, 50=72, 90=86, 99=146, 99.9=994, 99.99=4531] 
+2026-05-11 09:38:37:346 240 sec: 4940644 operations; 12057.1 current ops/sec; est completion in 3 second [READ: Count=60242, Max=9935, Min=61, Avg=82.29, 50=76, 90=95, 99=201, 99.9=609, 99.99=3409] [CLEANUP: Count=0, Max=0, Min=0, Avg=0, 50=0, 90=0, 99=0, 99.9=0, 99.99=0] [UPDATE: Count=60332, Max=9943, Min=61, Avg=80.46, 50=70, 90=90, 99=203, 99.9=597, 99.99=3939] 
+2026-05-11 09:38:41.922 INFO net.spy.memcached.MemcachedConnection:  Shut down memcached client
+2026-05-11 09:38:41:922 244 sec: 5000000 operations; 12968.32 current ops/sec; [READ: Count=29895, Max=8311, Min=61, Avg=76.76, 50=70, 90=82, 99=148, 99.9=444, 99.99=2611] [CLEANUP: Count=1, Max=756, Min=756, Avg=756, 50=756, 90=756, 99=756, 99.9=756, 99.99=756] [UPDATE: Count=29458, Max=7379, Min=63, Avg=74.4, 50=70, 90=76, 99=141, 99.9=399, 99.99=3591] 
+[OVERALL], RunTime(ms), 244577
+[OVERALL], Throughput(ops/sec), 20443.45952399449
+[TOTAL_GCS_PS_Scavenge], Count, 385
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 1536
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.6280230765771107
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 385
+[TOTAL_GC_TIME], Time(ms), 1536
+[TOTAL_GC_TIME_%], Time(%), 0.6280230765771107
+[READ], Operations, 2499935
+[READ], AverageLatency(us), 89.99649830895603
+[READ], MinLatency(us), 56
+[READ], MaxLatency(us), 31087
+[READ], 50thPercentileLatency(us), 85
+[READ], 95thPercentileLatency(us), 119
+[READ], 99thPercentileLatency(us), 201
+[READ], Return=OK, 2499935
+[CLEANUP], Operations, 2
+[CLEANUP], AverageLatency(us), 3307.0
+[CLEANUP], MinLatency(us), 756
+[CLEANUP], MaxLatency(us), 5859
+[CLEANUP], 50thPercentileLatency(us), 756
+[CLEANUP], 95thPercentileLatency(us), 5859
+[CLEANUP], 99thPercentileLatency(us), 5859
+[UPDATE], Operations, 2500065
+[UPDATE], AverageLatency(us), 86.98586436752645
+[UPDATE], MinLatency(us), 59
+[UPDATE], MaxLatency(us), 82687
+[UPDATE], 50thPercentileLatency(us), 82
+[UPDATE], 95thPercentileLatency(us), 114
+[UPDATE], 99thPercentileLatency(us), 206
+[UPDATE], Return=OK, 2500065

@@ -1,0 +1,226 @@
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -B -pl site.ycsb:redis-binding -am package -DskipTests dependency:list -DoutputAbsoluteArtifactFilename -DappendOutput=false -DoutputFile=/tmp/tmpLEAedk'
+[INFO] Scanning for projects...
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Build Order:
+[INFO] 
+[INFO] YCSB Root                                                          [pom]
+[INFO] Core YCSB                                                          [jar]
+[INFO] Per Datastore Binding descriptor                                   [jar]
+[INFO] YCSB Datastore Binding Parent                                      [pom]
+[INFO] Redis DB Binding                                                   [jar]
+[INFO] 
+[INFO] ---------------------------< site.ycsb:root >---------------------------
+[INFO] Building YCSB Root 0.18.0-SNAPSHOT                                 [1/5]
+[INFO]   from pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ root ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ root ---
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ root ---
+[INFO] 
+[INFO] ---------------------------< site.ycsb:core >---------------------------
+[INFO] Building Core YCSB 0.18.0-SNAPSHOT                                 [2/5]
+[INFO]   from core/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ core ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ core ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ core ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] The encoding used to copy filtered properties files have not been set. This means that the same encoding will be used to copy filtered properties files as when copying other filtered resources. This might not be what you want! Run your build with --debug to see which files might be affected. Read more at https://maven.apache.org/plugins/maven-resources-plugin/examples/filtering-properties-files.html
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ core ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 63 source files to /home/ubuntu/shared/YCSB/core/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ core ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/core/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ core ---
+[INFO] Nothing to compile - all classes are up to date
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ core ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ core ---
+[INFO] Building jar: /home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ core ---
+[INFO] 
+[INFO] --------------< site.ycsb:datastore-specific-descriptor >---------------
+[INFO] Building Per Datastore Binding descriptor 0.18.0-SNAPSHOT          [3/5]
+[INFO]   from binding-parent/datastore-specific-descriptor/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ datastore-specific-descriptor ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ datastore-specific-descriptor ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ datastore-specific-descriptor ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/binding-parent/datastore-specific-descriptor/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ datastore-specific-descriptor ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ datastore-specific-descriptor ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] ----------------------< site.ycsb:binding-parent >----------------------
+[INFO] Building YCSB Datastore Binding Parent 0.18.0-SNAPSHOT             [4/5]
+[INFO]   from binding-parent/pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ binding-parent ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ binding-parent ---
+[INFO] 
+[INFO] --- dependency:2.10:copy-dependencies (stage-dependencies) @ binding-parent ---
+[INFO] 
+[INFO] --- dependency:2.10:list (default-cli) @ binding-parent ---
+[INFO] 
+[INFO] ----------------------< site.ycsb:redis-binding >-----------------------
+[INFO] Building Redis DB Binding 0.18.0-SNAPSHOT                          [5/5]
+[INFO]   from redis/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ redis-binding ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ redis-binding ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ redis-binding ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/redis/src/main/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ redis-binding ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 2 source files to /home/ubuntu/shared/YCSB/redis/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ redis-binding ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/redis/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ redis-binding ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ redis-binding ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ redis-binding ---
+[INFO] Building jar: /home/ubuntu/shared/YCSB/redis/target/redis-binding-0.18.0-SNAPSHOT.jar
+[INFO] 
+[INFO] --- dependency:2.10:copy-dependencies (stage-dependencies) @ redis-binding ---
+[INFO] redis.clients:jedis:jar:2.9.0 already exists in destination.
+[INFO] org.apache.commons:commons-pool2:jar:2.4.2 already exists in destination.
+[INFO] 
+[INFO] --- assembly:2.5.5:single (default) @ redis-binding ---
+[WARNING] The following patterns were never triggered in this artifact exclusion filter:
+o  '*:sources'
+
+[INFO] Building tar: /home/ubuntu/shared/YCSB/redis/target/ycsb-redis-binding-0.18.0-SNAPSHOT.tar.gz
+[INFO] 
+[INFO] --- dependency:2.10:list (default-cli) @ redis-binding ---
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary for YCSB Root 0.18.0-SNAPSHOT:
+[INFO] 
+[INFO] YCSB Root .......................................... SUCCESS [  2.864 s]
+[INFO] Core YCSB .......................................... SUCCESS [  3.679 s]
+[INFO] Per Datastore Binding descriptor ................... SUCCESS [  0.402 s]
+[INFO] YCSB Datastore Binding Parent ...................... SUCCESS [  0.811 s]
+[INFO] Redis DB Binding ................................... SUCCESS [  1.487 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  10.107 s
+[INFO] Finished at: 2026-05-11T09:13:41Z
+[INFO] ------------------------------------------------------------------------
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /home/ubuntu/shared/YCSB/redis/conf:/home/ubuntu/shared/YCSB/redis/target/redis-binding-0.18.0-SNAPSHOT.jar:/home/ubuntu/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/home/ubuntu/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/home/ubuntu/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/home/ubuntu/.m2/repository/redis/clients/jedis/2.9.0/jedis-2.9.0.jar:/home/ubuntu/.m2/repository/org/apache/commons/commons-pool2/2.4.2/commons-pool2-2.4.2.jar:/home/ubuntu/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.RedisClient -s -P workloads/workloadb -p redis.host=127.0.0.1 -p redis.port=6379 -p threadcount=3 -t
+Command line: -db site.ycsb.db.RedisClient -s -P workloads/workloadb -p redis.host=127.0.0.1 -p redis.port=6379 -p threadcount=3 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+2026-05-11 09:13:42:065 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-05-11 09:13:52:028 10 sec: 392288 operations; 39228.8 current ops/sec; est completion in 6 minutes [READ: Count=372864, Max=15607, Min=33, Avg=73.39, 50=68, 90=88, 99=144, 99.9=1110, 99.99=6647] [UPDATE: Count=19661, Max=21455, Min=30, Avg=72.82, 50=62, 90=88, 99=168, 99.9=1581, 99.99=9447] 
+2026-05-11 09:14:02:029 20 sec: 838224 operations; 44589.14 current ops/sec; est completion in 5 minutes [READ: Count=423543, Max=12303, Min=33, Avg=66.03, 50=63, 90=74, 99=109, 99.9=925, 99.99=3997] [UPDATE: Count=22180, Max=4803, Min=32, Avg=58.81, 50=56, 90=67, 99=105, 99.9=699, 99.99=2119] 
+2026-05-11 09:14:12:028 30 sec: 1261185 operations; 42300.33 current ops/sec; est completion in 5 minutes [READ: Count=401781, Max=19567, Min=34, Avg=69.53, 50=64, 90=82, 99=122, 99.9=1138, 99.99=4743] [UPDATE: Count=21214, Max=10471, Min=31, Avg=63.74, 50=57, 90=76, 99=120, 99.9=1078, 99.99=8743] 
+2026-05-11 09:14:22:030 40 sec: 1703737 operations; 44250.77 current ops/sec; est completion in 5 minutes [READ: Count=420546, Max=11687, Min=33, Avg=66.54, 50=63, 90=74, 99=106, 99.9=1090, 99.99=3937] [UPDATE: Count=22127, Max=4025, Min=29, Avg=59.27, 50=56, 90=66, 99=96, 99.9=1095, 99.99=3313] 
+2026-05-11 09:14:32:028 50 sec: 2148017 operations; 44432.44 current ops/sec; est completion in 5 minutes [READ: Count=421741, Max=11927, Min=32, Avg=66.26, 50=63, 90=74, 99=107, 99.9=944, 99.99=4343] [UPDATE: Count=22364, Max=6355, Min=30, Avg=59.02, 50=56, 90=67, 99=103, 99.9=932, 99.99=6187] 
+2026-05-11 09:14:42:029 60 sec: 2576813 operations; 42875.31 current ops/sec; est completion in 4 minutes [READ: Count=407498, Max=13295, Min=32, Avg=68.61, 50=64, 90=82, 99=130, 99.9=1023, 99.99=4079] [UPDATE: Count=21336, Max=8407, Min=31, Avg=62.5, 50=58, 90=76, 99=123, 99.9=1101, 99.99=3601] 
+2026-05-11 09:14:52:028 70 sec: 3011814 operations; 43504.45 current ops/sec; est completion in 4 minutes [READ: Count=413353, Max=9855, Min=30, Avg=67.67, 50=63, 90=77, 99=125, 99.9=956, 99.99=4151] [UPDATE: Count=21657, Max=5295, Min=31, Avg=60.81, 50=57, 90=73, 99=114, 99.9=995, 99.99=3389] 
+2026-05-11 09:15:02:028 80 sec: 3436346 operations; 42453.2 current ops/sec; est completion in 4 minutes [READ: Count=403407, Max=32719, Min=33, Avg=69.35, 50=65, 90=84, 99=128, 99.9=849, 99.99=3161] [UPDATE: Count=21116, Max=8091, Min=30, Avg=63.76, 50=58, 90=78, 99=125, 99.9=923, 99.99=4691] 
+2026-05-11 09:15:12:028 90 sec: 3868464 operations; 43211.8 current ops/sec; est completion in 4 minutes [READ: Count=410608, Max=9999, Min=33, Avg=68.15, 50=64, 90=78, 99=130, 99.9=999, 99.99=4077] [UPDATE: Count=21513, Max=9191, Min=31, Avg=61.26, 50=57, 90=74, 99=125, 99.9=996, 99.99=4103] 
+2026-05-11 09:15:22:028 100 sec: 4307310 operations; 43884.6 current ops/sec; est completion in 4 minutes [READ: Count=417010, Max=12167, Min=32, Avg=67.13, 50=63, 90=75, 99=114, 99.9=943, 99.99=4527] [UPDATE: Count=21791, Max=5623, Min=31, Avg=59.61, 50=56, 90=68, 99=117, 99.9=929, 99.99=2871] 
+2026-05-11 09:15:32:028 110 sec: 4750340 operations; 44303 current ops/sec; est completion in 3 minutes [READ: Count=421041, Max=12095, Min=33, Avg=66.45, 50=63, 90=75, 99=102, 99.9=930, 99.99=3745] [UPDATE: Count=21989, Max=5067, Min=31, Avg=58.98, 50=56, 90=68, 99=98, 99.9=853, 99.99=3881] 
+2026-05-11 09:15:42:028 120 sec: 5193689 operations; 44334.9 current ops/sec; est completion in 3 minutes [READ: Count=421173, Max=12095, Min=34, Avg=66.42, 50=63, 90=74, 99=104, 99.9=1046, 99.99=3071] [UPDATE: Count=22176, Max=9455, Min=31, Avg=59.47, 50=56, 90=67, 99=97, 99.9=1076, 99.99=3305] 
+2026-05-11 09:15:52:028 130 sec: 5624817 operations; 43112.8 current ops/sec; est completion in 3 minutes [READ: Count=409288, Max=10175, Min=33, Avg=68.32, 50=64, 90=82, 99=114, 99.9=998, 99.99=4013] [UPDATE: Count=21843, Max=8175, Min=30, Avg=61.06, 50=57, 90=76, 99=112, 99.9=845, 99.99=2583] 
+2026-05-11 09:16:02:028 140 sec: 6033902 operations; 40908.5 current ops/sec; est completion in 3 minutes [READ: Count=388649, Max=12847, Min=32, Avg=72.05, 50=66, 90=86, 99=141, 99.9=911, 99.99=4715] [UPDATE: Count=20433, Max=7579, Min=29, Avg=65.02, 50=59, 90=80, 99=132, 99.9=867, 99.99=3329] 
+2026-05-11 09:16:12:029 150 sec: 6463382 operations; 42948 current ops/sec; est completion in 3 minutes [READ: Count=408398, Max=12975, Min=32, Avg=68.56, 50=64, 90=82, 99=114, 99.9=836, 99.99=4491] [UPDATE: Count=21235, Max=7375, Min=30, Avg=62.01, 50=58, 90=76, 99=113, 99.9=1056, 99.99=4403] 
+2026-05-11 09:16:22:028 160 sec: 6892330 operations; 42894.8 current ops/sec; est completion in 3 minutes [READ: Count=407423, Max=13863, Min=33, Avg=68.66, 50=64, 90=82, 99=120, 99.9=1018, 99.99=4299] [UPDATE: Count=21407, Max=8239, Min=31, Avg=61.99, 50=57, 90=75, 99=118, 99.9=1075, 99.99=6439] 
+2026-05-11 09:16:32:028 170 sec: 7323936 operations; 43160.6 current ops/sec; est completion in 2 minutes [READ: Count=409972, Max=11943, Min=32, Avg=68.22, 50=64, 90=80, 99=117, 99.9=941, 99.99=4531] [UPDATE: Count=21637, Max=10735, Min=32, Avg=61.93, 50=58, 90=75, 99=117, 99.9=960, 99.99=5023] 
+2026-05-11 09:16:42:028 180 sec: 7740977 operations; 41704.1 current ops/sec; est completion in 2 minutes [READ: Count=396237, Max=12663, Min=33, Avg=70.65, 50=66, 90=84, 99=134, 99.9=952, 99.99=5587] [UPDATE: Count=20777, Max=7551, Min=31, Avg=63.3, 50=59, 90=77, 99=126, 99.9=960, 99.99=3465] 
+2026-05-11 09:16:52:028 190 sec: 8161264 operations; 42028.7 current ops/sec; est completion in 2 minutes [READ: Count=399238, Max=12975, Min=33, Avg=70.16, 50=65, 90=84, 99=132, 99.9=941, 99.99=4211] [UPDATE: Count=21038, Max=8079, Min=32, Avg=62.33, 50=59, 90=78, 99=124, 99.9=623, 99.99=1596] 
+2026-05-11 09:17:02:028 200 sec: 8567647 operations; 40638.3 current ops/sec; est completion in 2 minutes [READ: Count=385810, Max=14071, Min=32, Avg=72.6, 50=68, 90=87, 99=136, 99.9=854, 99.99=5035] [UPDATE: Count=20589, Max=4595, Min=29, Avg=64.98, 50=61, 90=81, 99=132, 99.9=399, 99.99=3317] 
+2026-05-11 09:17:12:028 210 sec: 8979997 operations; 41235 current ops/sec; est completion in 2 minutes [READ: Count=391543, Max=10623, Min=33, Avg=71.51, 50=67, 90=84, 99=126, 99.9=1026, 99.99=4435] [UPDATE: Count=20812, Max=3575, Min=31, Avg=63.49, 50=60, 90=78, 99=126, 99.9=785, 99.99=1855] 
+2026-05-11 09:17:22:028 220 sec: 9404742 operations; 42474.5 current ops/sec; est completion in 2 minutes [READ: Count=403400, Max=11071, Min=35, Avg=69.41, 50=65, 90=84, 99=114, 99.9=878, 99.99=5371] [UPDATE: Count=21324, Max=4089, Min=31, Avg=61.41, 50=58, 90=77, 99=103, 99.9=527, 99.99=2187] 
+2026-05-11 09:17:32:028 230 sec: 9842721 operations; 43797.9 current ops/sec; est completion in 2 minutes [READ: Count=416004, Max=8607, Min=34, Avg=67.29, 50=64, 90=76, 99=112, 99.9=960, 99.99=3511] [UPDATE: Count=21975, Max=7099, Min=31, Avg=60, 50=57, 90=69, 99=106, 99.9=699, 99.99=3535] 
+2026-05-11 09:17:42:028 240 sec: 10284968 operations; 44224.7 current ops/sec; est completion in 1 minute [READ: Count=420100, Max=12079, Min=32, Avg=66.61, 50=64, 90=75, 99=102, 99.9=970, 99.99=3303] [UPDATE: Count=22163, Max=3729, Min=29, Avg=59.08, 50=57, 90=68, 99=99, 99.9=613, 99.99=2071] 
+2026-05-11 09:17:52:028 250 sec: 10718317 operations; 43334.9 current ops/sec; est completion in 1 minute [READ: Count=411565, Max=11847, Min=32, Avg=67.94, 50=64, 90=76, 99=127, 99.9=1044, 99.99=5187] [UPDATE: Count=21768, Max=12047, Min=29, Avg=61.09, 50=57, 90=69, 99=119, 99.9=1133, 99.99=5723] 
+2026-05-11 09:18:02:028 260 sec: 11127610 operations; 40929.3 current ops/sec; est completion in 1 minute [READ: Count=388529, Max=11431, Min=33, Avg=71.97, 50=67, 90=86, 99=141, 99.9=1119, 99.99=4071] [UPDATE: Count=20764, Max=11975, Min=30, Avg=65.07, 50=59, 90=79, 99=133, 99.9=1145, 99.99=5611] 
+2026-05-11 09:18:12:028 270 sec: 11558274 operations; 43066.4 current ops/sec; est completion in 1 minute [READ: Count=409146, Max=19295, Min=34, Avg=68.4, 50=64, 90=78, 99=123, 99.9=1074, 99.99=4065] [UPDATE: Count=21537, Max=8599, Min=31, Avg=60.41, 50=57, 90=72, 99=120, 99.9=876, 99.99=2349] 
+2026-05-11 09:18:22:028 280 sec: 11982493 operations; 42421.9 current ops/sec; est completion in 1 minute [READ: Count=402801, Max=12295, Min=32, Avg=69.49, 50=65, 90=83, 99=128, 99.9=961, 99.99=5375] [UPDATE: Count=21408, Max=3297, Min=31, Avg=61.33, 50=57, 90=76, 99=121, 99.9=902, 99.99=2841] 
+2026-05-11 09:18:32:028 290 sec: 12405394 operations; 42290.1 current ops/sec; est completion in 1 minute [READ: Count=401723, Max=11383, Min=32, Avg=69.68, 50=65, 90=83, 99=118, 99.9=1009, 99.99=4827] [UPDATE: Count=21169, Max=8695, Min=32, Avg=62.35, 50=58, 90=77, 99=110, 99.9=843, 99.99=4271] 
+2026-05-11 09:18:42:028 300 sec: 12824533 operations; 41913.9 current ops/sec; est completion in 51 seconds [READ: Count=398178, Max=10959, Min=33, Avg=70.26, 50=66, 90=84, 99=119, 99.9=990, 99.99=3829] [UPDATE: Count=20961, Max=8583, Min=32, Avg=63.67, 50=59, 90=78, 99=122, 99.9=1181, 99.99=5415] 
+2026-05-11 09:18:52:029 310 sec: 13254196 operations; 42966.3 current ops/sec; est completion in 41 seconds [READ: Count=408217, Max=10767, Min=32, Avg=68.58, 50=64, 90=81, 99=117, 99.9=951, 99.99=4759] [UPDATE: Count=21487, Max=2511, Min=29, Avg=60.98, 50=57, 90=75, 99=117, 99.9=1099, 99.99=2223] 
+2026-05-11 09:19:02:028 320 sec: 13684378 operations; 43018.2 current ops/sec; est completion in 31 seconds [READ: Count=408833, Max=9247, Min=33, Avg=68.51, 50=64, 90=79, 99=121, 99.9=997, 99.99=4059] [UPDATE: Count=21308, Max=6255, Min=30, Avg=61.04, 50=58, 90=74, 99=122, 99.9=856, 99.99=3319] 
+2026-05-11 09:19:12:029 330 sec: 14118547 operations; 43416.9 current ops/sec; est completion in 21 seconds [READ: Count=412455, Max=11767, Min=33, Avg=67.82, 50=64, 90=76, 99=113, 99.9=1046, 99.99=4471] [UPDATE: Count=21751, Max=9567, Min=29, Avg=60.5, 50=57, 90=69, 99=108, 99.9=937, 99.99=7307] 
+2026-05-11 09:19:22:028 340 sec: 14546323 operations; 42777.6 current ops/sec; est completion in 11 seconds [READ: Count=406318, Max=11815, Min=32, Avg=68.81, 50=65, 90=82, 99=122, 99.9=916, 99.99=3987] [UPDATE: Count=21436, Max=3583, Min=30, Avg=61.08, 50=58, 90=76, 99=118, 99.9=774, 99.99=1766] 
+2026-05-11 09:19:32:032 350 sec: 14975004 operations; 42850.96 current ops/sec; est completion in 1 second [READ: Count=407108, Max=12967, Min=34, Avg=68.66, 50=64, 90=78, 99=131, 99.9=984, 99.99=4791] [UPDATE: Count=21558, Max=11711, Min=31, Avg=62.74, 50=57, 90=72, 99=122, 99.9=1254, 99.99=5287] 
+2026-05-11 09:19:32:869 350 sec: 15000000 operations; 29863.8 current ops/sec; [READ: Count=23684, Max=8591, Min=35, Avg=53.17, 50=47, 90=66, 99=92, 99.9=1088, 99.99=2981] [CLEANUP: Count=3, Max=694, Min=50, Avg=267.33, 50=58, 90=694, 99=694, 99.9=694, 99.99=694] [UPDATE: Count=1312, Max=428, Min=29, Avg=43.96, 50=40, 90=58, 99=80, 99.9=377, 99.99=428] 
+[OVERALL], RunTime(ms), 350841
+[OVERALL], Throughput(ops/sec), 42754.41011740361
+[TOTAL_GCS_PS_Scavenge], Count, 2178
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 2100
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.5985617416436505
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 2178
+[TOTAL_GC_TIME], Time(ms), 2100
+[TOTAL_GC_TIME_%], Time(%), 0.5985617416436505
+[READ], Operations, 14249184
+[READ], AverageLatency(us), 68.7718673574571
+[READ], MinLatency(us), 30
+[READ], MaxLatency(us), 32719
+[READ], 50thPercentileLatency(us), 64
+[READ], 95thPercentileLatency(us), 86
+[READ], 99thPercentileLatency(us), 123
+[READ], Return=OK, 14249184
+[CLEANUP], Operations, 3
+[CLEANUP], AverageLatency(us), 267.3333333333333
+[CLEANUP], MinLatency(us), 50
+[CLEANUP], MaxLatency(us), 694
+[CLEANUP], 50thPercentileLatency(us), 58
+[CLEANUP], 95thPercentileLatency(us), 694
+[CLEANUP], 99thPercentileLatency(us), 694
+[UPDATE], Operations, 750816
+[UPDATE], AverageLatency(us), 61.81786749350041
+[UPDATE], MinLatency(us), 29
+[UPDATE], MaxLatency(us), 21455
+[UPDATE], 50thPercentileLatency(us), 57
+[UPDATE], 95thPercentileLatency(us), 81
+[UPDATE], 99thPercentileLatency(us), 121
+[UPDATE], Return=OK, 750816

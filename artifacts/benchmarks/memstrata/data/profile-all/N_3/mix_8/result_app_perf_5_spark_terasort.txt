@@ -1,0 +1,2 @@
+Type         Date       Time     Input_data_size      Duration(s)          Throughput(bytes/s)  Throughput/node     
+ScalaSparkTerasort 2026-05-11 08:35:31 3200000000           135.666              23587339             23587339            

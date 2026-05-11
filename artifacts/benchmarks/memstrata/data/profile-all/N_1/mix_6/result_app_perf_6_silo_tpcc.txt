@@ -1,0 +1,110 @@
+Database Benchmark:
+  pid: 1534
+settings:
+  par-loading : 0
+  pin-cpus    : 0
+  slow-exit   : 0
+  retry-txns  : 0
+  backoff-txns: 0
+  bench       : tpcc
+  scale       : 1
+  num-cpus    : 1
+  num-threads : 1
+  db-type     : ndb-proto2
+  basedir     : /home/ubuntu/silo
+  txn-flags   : 0
+  runtime     : 300
+  var-encode  : yes
+  allocator   : jemalloc
+  numa-memory : disabled
+  logfiles : []
+  assignments : []
+  disable-gc : 0
+  disable-snapshots : 0
+  stats-server-sockfile: 
+system properties:
+  btree_internal_node_size: 264
+  btree_leaf_node_size    : 312
+  tuple_prefetch          : no
+  btree_node_prefetch     : yes
+tpcc settings:
+  cross_partition_transactions : 1
+  read_only_snapshots          : 1
+  partition_locks              : 0
+  separate_tree_per_partition  : 0
+  new_order_remote_item_pct    : 1
+  new_order_fast_id_gen        : 0
+  uniform_item_dist            : 0
+  order_status_scan_hack       : 0
+  workload_mix                 : [45, 43, 4, 4, 4]
+[INFO] finished loading warehouse
+[INFO]   * average warehouse record length: 97 bytes
+[INFO] finished loading district
+[INFO]   * average district record length: 99 bytes
+num batches: 30
+[INFO] finished loading order
+[INFO]   * average order_line record length: 10.9193 bytes
+[INFO]   * average oorder record length: 7.4286 bytes
+[INFO]   * average new_order record length: 12 bytes
+[INFO] finished loading item
+[INFO]   * average item record length: 84.1739 bytes
+[INFO] finished loading customer
+[INFO]   * average customer record length: 656.725 bytes 
+[INFO] finished loading stock
+[INFO]   * average stock record length: 8 bytes
+timed region dataloading took 11417 ms
+DB size: 101.191 MB
+wait_an_epoch(): consistent reads happening in e-1, but e=0 so special case
+[0, 0, 0] txns persisted in loading phase
+table customer_0 size 30000
+table customer_name_idx_0 size 30000
+table district_0 size 10
+table history_0 size 30000
+table item_0 size 100000
+table new_order_0 size 9000
+table oorder_0 size 30000
+table oorder_c_id_idx_0 size 30000
+table order_line_0 size 299560
+table stock_0 size 100000
+table stock_data_0 size 100000
+table warehouse_0 size 1
+starting benchmark...
+tpcc: worker id 7 => warehouses [1, 2)
+--- table statistics ---
+table customer_0 size 30000 (+0 records)
+table customer_name_idx_0 size 30000 (+0 records)
+table district_0 size 10 (+0 records)
+table history_0 size 2024270 (+1994270 records)
+table item_0 size 100000 (+0 records)
+table new_order_0 size 274613 (+265613 records)
+table oorder_0 size 2117503 (+2087503 records)
+table oorder_c_id_idx_0 size 2117503 (+2087503 records)
+table order_line_0 size 21174166 (+20874606 records)
+table stock_0 size 100000 (+0 records)
+table stock_data_0 size 100000 (+0 records)
+table warehouse_0 size 1 (+0 records)
+--- benchmark statistics ---
+runtime: 300.464 sec
+memory delta: 2021.88 MB
+memory delta rate: 6.72918 MB/sec
+logical memory delta: 295.263 MB
+logical memory delta rate: 0.982692 MB/sec
+agg_nosync_throughput: 15438.5 ops/sec
+avg_nosync_per_core_throughput: 15438.5 ops/sec/core
+agg_throughput: 15438.5 ops/sec
+avg_per_core_throughput: 15438.5 ops/sec/core
+agg_persist_throughput: 15438.5 ops/sec
+avg_per_core_persist_throughput: 15438.5 ops/sec/core
+avg_latency: 0.0646943 ms
+avg_persist_latency: 0 ms
+agg_abort_rate: 0 aborts/sec
+avg_per_core_abort_rate: 0 aborts/sec/core
+txn breakdown: [[Delivery, 185859], [NewOrder, 2087503], [OrderStatus, 185623], [Payment, 1994270], [StockLevel, 185456]]
+--- system counters (for benchmark) ---
+--- perf counters (if enabled, for benchmark) ---
+--- allocator stats ---
+[allocator] ncpus=0
+---------------------------------------
+dumping heap profile...
+printing jemalloc stats...
+15438.5 15438.5 0.0646943 0 0

@@ -1,0 +1,175 @@
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -B -pl site.ycsb:memcached-binding -am package -DskipTests dependency:list -DoutputAbsoluteArtifactFilename -DappendOutput=false -DoutputFile=/tmp/tmpR5DOQC'
+[INFO] Scanning for projects...
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Build Order:
+[INFO] 
+[INFO] YCSB Root                                                          [pom]
+[INFO] Core YCSB                                                          [jar]
+[INFO] Per Datastore Binding descriptor                                   [jar]
+[INFO] YCSB Datastore Binding Parent                                      [pom]
+[INFO] memcached binding                                                  [jar]
+[INFO] 
+[INFO] ---------------------------< site.ycsb:root >---------------------------
+[INFO] Building YCSB Root 0.18.0-SNAPSHOT                                 [1/5]
+[INFO]   from pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ root ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ root ---
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ root ---
+[INFO] 
+[INFO] ---------------------------< site.ycsb:core >---------------------------
+[INFO] Building Core YCSB 0.18.0-SNAPSHOT                                 [2/5]
+[INFO]   from core/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ core ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ core ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ core ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] The encoding used to copy filtered properties files have not been set. This means that the same encoding will be used to copy filtered properties files as when copying other filtered resources. This might not be what you want! Run your build with --debug to see which files might be affected. Read more at https://maven.apache.org/plugins/maven-resources-plugin/examples/filtering-properties-files.html
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ core ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 63 source files to /home/ubuntu/shared/YCSB/core/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ core ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/core/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ core ---
+[INFO] Nothing to compile - all classes are up to date
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ core ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ core ---
+[INFO] Building jar: /home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ core ---
+[INFO] 
+[INFO] --------------< site.ycsb:datastore-specific-descriptor >---------------
+[INFO] Building Per Datastore Binding descriptor 0.18.0-SNAPSHOT          [3/5]
+[INFO]   from binding-parent/datastore-specific-descriptor/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ datastore-specific-descriptor ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ datastore-specific-descriptor ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ datastore-specific-descriptor ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/binding-parent/datastore-specific-descriptor/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ datastore-specific-descriptor ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ datastore-specific-descriptor ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] ----------------------< site.ycsb:binding-parent >----------------------
+[INFO] Building YCSB Datastore Binding Parent 0.18.0-SNAPSHOT             [4/5]
+[INFO]   from binding-parent/pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ binding-parent ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ binding-parent ---
+[INFO] 
+[INFO] --- dependency:2.10:copy-dependencies (stage-dependencies) @ binding-parent ---
+[INFO] 
+[INFO] --- dependency:2.10:list (default-cli) @ binding-parent ---
+[INFO] 
+[INFO] --------------------< site.ycsb:memcached-binding >---------------------
+[INFO] Building memcached binding 0.18.0-SNAPSHOT                         [5/5]
+[INFO]   from memcached/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ memcached-binding ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ memcached-binding ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ memcached-binding ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/memcached/src/main/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ memcached-binding ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 2 source files to /home/ubuntu/shared/YCSB/memcached/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ memcached-binding ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/memcached/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ memcached-binding ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ memcached-binding ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ memcached-binding ---
+[INFO] Building jar: /home/ubuntu/shared/YCSB/memcached/target/memcached-binding-0.18.0-SNAPSHOT.jar
+[INFO] 
+[INFO] --- dependency:2.10:copy-dependencies (stage-dependencies) @ memcached-binding ---
+[INFO] Copying /home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar to /home/ubuntu/shared/YCSB/memcached/target/dependency/core-0.18.0-SNAPSHOT.jar
+[INFO] org.apache.htrace:htrace-core4:jar:4.1.0-incubating already exists in destination.
+[INFO] org.hdrhistogram:HdrHistogram:jar:2.1.12 already exists in destination.
+[INFO] log4j:log4j:jar:1.2.17 already exists in destination.
+[INFO] org.codehaus.jackson:jackson-mapper-asl:jar:1.9.13 already exists in destination.
+[INFO] net.spy:spymemcached:jar:2.11.4 already exists in destination.
+[INFO] org.codehaus.jackson:jackson-core-asl:jar:1.9.4 already exists in destination.
+[INFO] 
+[INFO] --- assembly:2.5.5:single (default) @ memcached-binding ---
+[INFO] Building tar: /home/ubuntu/shared/YCSB/memcached/target/ycsb-memcached-binding-0.18.0-SNAPSHOT.tar.gz
+[INFO] 
+[INFO] --- dependency:2.10:list (default-cli) @ memcached-binding ---
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary for YCSB Root 0.18.0-SNAPSHOT:
+[INFO] 
+[INFO] YCSB Root .......................................... SUCCESS [  2.550 s]
+[INFO] Core YCSB .......................................... SUCCESS [  3.552 s]
+[INFO] Per Datastore Binding descriptor ................... SUCCESS [  0.433 s]
+[INFO] YCSB Datastore Binding Parent ...................... SUCCESS [  0.661 s]
+[INFO] memcached binding .................................. SUCCESS [  2.707 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  10.795 s
+[INFO] Finished at: 2026-05-11T08:46:17Z
+[INFO] ------------------------------------------------------------------------
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /home/ubuntu/shared/YCSB/memcached/conf:/home/ubuntu/shared/YCSB/memcached/target/memcached-binding-0.18.0-SNAPSHOT.jar:/home/ubuntu/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/home/ubuntu/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/home/ubuntu/.m2/repository/log4j/log4j/1.2.17/log4j-1.2.17.jar:/home/ubuntu/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.13/jackson-mapper-asl-1.9.13.jar:/home/ubuntu/.m2/repository/net/spy/spymemcached/2.11.4/spymemcached-2.11.4.jar:/home/ubuntu/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.MemcachedClient -s -P workloads/workloade -p memcached.hosts=127.0.0.1 -p threadcount=2 -t
+Command line: -db site.ycsb.db.MemcachedClient -s -P workloads/workloade -p memcached.hosts=127.0.0.1 -p threadcount=2 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+log4j:WARN No appenders could be found for logger (org.apache.htrace.core.Tracer).
+log4j:WARN Please initialize the log4j system properly.
+log4j:WARN See http://logging.apache.org/log4j/1.2/faq.html#noconfig for more info.
+Starting test.
+2026-05-11 08:46:18:429 0 sec: 0 operations; est completion in 0 second 
+2026-05-11 08:46:18.621 INFO net.spy.memcached.MemcachedConnection:  Added {QA sa=/127.0.0.1:11211, #Rops=0, #Wops=0, #iq=0, topRop=null, topWop=null, toWrite=0, interested=0} to connect queue
+2026-05-11 08:46:18.622 INFO net.spy.memcached.MemcachedConnection:  Added {QA sa=/127.0.0.1:11211, #Rops=0, #Wops=0, #iq=0, topRop=null, topWop=null, toWrite=0, interested=0} to connect queue
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+java.lang.ArithmeticException: / by zero
+	at site.ycsb.workloads.CoreWorkload.doTransactionScan(CoreWorkload.java:830)
+	at site.ycsb.workloads.CoreWorkload.doTransaction(CoreWorkload.java:684)
+	at site.ycsb.ClientThread.run(ClientThread.java:122)
+	at java.lang.Thread.run(Thread.java:750)
+java.lang.ArithmeticException: / by zero
+	at site.ycsb.workloads.CoreWorkload.doTransactionScan(CoreWorkload.java:830)
+	at site.ycsb.workloads.CoreWorkload.doTransaction(CoreWorkload.java:684)
+java.lang.ArithmeticException: / by zero	at site.ycsb.ClientThread.run(ClientThread.java:122)
+	at java.lang.Thread.run(Thread.java:750)
+
+	at site.ycsb.workloads.CoreWorkload.doTransactionScan(CoreWorkload.java:830)

@@ -1,0 +1,2 @@
+Type         Date       Time     Input_data_size      Duration(s)          Throughput(bytes/s)  Throughput/node     
+RandomForest 2026-05-11 09:14:21 8062008              41.284               195281               195281              

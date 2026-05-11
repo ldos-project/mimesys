@@ -1,0 +1,4 @@
+psql: FATAL:  the database system is starting up
+Command exited with non-zero status 2
+0.03
+0.00user 0.00system 0:00.03elapsed 28%CPU (0text+0data 4836max)k

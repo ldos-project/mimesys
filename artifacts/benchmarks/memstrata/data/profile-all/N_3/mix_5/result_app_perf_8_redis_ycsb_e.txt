@@ -1,0 +1,234 @@
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -B -pl site.ycsb:redis-binding -am package -DskipTests dependency:list -DoutputAbsoluteArtifactFilename -DappendOutput=false -DoutputFile=/tmp/tmpnDn4mL'
+[INFO] Scanning for projects...
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Build Order:
+[INFO] 
+[INFO] YCSB Root                                                          [pom]
+[INFO] Core YCSB                                                          [jar]
+[INFO] Per Datastore Binding descriptor                                   [jar]
+[INFO] YCSB Datastore Binding Parent                                      [pom]
+[INFO] Redis DB Binding                                                   [jar]
+[INFO] 
+[INFO] ---------------------------< site.ycsb:root >---------------------------
+[INFO] Building YCSB Root 0.18.0-SNAPSHOT                                 [1/5]
+[INFO]   from pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ root ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ root ---
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ root ---
+[INFO] 
+[INFO] ---------------------------< site.ycsb:core >---------------------------
+[INFO] Building Core YCSB 0.18.0-SNAPSHOT                                 [2/5]
+[INFO]   from core/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ core ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ core ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ core ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] The encoding used to copy filtered properties files have not been set. This means that the same encoding will be used to copy filtered properties files as when copying other filtered resources. This might not be what you want! Run your build with --debug to see which files might be affected. Read more at https://maven.apache.org/plugins/maven-resources-plugin/examples/filtering-properties-files.html
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ core ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 63 source files to /home/ubuntu/shared/YCSB/core/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ core ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/core/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ core ---
+[INFO] Nothing to compile - all classes are up to date
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ core ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ core ---
+[INFO] Building jar: /home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ core ---
+[INFO] 
+[INFO] --------------< site.ycsb:datastore-specific-descriptor >---------------
+[INFO] Building Per Datastore Binding descriptor 0.18.0-SNAPSHOT          [3/5]
+[INFO]   from binding-parent/datastore-specific-descriptor/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ datastore-specific-descriptor ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ datastore-specific-descriptor ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ datastore-specific-descriptor ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/binding-parent/datastore-specific-descriptor/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ datastore-specific-descriptor ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ datastore-specific-descriptor ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] --- dependency:3.7.0:list (default-cli) @ datastore-specific-descriptor ---
+[INFO] 
+[INFO] ----------------------< site.ycsb:binding-parent >----------------------
+[INFO] Building YCSB Datastore Binding Parent 0.18.0-SNAPSHOT             [4/5]
+[INFO]   from binding-parent/pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ binding-parent ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ binding-parent ---
+[INFO] 
+[INFO] --- dependency:2.10:copy-dependencies (stage-dependencies) @ binding-parent ---
+[INFO] 
+[INFO] --- dependency:2.10:list (default-cli) @ binding-parent ---
+[INFO] 
+[INFO] ----------------------< site.ycsb:redis-binding >-----------------------
+[INFO] Building Redis DB Binding 0.18.0-SNAPSHOT                          [5/5]
+[INFO]   from redis/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.0.0-M1:enforce (enforce-maven) @ redis-binding ---
+[INFO] 
+[INFO] --- checkstyle:2.16:check (validate) @ redis-binding ---
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ redis-binding ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/redis/src/main/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:compile (default-compile) @ redis-binding ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 2 source files to /home/ubuntu/shared/YCSB/redis/target/classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ redis-binding ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/shared/YCSB/redis/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.7.0:testCompile (default-testCompile) @ redis-binding ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ redis-binding ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --- jar:3.4.1:jar (default-jar) @ redis-binding ---
+[INFO] Building jar: /home/ubuntu/shared/YCSB/redis/target/redis-binding-0.18.0-SNAPSHOT.jar
+[INFO] 
+[INFO] --- dependency:2.10:copy-dependencies (stage-dependencies) @ redis-binding ---
+[INFO] redis.clients:jedis:jar:2.9.0 already exists in destination.
+[INFO] org.apache.commons:commons-pool2:jar:2.4.2 already exists in destination.
+[INFO] 
+[INFO] --- assembly:2.5.5:single (default) @ redis-binding ---
+[WARNING] The following patterns were never triggered in this artifact exclusion filter:
+o  '*:sources'
+
+[INFO] Building tar: /home/ubuntu/shared/YCSB/redis/target/ycsb-redis-binding-0.18.0-SNAPSHOT.tar.gz
+[INFO] 
+[INFO] --- dependency:2.10:list (default-cli) @ redis-binding ---
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary for YCSB Root 0.18.0-SNAPSHOT:
+[INFO] 
+[INFO] YCSB Root .......................................... SUCCESS [  2.860 s]
+[INFO] Core YCSB .......................................... SUCCESS [  3.631 s]
+[INFO] Per Datastore Binding descriptor ................... SUCCESS [  0.403 s]
+[INFO] YCSB Datastore Binding Parent ...................... SUCCESS [  0.802 s]
+[INFO] Redis DB Binding ................................... SUCCESS [  4.206 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  12.857 s
+[INFO] Finished at: 2026-05-11T08:12:21Z
+[INFO] ------------------------------------------------------------------------
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /home/ubuntu/shared/YCSB/redis/conf:/home/ubuntu/shared/YCSB/redis/target/redis-binding-0.18.0-SNAPSHOT.jar:/home/ubuntu/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/home/ubuntu/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/home/ubuntu/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/home/ubuntu/.m2/repository/redis/clients/jedis/2.9.0/jedis-2.9.0.jar:/home/ubuntu/.m2/repository/org/apache/commons/commons-pool2/2.4.2/commons-pool2-2.4.2.jar:/home/ubuntu/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/home/ubuntu/shared/YCSB/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.RedisClient -s -P workloads/workloade -p redis.host=127.0.0.1 -p redis.port=6379 -p threadcount=3 -t
+Command line: -db site.ycsb.db.RedisClient -s -P workloads/workloade -p redis.host=127.0.0.1 -p redis.port=6379 -p threadcount=3 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-05-11 08:12:21:871 0 sec: 0 operations; est completion in 0 second 
+2026-05-11 08:12:31:822 10 sec: 7371 operations; 737.03 current ops/sec; est completion in 6 minutes [SCAN-LATENCY-PER-RECORD: Count=6979, Max=2667, Min=43, Avg=86.39, 50=75, 90=107, 99=228, 99.9=576, 99.99=2667] [INSERT: Count=392, Max=9967, Min=125, Avg=437.08, 50=248, 90=408, 99=6511, 99.9=9967, 99.99=9967] [SCAN: Count=6991, Max=51743, Min=99, Avg=4223.44, 50=3953, 90=7503, 99=13503, 99.9=24639, 99.99=51743] 
+2026-05-11 08:12:41:822 20 sec: 14716 operations; 734.5 current ops/sec; est completion in 6 minutes [SCAN-LATENCY-PER-RECORD: Count=6969, Max=1608, Min=43, Avg=85.48, 50=78, 90=101, 99=197, 99.9=519, 99.99=1608] [INSERT: Count=376, Max=6471, Min=118, Avg=254.73, 50=217, 90=272, 99=1659, 99.9=6471, 99.99=6471] [SCAN: Count=6963, Max=37087, Min=114, Avg=4281.66, 50=4175, 90=7547, 99=11951, 99.9=22799, 99.99=37087] 
+2026-05-11 08:12:51:822 30 sec: 22245 operations; 752.9 current ops/sec; est completion in 6 minutes [SCAN-LATENCY-PER-RECORD: Count=7174, Max=1178, Min=44, Avg=84.78, 50=74, 90=99, 99=212, 99.9=601, 99.99=1178] [INSERT: Count=355, Max=1632, Min=134, Avg=226.87, 50=203, 90=271, 99=621, 99.9=1632, 99.99=1632] [SCAN: Count=7169, Max=34847, Min=108, Avg=4157.12, 50=3997, 90=7171, 99=11591, 99.9=21663, 99.99=34847] 
+2026-05-11 08:13:01:822 40 sec: 30118 operations; 787.3 current ops/sec; est completion in 5 minutes [SCAN-LATENCY-PER-RECORD: Count=7489, Max=609, Min=47, Avg=80.32, 50=72, 90=95, 99=184, 99.9=351, 99.99=609] [INSERT: Count=385, Max=2449, Min=135, Avg=200.79, 50=188, 90=243, 99=361, 99.9=2449, 99.99=2449] [SCAN: Count=7490, Max=31599, Min=109, Avg=3990.86, 50=3891, 90=6835, 99=11159, 99.9=24127, 99.99=31599] 
+2026-05-11 08:13:11:822 50 sec: 38154 operations; 803.6 current ops/sec; est completion in 5 minutes [SCAN-LATENCY-PER-RECORD: Count=7642, Max=1234, Min=47, Avg=79.38, 50=70, 90=95, 99=178, 99.9=512, 99.99=1234] [INSERT: Count=393, Max=6667, Min=133, Avg=204.64, 50=169, 90=242, 99=384, 99.9=6667, 99.99=6667] [SCAN: Count=7640, Max=37951, Min=108, Avg=3909.68, 50=3773, 90=6747, 99=10575, 99.9=20303, 99.99=37951] 
+2026-05-11 08:13:21:822 60 sec: 46458 operations; 830.4 current ops/sec; est completion in 5 minutes [SCAN-LATENCY-PER-RECORD: Count=7866, Max=1068, Min=47, Avg=77.73, 50=70, 90=91, 99=179, 99.9=456, 99.99=1068] [INSERT: Count=438, Max=2493, Min=125, Avg=180.06, 50=161, 90=225, 99=307, 99.9=2493, 99.99=2493] [SCAN: Count=7866, Max=23471, Min=89, Avg=3799.39, 50=3659, 90=6659, 99=10479, 99.9=16895, 99.99=23471] 
+2026-05-11 08:13:31:822 70 sec: 54935 operations; 847.7 current ops/sec; est completion in 5 minutes [SCAN-LATENCY-PER-RECORD: Count=8042, Max=669, Min=46, Avg=75.15, 50=70, 90=88, 99=155, 99.9=279, 99.99=669] [INSERT: Count=436, Max=402, Min=108, Avg=167.54, 50=160, 90=206, 99=268, 99.9=402, 99.99=402] [SCAN: Count=8042, Max=17839, Min=98, Avg=3717.9, 50=3655, 90=6511, 99=9111, 99.9=15775, 99.99=17839] 
+2026-05-11 08:13:41:822 80 sec: 63002 operations; 806.7 current ops/sec; est completion in 5 minutes [SCAN-LATENCY-PER-RECORD: Count=7660, Max=2567, Min=47, Avg=79.67, 50=71, 90=94, 99=179, 99.9=397, 99.99=2567] [INSERT: Count=406, Max=1312, Min=114, Avg=181.22, 50=164, 90=241, 99=329, 99.9=1312, 99.99=1312] [SCAN: Count=7663, Max=29023, Min=97, Avg=3901.29, 50=3755, 90=6727, 99=10543, 99.9=20591, 99.99=29023] 
+2026-05-11 08:13:51:822 90 sec: 71287 operations; 828.5 current ops/sec; est completion in 4 minutes [SCAN-LATENCY-PER-RECORD: Count=7884, Max=603, Min=46, Avg=77.98, 50=70, 90=93, 99=177, 99.9=367, 99.99=603] [INSERT: Count=401, Max=1815, Min=123, Avg=176.65, 50=162, 90=213, 99=337, 99.9=1815, 99.99=1815] [SCAN: Count=7881, Max=24207, Min=94, Avg=3794.28, 50=3643, 90=6639, 99=10615, 99.9=18751, 99.99=24207] 
+2026-05-11 08:14:01:822 100 sec: 79741 operations; 845.4 current ops/sec; est completion in 4 minutes [SCAN-LATENCY-PER-RECORD: Count=8050, Max=2207, Min=46, Avg=76.12, 50=70, 90=88, 99=170, 99.9=491, 99.99=2207] [INSERT: Count=405, Max=374, Min=121, Avg=168.67, 50=161, 90=207, 99=266, 99.9=374, 99.99=374] [SCAN: Count=8051, Max=23663, Min=89, Avg=3715.83, 50=3621, 90=6479, 99=9063, 99.9=20207, 99.99=23663] 
+2026-05-11 08:14:11:823 110 sec: 87891 operations; 814.92 current ops/sec; est completion in 4 minutes [SCAN-LATENCY-PER-RECORD: Count=7710, Max=5439, Min=46, Avg=78.32, 50=71, 90=91, 99=159, 99.9=318, 99.99=5439] [INSERT: Count=442, Max=1047, Min=112, Avg=174.62, 50=163, 90=221, 99=303, 99.9=1047, 99.99=1047] [SCAN: Count=7712, Max=21375, Min=90, Avg=3878.58, 50=3791, 90=6751, 99=9519, 99.9=15919, 99.99=21375] 
+2026-05-11 08:14:21:822 120 sec: 96244 operations; 835.38 current ops/sec; est completion in 4 minutes [SCAN-LATENCY-PER-RECORD: Count=7957, Max=996, Min=47, Avg=76.16, 50=70, 90=90, 99=164, 99.9=312, 99.99=996] [INSERT: Count=394, Max=1072, Min=122, Avg=173.01, 50=159, 90=204, 99=349, 99.9=1072, 99.99=1072] [SCAN: Count=7955, Max=31135, Min=96, Avg=3758.6, 50=3651, 90=6571, 99=10223, 99.9=17551, 99.99=31135] 
+2026-05-11 08:14:31:822 130 sec: 104771 operations; 852.7 current ops/sec; est completion in 4 minutes [SCAN-LATENCY-PER-RECORD: Count=8108, Max=639, Min=44, Avg=73.9, 50=70, 90=82, 99=146, 99.9=289, 99.99=639] [INSERT: Count=418, Max=14623, Min=108, Avg=203.24, 50=160, 90=195, 99=310, 99.9=14623, 99.99=14623] [SCAN: Count=8108, Max=27839, Min=107, Avg=3685.37, 50=3637, 90=6447, 99=8935, 99.9=15311, 99.99=27839] 
+2026-05-11 08:14:41:822 140 sec: 113148 operations; 837.7 current ops/sec; est completion in 3 minutes [SCAN-LATENCY-PER-RECORD: Count=7943, Max=1118, Min=46, Avg=75.95, 50=70, 90=90, 99=159, 99.9=319, 99.99=1118] [INSERT: Count=435, Max=452, Min=121, Avg=170.28, 50=161, 90=213, 99=277, 99.9=452, 99.99=452] [SCAN: Count=7942, Max=32207, Min=104, Avg=3765.72, 50=3655, 90=6559, 99=10071, 99.9=19455, 99.99=32207] 
+2026-05-11 08:14:51:822 150 sec: 121484 operations; 833.6 current ops/sec; est completion in 3 minutes [SCAN-LATENCY-PER-RECORD: Count=7908, Max=1698, Min=46, Avg=76.11, 50=70, 90=90, 99=158, 99.9=418, 99.99=1698] [INSERT: Count=427, Max=7207, Min=122, Avg=188.76, 50=161, 90=212, 99=307, 99.9=7207, 99.99=7207] [SCAN: Count=7908, Max=30543, Min=96, Avg=3779.69, 50=3693, 90=6543, 99=10111, 99.9=15511, 99.99=30543] 
+2026-05-11 08:15:01:822 160 sec: 129666 operations; 818.2 current ops/sec; est completion in 3 minutes [SCAN-LATENCY-PER-RECORD: Count=7792, Max=894, Min=44, Avg=77.07, 50=70, 90=90, 99=156, 99.9=462, 99.99=894] [INSERT: Count=390, Max=1387, Min=128, Avg=176.75, 50=162, 90=213, 99=324, 99.9=1387, 99.99=1387] [SCAN: Count=7792, Max=19167, Min=106, Avg=3839.18, 50=3767, 90=6647, 99=9679, 99.9=16247, 99.99=19167] 
+2026-05-11 08:15:11:822 170 sec: 138172 operations; 850.6 current ops/sec; est completion in 3 minutes [SCAN-LATENCY-PER-RECORD: Count=8073, Max=1143, Min=47, Avg=76.25, 50=70, 90=90, 99=164, 99.9=276, 99.99=1143] [INSERT: Count=433, Max=2613, Min=109, Avg=176.73, 50=159, 90=208, 99=393, 99.9=2613, 99.99=2613] [SCAN: Count=8073, Max=23167, Min=92, Avg=3703.46, 50=3575, 90=6503, 99=10111, 99.9=16687, 99.99=23167] 
+2026-05-11 08:15:21:822 180 sec: 146388 operations; 821.6 current ops/sec; est completion in 3 minutes [SCAN-LATENCY-PER-RECORD: Count=7802, Max=783, Min=43, Avg=77.47, 50=70, 90=92, 99=177, 99.9=352, 99.99=783] [INSERT: Count=414, Max=1550, Min=120, Avg=178.64, 50=163, 90=215, 99=358, 99.9=1550, 99.99=1550] [SCAN: Count=7802, Max=28639, Min=91, Avg=3834.16, 50=3689, 90=6655, 99=10527, 99.9=18623, 99.99=28639] 
+2026-05-11 08:15:31:822 190 sec: 154438 operations; 805 current ops/sec; est completion in 3 minutes [SCAN-LATENCY-PER-RECORD: Count=7650, Max=551, Min=48, Avg=80.02, 50=71, 90=99, 99=182, 99.9=315, 99.99=551] [INSERT: Count=401, Max=5367, Min=118, Avg=194.76, 50=166, 90=236, 99=300, 99.9=5367, 99.99=5367] [SCAN: Count=7652, Max=22735, Min=108, Avg=3909.85, 50=3765, 90=6791, 99=11311, 99.9=18911, 99.99=22735] 
+2026-05-11 08:15:41:822 200 sec: 162444 operations; 800.6 current ops/sec; est completion in 2 minutes [SCAN-LATENCY-PER-RECORD: Count=7613, Max=1185, Min=44, Avg=78.63, 50=70, 90=92, 99=176, 99.9=442, 99.99=1185] [INSERT: Count=393, Max=1941, Min=105, Avg=187.75, 50=163, 90=228, 99=975, 99.9=1941, 99.99=1941] [SCAN: Count=7611, Max=28735, Min=94, Avg=3927.15, 50=3857, 90=6763, 99=9959, 99.9=17375, 99.99=28735] 
+2026-05-11 08:15:51:822 210 sec: 170861 operations; 841.7 current ops/sec; est completion in 2 minutes [SCAN-LATENCY-PER-RECORD: Count=7970, Max=1365, Min=46, Avg=76.69, 50=70, 90=90, 99=164, 99.9=358, 99.99=1365] [INSERT: Count=446, Max=1387, Min=109, Avg=170.98, 50=159, 90=208, 99=310, 99.9=1387, 99.99=1387] [SCAN: Count=7970, Max=33727, Min=90, Avg=3751.99, 50=3621, 90=6551, 99=9551, 99.9=16991, 99.99=33727] 
+2026-05-11 08:16:01:822 220 sec: 178966 operations; 810.5 current ops/sec; est completion in 2 minutes [SCAN-LATENCY-PER-RECORD: Count=7699, Max=1238, Min=46, Avg=78.27, 50=70, 90=92, 99=186, 99.9=380, 99.99=1238] [INSERT: Count=406, Max=3021, Min=123, Avg=183.53, 50=161, 90=230, 99=332, 99.9=3021, 99.99=3021] [SCAN: Count=7700, Max=25359, Min=94, Avg=3883.82, 50=3779, 90=6703, 99=11087, 99.9=18047, 99.99=25359] 
+2026-05-11 08:16:11:822 230 sec: 187369 operations; 840.3 current ops/sec; est completion in 2 minutes [SCAN-LATENCY-PER-RECORD: Count=7961, Max=1356, Min=46, Avg=76.95, 50=70, 90=90, 99=171, 99.9=318, 99.99=1356] [INSERT: Count=442, Max=1374, Min=121, Avg=173.12, 50=161, 90=211, 99=286, 99.9=1374, 99.99=1374] [SCAN: Count=7961, Max=26575, Min=96, Avg=3756.68, 50=3695, 90=6575, 99=9071, 99.9=19247, 99.99=26575] 
+2026-05-11 08:16:21:822 240 sec: 195845 operations; 847.6 current ops/sec; est completion in 2 minutes [SCAN-LATENCY-PER-RECORD: Count=8076, Max=1124, Min=46, Avg=75.24, 50=70, 90=88, 99=151, 99.9=345, 99.99=1124] [INSERT: Count=401, Max=899, Min=114, Avg=168.78, 50=159, 90=202, 99=279, 99.9=899, 99.99=899] [SCAN: Count=8075, Max=24623, Min=106, Avg=3704.24, 50=3625, 90=6463, 99=9559, 99.9=14519, 99.99=24623] 
+2026-05-11 08:16:31:822 250 sec: 204030 operations; 818.5 current ops/sec; est completion in 1 minute [SCAN-LATENCY-PER-RECORD: Count=7732, Max=1421, Min=43, Avg=78.3, 50=70, 90=92, 99=178, 99.9=426, 99.99=1421] [INSERT: Count=452, Max=481, Min=110, Avg=171.46, 50=161, 90=215, 99=310, 99.9=481, 99.99=481] [SCAN: Count=7732, Max=26031, Min=112, Avg=3866.27, 50=3693, 90=6659, 99=11063, 99.9=19167, 99.99=26031] 
+2026-05-11 08:16:41:822 260 sec: 212373 operations; 834.3 current ops/sec; est completion in 1 minute [SCAN-LATENCY-PER-RECORD: Count=7932, Max=792, Min=47, Avg=76.44, 50=70, 90=93, 99=167, 99.9=317, 99.99=792] [INSERT: Count=411, Max=420, Min=123, Avg=168.71, 50=159, 90=210, 99=307, 99.9=420, 99.99=420] [SCAN: Count=7933, Max=31439, Min=97, Avg=3770.87, 50=3637, 90=6591, 99=10239, 99.9=17631, 99.99=31439] 
+2026-05-11 08:16:51:822 270 sec: 220538 operations; 816.5 current ops/sec; est completion in 1 minute [SCAN-LATENCY-PER-RECORD: Count=7759, Max=509, Min=48, Avg=78.36, 50=71, 90=91, 99=166, 99.9=331, 99.99=509] [INSERT: Count=406, Max=1311, Min=117, Avg=180.88, 50=166, 90=231, 99=369, 99.9=1311, 99.99=1311] [SCAN: Count=7758, Max=26735, Min=108, Avg=3854.37, 50=3751, 90=6727, 99=9335, 99.9=18383, 99.99=26735] 
+2026-05-11 08:17:01:822 280 sec: 229135 operations; 859.7 current ops/sec; est completion in 1 minute [SCAN-LATENCY-PER-RECORD: Count=8183, Max=1534, Min=44, Avg=74.64, 50=69, 90=85, 99=171, 99.9=316, 99.99=1534] [INSERT: Count=414, Max=1593, Min=114, Avg=167.79, 50=159, 90=195, 99=276, 99.9=1593, 99.99=1593] [SCAN: Count=8183, Max=32831, Min=90, Avg=3655.26, 50=3543, 90=6443, 99=9503, 99.9=18783, 99.99=32831] 
+2026-05-11 08:17:11:822 290 sec: 237479 operations; 834.4 current ops/sec; est completion in 1 minute [SCAN-LATENCY-PER-RECORD: Count=7945, Max=938, Min=46, Avg=75.89, 50=70, 90=90, 99=167, 99.9=338, 99.99=938] [INSERT: Count=399, Max=371, Min=120, Avg=167.64, 50=159, 90=207, 99=277, 99.9=371, 99.99=371] [SCAN: Count=7946, Max=23599, Min=109, Avg=3764.64, 50=3647, 90=6531, 99=10247, 99.9=16623, 99.99=23599] 
+2026-05-11 08:17:21:822 300 sec: 245671 operations; 819.2 current ops/sec; est completion in 1 minute [SCAN-LATENCY-PER-RECORD: Count=7796, Max=1728, Min=45, Avg=77.16, 50=70, 90=91, 99=162, 99.9=486, 99.99=1728] [INSERT: Count=397, Max=4019, Min=103, Avg=179.98, 50=161, 90=211, 99=303, 99.9=4019, 99.99=4019] [SCAN: Count=7795, Max=29663, Min=109, Avg=3836.62, 50=3729, 90=6607, 99=10207, 99.9=20735, 99.99=29663] 
+2026-05-11 08:17:31:822 310 sec: 254210 operations; 853.9 current ops/sec; est completion in 56 seconds [SCAN-LATENCY-PER-RECORD: Count=8136, Max=1138, Min=45, Avg=74.17, 50=70, 90=81, 99=158, 99.9=324, 99.99=1138] [INSERT: Count=402, Max=1536, Min=119, Avg=169.87, 50=157, 90=191, 99=254, 99.9=1536, 99.99=1536] [SCAN: Count=8136, Max=24927, Min=95, Avg=3676.38, 50=3601, 90=6415, 99=9311, 99.9=17007, 99.99=24927] 
+2026-05-11 08:17:41:822 320 sec: 262747 operations; 853.7 current ops/sec; est completion in 46 seconds [SCAN-LATENCY-PER-RECORD: Count=8100, Max=1473, Min=47, Avg=75.5, 50=70, 90=86, 99=159, 99.9=397, 99.99=1473] [INSERT: Count=437, Max=3509, Min=126, Avg=179.17, 50=159, 90=216, 99=347, 99.9=3509, 99.99=3509] [SCAN: Count=8101, Max=26735, Min=99, Avg=3691.06, 50=3593, 90=6463, 99=9935, 99.9=15191, 99.99=26735] 
+2026-05-11 08:17:51:822 330 sec: 270554 operations; 780.7 current ops/sec; est completion in 36 seconds [SCAN-LATENCY-PER-RECORD: Count=7425, Max=707, Min=42, Avg=80.55, 50=71, 90=95, 99=175, 99.9=329, 99.99=707] [INSERT: Count=382, Max=1478, Min=111, Avg=182.82, 50=166, 90=230, 99=350, 99.9=1478, 99.99=1478] [SCAN: Count=7424, Max=29071, Min=98, Avg=4029.62, 50=3903, 90=6947, 99=11327, 99.9=18879, 99.99=29071] 
+2026-05-11 08:18:01:822 340 sec: 278914 operations; 836 current ops/sec; est completion in 26 seconds [SCAN-LATENCY-PER-RECORD: Count=7950, Max=3315, Min=46, Avg=78.02, 50=70, 90=91, 99=169, 99.9=515, 99.99=3315] [INSERT: Count=410, Max=1867, Min=114, Avg=181.59, 50=161, 90=213, 99=305, 99.9=1867, 99.99=1867] [SCAN: Count=7950, Max=32831, Min=107, Avg=3761.41, 50=3599, 90=6667, 99=9583, 99.9=17359, 99.99=32831] 
+2026-05-11 08:18:11:822 350 sec: 287141 operations; 822.7 current ops/sec; est completion in 16 seconds [SCAN-LATENCY-PER-RECORD: Count=7776, Max=522, Min=45, Avg=78.49, 50=70, 90=94, 99=183, 99.9=348, 99.99=522] [INSERT: Count=451, Max=1639, Min=120, Avg=182.43, 50=165, 90=234, 99=430, 99.9=1639, 99.99=1639] [SCAN: Count=7776, Max=26879, Min=103, Avg=3844.43, 50=3739, 90=6695, 99=10431, 99.9=18671, 99.99=26879] 
+2026-05-11 08:18:21:822 360 sec: 295422 operations; 828.1 current ops/sec; est completion in 6 second [SCAN-LATENCY-PER-RECORD: Count=7854, Max=1400, Min=47, Avg=77.23, 50=70, 90=91, 99=168, 99.9=360, 99.99=1400] [INSERT: Count=427, Max=1259, Min=98, Avg=180.37, 50=160, 90=231, 99=412, 99.9=1259, 99.99=1259] [SCAN: Count=7854, Max=24111, Min=97, Avg=3807.69, 50=3699, 90=6623, 99=9815, 99.9=19535, 99.99=24111] 
+2026-05-11 08:18:27:337 365 sec: 300000 operations; 830.1 current ops/sec; [CLEANUP: Count=3, Max=705, Min=56, Avg=277.67, 50=72, 90=705, 99=705, 99.9=705, 99.99=705] [SCAN-LATENCY-PER-RECORD: Count=4347, Max=476, Min=44, Avg=71.5, 50=69, 90=81, 99=147, 99.9=339, 99.99=476] [INSERT: Count=231, Max=382, Min=99, Avg=160.36, 50=155, 90=186, 99=328, 99.9=382, 99.99=382] [SCAN: Count=4347, Max=26655, Min=90, Avg=3546.99, 50=3421, 90=6383, 99=8655, 99.9=14951, 99.99=26655] 
+[OVERALL], RunTime(ms), 365519
+[OVERALL], Throughput(ops/sec), 820.7507680859271
+[TOTAL_GCS_PS_Scavenge], Count, 1808
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 2517
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.6886098944240928
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 1808
+[TOTAL_GC_TIME], Time(ms), 2517
+[TOTAL_GC_TIME_%], Time(%), 0.6886098944240928
+[CLEANUP], Operations, 3
+[CLEANUP], AverageLatency(us), 277.6666666666667
+[CLEANUP], MinLatency(us), 56
+[CLEANUP], MaxLatency(us), 705
+[CLEANUP], 50thPercentileLatency(us), 72
+[CLEANUP], 95thPercentileLatency(us), 705
+[CLEANUP], 99thPercentileLatency(us), 705
+[SCAN-LATENCY-PER-RECORD], Operations, 284952
+[SCAN-LATENCY-PER-RECORD], AverageLatency(us), 77.71142508211909
+[SCAN-LATENCY-PER-RECORD], MinLatency(us), 42
+[SCAN-LATENCY-PER-RECORD], MaxLatency(us), 5439
+[SCAN-LATENCY-PER-RECORD], 50thPercentileLatency(us), 70
+[SCAN-LATENCY-PER-RECORD], 95thPercentileLatency(us), 107
+[SCAN-LATENCY-PER-RECORD], 99thPercentileLatency(us), 174
+[INSERT], Operations, 15048
+[INSERT], AverageLatency(us), 188.50053163211058
+[INSERT], MinLatency(us), 98
+[INSERT], MaxLatency(us), 14623
+[INSERT], 50thPercentileLatency(us), 163
+[INSERT], 95thPercentileLatency(us), 257
+[INSERT], 99thPercentileLatency(us), 386
+[INSERT], Return=OK, 15048
+[SCAN], Operations, 284952
+[SCAN], AverageLatency(us), 3829.9316340997784
+[SCAN], MinLatency(us), 89
+[SCAN], MaxLatency(us), 51743
+[SCAN], 50thPercentileLatency(us), 3713
+[SCAN], 95thPercentileLatency(us), 7323
+[SCAN], 99thPercentileLatency(us), 10255
+[SCAN], Return=OK, 284952

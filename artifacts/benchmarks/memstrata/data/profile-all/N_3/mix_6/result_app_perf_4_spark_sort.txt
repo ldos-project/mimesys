@@ -1,0 +1,2 @@
+Type         Date       Time     Input_data_size      Duration(s)          Throughput(bytes/s)  Throughput/node     
+ScalaSparkSort 2026-05-11 08:23:18 40730016             40.452               1006872              1006872             

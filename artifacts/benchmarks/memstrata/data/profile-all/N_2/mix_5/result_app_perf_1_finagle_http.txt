@@ -1,0 +1,124 @@
+finagle-http on :42287 spawning 7 client and default number of server workers.
+====== finagle-http (web) [default], iteration 0 started ======
+GC before operation: completed in 59.051 ms, heap usage 33.436 MB -> 9.799 MB.
+====== finagle-http (web) [default], iteration 0 completed (16820.153 ms) ======
+====== finagle-http (web) [default], iteration 1 started ======
+GC before operation: completed in 102.235 ms, heap usage 16.172 MB -> 14.473 MB.
+====== finagle-http (web) [default], iteration 1 completed (9866.600 ms) ======
+====== finagle-http (web) [default], iteration 2 started ======
+GC before operation: completed in 81.573 ms, heap usage 58.354 MB -> 14.595 MB.
+====== finagle-http (web) [default], iteration 2 completed (7510.161 ms) ======
+====== finagle-http (web) [default], iteration 3 started ======
+GC before operation: completed in 66.697 ms, heap usage 77.493 MB -> 14.634 MB.
+====== finagle-http (web) [default], iteration 3 completed (7276.715 ms) ======
+====== finagle-http (web) [default], iteration 4 started ======
+GC before operation: completed in 117.366 ms, heap usage 65.724 MB -> 14.658 MB.
+====== finagle-http (web) [default], iteration 4 completed (7310.450 ms) ======
+====== finagle-http (web) [default], iteration 5 started ======
+GC before operation: completed in 73.652 ms, heap usage 33.768 MB -> 14.683 MB.
+====== finagle-http (web) [default], iteration 5 completed (7062.565 ms) ======
+====== finagle-http (web) [default], iteration 6 started ======
+GC before operation: completed in 86.367 ms, heap usage 42.489 MB -> 14.734 MB.
+====== finagle-http (web) [default], iteration 6 completed (7149.014 ms) ======
+====== finagle-http (web) [default], iteration 7 started ======
+GC before operation: completed in 85.219 ms, heap usage 64.166 MB -> 14.738 MB.
+====== finagle-http (web) [default], iteration 7 completed (7164.185 ms) ======
+====== finagle-http (web) [default], iteration 8 started ======
+GC before operation: completed in 65.516 ms, heap usage 87.928 MB -> 14.735 MB.
+====== finagle-http (web) [default], iteration 8 completed (7178.261 ms) ======
+====== finagle-http (web) [default], iteration 9 started ======
+GC before operation: completed in 86.537 ms, heap usage 79.675 MB -> 14.722 MB.
+====== finagle-http (web) [default], iteration 9 completed (7220.301 ms) ======
+====== finagle-http (web) [default], iteration 10 started ======
+GC before operation: completed in 84.726 ms, heap usage 68.889 MB -> 14.745 MB.
+====== finagle-http (web) [default], iteration 10 completed (7178.981 ms) ======
+====== finagle-http (web) [default], iteration 11 started ======
+GC before operation: completed in 79.233 ms, heap usage 40.595 MB -> 14.754 MB.
+====== finagle-http (web) [default], iteration 11 completed (7076.228 ms) ======
+====== finagle-http (web) [default], iteration 12 started ======
+GC before operation: completed in 94.318 ms, heap usage 28.191 MB -> 14.742 MB.
+====== finagle-http (web) [default], iteration 12 completed (7264.262 ms) ======
+====== finagle-http (web) [default], iteration 13 started ======
+GC before operation: completed in 115.965 ms, heap usage 63.452 MB -> 14.717 MB.
+====== finagle-http (web) [default], iteration 13 completed (7138.448 ms) ======
+====== finagle-http (web) [default], iteration 14 started ======
+GC before operation: completed in 113.051 ms, heap usage 65.068 MB -> 14.748 MB.
+====== finagle-http (web) [default], iteration 14 completed (7216.675 ms) ======
+====== finagle-http (web) [default], iteration 15 started ======
+GC before operation: completed in 117.600 ms, heap usage 54.490 MB -> 14.721 MB.
+====== finagle-http (web) [default], iteration 15 completed (7115.402 ms) ======
+====== finagle-http (web) [default], iteration 16 started ======
+GC before operation: completed in 101.644 ms, heap usage 85.963 MB -> 14.760 MB.
+====== finagle-http (web) [default], iteration 16 completed (7030.164 ms) ======
+====== finagle-http (web) [default], iteration 17 started ======
+GC before operation: completed in 102.032 ms, heap usage 53.249 MB -> 14.732 MB.
+====== finagle-http (web) [default], iteration 17 completed (6990.741 ms) ======
+====== finagle-http (web) [default], iteration 18 started ======
+GC before operation: completed in 112.157 ms, heap usage 113.367 MB -> 14.755 MB.
+====== finagle-http (web) [default], iteration 18 completed (7110.058 ms) ======
+====== finagle-http (web) [default], iteration 19 started ======
+GC before operation: completed in 75.075 ms, heap usage 30.365 MB -> 14.744 MB.
+====== finagle-http (web) [default], iteration 19 completed (7137.108 ms) ======
+====== finagle-http (web) [default], iteration 20 started ======
+GC before operation: completed in 69.359 ms, heap usage 56.010 MB -> 14.722 MB.
+====== finagle-http (web) [default], iteration 20 completed (6980.658 ms) ======
+====== finagle-http (web) [default], iteration 21 started ======
+GC before operation: completed in 78.457 ms, heap usage 79.731 MB -> 14.728 MB.
+====== finagle-http (web) [default], iteration 21 completed (6987.128 ms) ======
+====== finagle-http (web) [default], iteration 22 started ======
+GC before operation: completed in 108.643 ms, heap usage 89.795 MB -> 14.733 MB.
+====== finagle-http (web) [default], iteration 22 completed (7073.794 ms) ======
+====== finagle-http (web) [default], iteration 23 started ======
+GC before operation: completed in 101.964 ms, heap usage 35.607 MB -> 14.690 MB.
+====== finagle-http (web) [default], iteration 23 completed (7048.726 ms) ======
+====== finagle-http (web) [default], iteration 24 started ======
+GC before operation: completed in 118.832 ms, heap usage 72.371 MB -> 14.742 MB.
+====== finagle-http (web) [default], iteration 24 completed (7215.101 ms) ======
+====== finagle-http (web) [default], iteration 25 started ======
+GC before operation: completed in 97.497 ms, heap usage 34.028 MB -> 14.743 MB.
+====== finagle-http (web) [default], iteration 25 completed (7079.534 ms) ======
+====== finagle-http (web) [default], iteration 26 started ======
+GC before operation: completed in 97.389 ms, heap usage 34.677 MB -> 14.749 MB.
+====== finagle-http (web) [default], iteration 26 completed (7060.158 ms) ======
+====== finagle-http (web) [default], iteration 27 started ======
+GC before operation: completed in 87.385 ms, heap usage 42.929 MB -> 14.754 MB.
+====== finagle-http (web) [default], iteration 27 completed (7121.136 ms) ======
+====== finagle-http (web) [default], iteration 28 started ======
+GC before operation: completed in 100.866 ms, heap usage 77.213 MB -> 14.753 MB.
+====== finagle-http (web) [default], iteration 28 completed (7124.580 ms) ======
+====== finagle-http (web) [default], iteration 29 started ======
+GC before operation: completed in 119.399 ms, heap usage 28.880 MB -> 14.786 MB.
+====== finagle-http (web) [default], iteration 29 completed (6974.454 ms) ======
+====== finagle-http (web) [default], iteration 30 started ======
+GC before operation: completed in 100.948 ms, heap usage 71.325 MB -> 14.765 MB.
+====== finagle-http (web) [default], iteration 30 completed (7039.915 ms) ======
+====== finagle-http (web) [default], iteration 31 started ======
+GC before operation: completed in 91.510 ms, heap usage 84.677 MB -> 14.768 MB.
+====== finagle-http (web) [default], iteration 31 completed (7088.803 ms) ======
+====== finagle-http (web) [default], iteration 32 started ======
+GC before operation: completed in 85.254 ms, heap usage 59.186 MB -> 14.755 MB.
+====== finagle-http (web) [default], iteration 32 completed (7174.124 ms) ======
+====== finagle-http (web) [default], iteration 33 started ======
+GC before operation: completed in 79.317 ms, heap usage 37.993 MB -> 14.764 MB.
+====== finagle-http (web) [default], iteration 33 completed (7216.060 ms) ======
+====== finagle-http (web) [default], iteration 34 started ======
+GC before operation: completed in 109.694 ms, heap usage 67.316 MB -> 14.757 MB.
+====== finagle-http (web) [default], iteration 34 completed (7182.884 ms) ======
+====== finagle-http (web) [default], iteration 35 started ======
+GC before operation: completed in 108.294 ms, heap usage 57.034 MB -> 14.770 MB.
+====== finagle-http (web) [default], iteration 35 completed (7354.195 ms) ======
+====== finagle-http (web) [default], iteration 36 started ======
+GC before operation: completed in 77.890 ms, heap usage 67.732 MB -> 14.771 MB.
+====== finagle-http (web) [default], iteration 36 completed (7300.921 ms) ======
+====== finagle-http (web) [default], iteration 37 started ======
+GC before operation: completed in 108.118 ms, heap usage 20.434 MB -> 14.763 MB.
+====== finagle-http (web) [default], iteration 37 completed (7429.258 ms) ======
+====== finagle-http (web) [default], iteration 38 started ======
+GC before operation: completed in 95.323 ms, heap usage 97.536 MB -> 14.772 MB.
+====== finagle-http (web) [default], iteration 38 completed (7348.759 ms) ======
+====== finagle-http (web) [default], iteration 39 started ======
+GC before operation: completed in 120.348 ms, heap usage 47.062 MB -> 14.744 MB.
+====== finagle-http (web) [default], iteration 39 completed (7187.688 ms) ======
+====== finagle-http (web) [default], iteration 40 started ======
+GC before operation: completed in 111.289 ms, heap usage 98.298 MB -> 14.740 MB.
+====== finagle-http (web) [default], iteration 40 completed (7279.082 ms) ======

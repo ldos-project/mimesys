@@ -1,0 +1,17 @@
+[2026-05-11 07:46:31,149 script_utils.py:  88 INFO ] - * mlcr run-mlperf,inference,_find-performance,_full,_r5.1-dev
+[2026-05-11 07:46:31,160 script_utils.py:  88 INFO ] -   * mlcr detect,os
+[2026-05-11 07:46:31,198 module.py      :1037 INFO ] -        ! load /home/ubuntu/MLC/repos/local/cache/detect-os_ffe4673d/mlc-cached-state.json
+[2026-05-11 07:46:31,209 script_utils.py:  88 INFO ] -   * mlcr detect,cpu
+[2026-05-11 07:46:31,215 module.py      :1037 INFO ] -        ! load /home/ubuntu/MLC/repos/local/cache/detect-cpu_0a1ca6be/mlc-cached-state.json
+[2026-05-11 07:46:31,233 script_utils.py:  88 INFO ] -   * mlcr get,python3
+[2026-05-11 07:46:31,238 script_utils.py: 212 INFO ] -       - More than 1 cached script output found for "get,python3":
+[2026-05-11 07:46:31,239 script_utils.py: 231 INFO ] -         0) /home/ubuntu/MLC/repos/local/cache/get-python3_a7d3f3d8 (get,python,-virtual,python3,get-python,get-python3,script-item-d0b5dd74373f4a62,version-3.8.10) (Version 3.8.10)
+[2026-05-11 07:46:31,239 script_utils.py: 231 INFO ] -         1) /home/ubuntu/MLC/repos/local/cache/get-python3_virtual-name-ml_040ccf5e (get,python3,python,get-python,get-python3,virtual,name-mlperf,script-item-d0b5dd74373f4a62,version-3.8.10) (Version 3.8.10)
+        Make your selection or press Enter for 0 or use -1 to skip: [2026-05-11 07:46:31,239 main.py        : 134 ERROR] - Error during 'script' action: Script run execution failed in /home/ubuntu/MLC/repos/mlcommons@mlperf-automations/automation/script/module.py.
+Error : EOFError: EOF when reading a line
+[2026-05-11 07:46:31,242 main.py        : 148 ERROR] -   at /home/ubuntu/.local/lib/python3.8/site-packages/mlc/script_action.py:287 in call_script_module_function
+[2026-05-11 07:46:31,243 main.py        : 178 ERROR] - Failed script: run-mlperf,inference,_find-performance,_full,_r5.1-dev
+[2026-05-11 07:46:31,243 main.py        : 179 ERROR] - To rerun just the failed part: mlcr run-mlperf,inference,_find-performance,_full,_r5.1-dev --model=resnet50 --implementation=reference --framework=onnxruntime --category=datacenter --scenario=Offline --device=cpu --execution_mode=test --test_query_count=1000 --rerun=True
+[2026-05-11 07:46:31,244 main.py        : 188 ERROR] - Please file an issue at https://github.com/mlcommons/mlperf-automations/issues with the full console log.
+[2026-05-11 07:46:31,244 main.py        : 191 ERROR] - mlcflow 1.2.1
+[2026-05-11 07:46:31,405 main.py        : 196 ERROR] -   mlcommons@mlperf-automations: dev 430f2f84a

@@ -1,0 +1,2 @@
+Type         Date       Time     Input_data_size      Duration(s)          Throughput(bytes/s)  Throughput/node     
+ScalaSparkWordcount 2026-05-11 05:32:55 407286674            46.165               8822412              8822412             

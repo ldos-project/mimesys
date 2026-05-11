@@ -1,0 +1,32 @@
+Hash table virtual address: [139972927553536, 139973195988992)
+Populating the store...
+Finished populating store: contains 8000000 elements.
+Setup time: 24.10 seconds.
+number of hash buckets: 4194304
+total record count: 8000000
+histogram:
+ 0 : 571775
+ 1 : 1111974
+ 2 : 1207784
+ 3 : 789066
+ 4 : 463265
+ 5 : 50440
+ 6 : 0
+ 7 : 0
+ 8 : 0
+ 9 : 0
+10 : 0
+11 : 0
+12 : 0
+13 : 0
+14 : 0
+15+: 0
+Warming up log
+Warming up hash table
+Configuring distribution...
+Warming up the store...
+Warmup time: 3.54 seconds.
+Running benchmark on 1 threads...
+Reached maximum run time of 300 seconds, shutting down...
+Finished thread 0 : 206491237 reads, 206479920 writes, in 300.00 seconds.
+Finished benchmark: 1376576.67 ops/second/thread
