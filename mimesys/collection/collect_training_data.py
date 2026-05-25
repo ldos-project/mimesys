@@ -54,7 +54,9 @@ if _WORKER_SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _WORKER_SCRIPTS_DIR)
 import config as worker_config
 
-OUTPUT_PATH = os.path.expanduser("~/mimesys_training_data/training_data_v1")
+OUTPUT_PATH = os.path.expanduser(
+    os.environ.get("MIMESYS_OUTPUT_PATH",
+                    "~/mimesys_training_data/training_data_v2_2sec"))
 
 PROFILING_MACHINES = list(worker_config.HOSTNAMES)
 SSH_USER           = worker_config.USERNAME
@@ -64,7 +66,8 @@ MY_HOSTNAME        = worker_config.MY_HOSTNAME
 NUM_ACTIONS    = 13
 NUM_THREADS    = 20
 BATCH_SIZE     = worker_config.PER_MACHINE_BATCH * len(PROFILING_MACHINES)   # active-learning round size
-NUM_METRICS    = 26
+# 24 = 20 per-core CPU% + 1 avg_cpu_utilizations_total + 1 io + 1 l3_cache_usage + 1 memory_bandwidth
+NUM_METRICS    = 24
 
 # 3:7:0 ratio parameters (30% hull, 70% fps, no IO mutation)
 HULL_FPS_RATIO = 3/7     # hull:fps split inside hull_mixed_fps_hybrid (3/7 → 30/70)
@@ -289,6 +292,15 @@ def propose_candidates_by_pool_mutation(A, n_candidates=1000, noise_std=0.03):
             else:  # scale_noise
                 result_arrs = _scale_noise(a1)
 
+        # Per-thread uniform[0, 1] scale on curr_action so per-core CPU%
+        # spreads across the full [0, 100] range. Without this, mutations
+        # inherit parent magnitudes (which sum ~1 per thread → saturated cores),
+        # producing the bimodal per-core distribution.
+        curr_idx = len(result_arrs) - 1
+        curr = result_arrs[curr_idx]
+        thread_scales = np.random.uniform(0.8, 1.0, size=curr.shape[0])
+        result_arrs[curr_idx] = curr * thread_scales[:, None]
+
         candidates.append(_arrays_to_action(result_arrs))
 
     return candidates
@@ -296,17 +308,13 @@ def propose_candidates_by_pool_mutation(A, n_candidates=1000, noise_std=0.03):
 
 # M layout: [prev_metrics(NUM_METRICS), curr_metrics(NUM_METRICS), noop_metrics(NUM_METRICS)] = NUM_METRICS * 3 dims total.
 # M ordering verified: group 0 = prev_action, group 1 = curr_action, group 2 = no-op.
-# e.g., Within each 26-dim group the last 6 are the key metrics in this order:
+# Within each 24-dim group the last 4 are the key metrics in this order:
 #   idx+20  avg_cpu_utilizations_total
 #   idx+21  io
-#   idx+22  l3_cache_usage_socket_0
-#   idx+23  l3_cache_usage_socket_1
-#   idx+24  memory_bandwidth_socket_0
-#   idx+25  memory_bandwidth_socket_1
-# For curr_action (group 1, offset 26): flat indices 46–51.
+#   idx+22  l3_cache_usage    (aggregate; per-socket dropped to avoid CHA artifact)
+#   idx+23  memory_bandwidth  (aggregate)
+# For curr_action (group 1, offset 24): flat indices 44–47.
 _KEY_METRIC_INDICES = [
-        NUM_METRICS * 2 - 6,
-        NUM_METRICS * 2 - 5,
         NUM_METRICS * 2 - 4,
         NUM_METRICS * 2 - 3,
         NUM_METRICS * 2 - 2,
@@ -330,6 +338,75 @@ def _flatten_action_for_knn(a):
     return arr
 
 
+AUG_FACTOR = 10  # variants per original (matches dataloader's training-time aug_factor)
+
+
+def _augment_pool_for_hull(A, M, aug_factor: int = AUG_FACTOR):
+    """Expand the (A, M) pool by `aug_factor` so hull/FPS don't treat thread
+    permutations or socket swaps as novel.
+
+    For each (a, m) we emit `aug_factor` variants:
+      0. identity
+      1..half-1                : intra-socket thread perm (random per variant)
+      half                     : socket swap (no perm)
+      half+1..end              : intra-socket perm + socket swap
+
+    Notes:
+      - Intra-perm preserves all socket-aggregate features hull/FPS use
+        (cpu_s0/s1 aggregate, cpu_std, cpu_mid_frac are invariant) but adds
+        action-space diversity so FPS mutation has more parent shapes.
+      - Socket swap exchanges cpu_s0↔cpu_s1 (per-core indices) only. LLC and
+        memory bandwidth are now socket-aggregated so they're already
+        swap-invariant.
+      - Mirrors `augment_dataset` in preprocessing/dataloader.py so training-time
+        aug doesn't grant the model "free" samples that collection already paid
+        for.
+    """
+    def _action_apply(a, perm_s0, perm_s1, do_swap):
+        out = []
+        for arr in a:
+            arr_np = np.asarray(arr, dtype=np.float32)
+            new = arr_np.copy()
+            if perm_s0 is not None:
+                new[0:10]  = arr_np[0:10][perm_s0]
+                new[10:20] = arr_np[10:20][perm_s1]
+            if do_swap:
+                new = np.vstack([new[10:20], new[0:10]])
+            out.append(new.tolist() if isinstance(arr, list) else new)
+        return out
+
+    def _metric_apply(m, perm_s0, perm_s1, do_swap):
+        new = np.asarray(m, dtype=float).copy()
+        for K in range(3):                              # prev, curr, noop
+            base = K * NUM_METRICS                      # 0, 24, 48
+            if perm_s0 is not None:
+                new[base:base+10]    = np.asarray(m[base:base+10])[perm_s0]
+                new[base+10:base+20] = np.asarray(m[base+10:base+20])[perm_s1]
+            if do_swap:
+                tmp_s0 = new[base:base+10].copy()
+                new[base:base+10]    = new[base+10:base+20]
+                new[base+10:base+20] = tmp_s0
+                # LLC/BW are now aggregated → no per-socket swap needed
+        return new
+
+    n_extra = aug_factor - 1
+    half = n_extra // 2
+    A_aug, M_aug = [], []
+    for a, m in zip(A, M):
+        # 0: identity
+        A_aug.append(a); M_aug.append(np.asarray(m, dtype=float))
+        # 1..n_extra: aug variants — perm only (first half) vs perm+swap (second half)
+        # Variant `half` is socket-swap only (no perm).
+        for k in range(n_extra):
+            do_perm = (k != half)
+            do_swap = (k >= half)
+            ps0 = np.random.permutation(10) if do_perm else None
+            ps1 = np.random.permutation(10) if do_perm else None
+            A_aug.append(_action_apply(a, ps0, ps1, do_swap))
+            M_aug.append(_metric_apply(m, ps0, ps1, do_swap))
+    return A_aug, np.asarray(M_aug)
+
+
 def propose_by_hull_mixed_fps_hybrid(A, M, n_candidates, grid_bins=10, k_neighbors=3,
                                       n_estimators=100, fps_oversample=3,
                                       hull_fps_ratio=1):
@@ -350,25 +427,47 @@ def propose_by_hull_mixed_fps_hybrid(A, M, n_candidates, grid_bins=10, k_neighbo
     hull_fps_ratio=1  → equal pools (1:1); hull_fps_ratio=9 → 9:1 hull:fps.
     mutation_ratio=0.5 → half the fps oversample pool comes from pool mutations,
                          half from fresh random candidates.
-    Metric indices: 0=CPU%  1=IO  2=LLC-S0  3=LLC-S1  4=BW-S0  5=BW-S1
-                    6=CPU-S0  7=CPU-S1  (per-socket CPU util, cols 26-35 / 36-45)
+    Metric indices (new 23-D layout with socket-aggregated LLC/BW):
+                    0=CPU%  1=IO  2=LLC  3=BW  (key metrics from curr_action group)
+                    4=CPU-S0  5=CPU-S1  (per-socket CPU util, cols 24-33 / 34-43)
+                    6=CPU-STD  7=CPU-MID-FRAC  (per-core shape — std across 20 cores
+                    and fraction of cores at 20-80% mid-range)
     """
     from collections import Counter
 
-    M_key6 = M[:, _KEY_METRIC_INDICES].astype(float)
-    # Per-socket CPU util: mean across the 10 threads per socket
-    cpu_s0 = M[:, NUM_ACTIONS:NUM_ACTIONS+10].astype(float).mean(axis=1, keepdims=True)
-    cpu_s1 = M[:, NUM_ACTIONS+10:NUM_ACTIONS+20].astype(float).mean(axis=1, keepdims=True)
-    M_key  = np.hstack([M_key6, cpu_s0, cpu_s1])          # (N, 8)
+    # Augment pool with thread-perm + socket-swap variants so hull/FPS don't
+    # treat augmentation-equivalents of existing samples as novel candidates.
+    n_orig = len(A)
+    A, M = _augment_pool_for_hull(A, M)
+    print(f"  [hull/fps] augmented pool: {n_orig} → {len(A)} samples "
+          f"({AUG_FACTOR}× via intra-perm + socket-swap variants)")
+
+    M_key4 = M[:, _KEY_METRIC_INDICES].astype(float)
+    # Per-core CPU% live in group 1 (curr_action), cols 24..43 (alphabetical
+    # core_00..core_19). Socket 0 = cores 0..9, socket 1 = cores 10..19.
+    G1_CPU_LO = NUM_METRICS               # 24
+    G1_CPU_HI = NUM_METRICS + 20          # 44
+    per_core_curr = M[:, G1_CPU_LO:G1_CPU_HI].astype(float)
+    cpu_s0 = per_core_curr[:, :10].mean(axis=1, keepdims=True)
+    cpu_s1 = per_core_curr[:, 10:].mean(axis=1, keepdims=True)
+    # Per-core shape features: encourage workloads that put cores in the
+    # mid-range (20..80%) rather than the bimodal 0/100 tails.
+    cpu_std      = per_core_curr.std(axis=1, keepdims=True)
+    cpu_mid_frac = ((per_core_curr >= 20.0) & (per_core_curr <= 80.0)) \
+                     .mean(axis=1, keepdims=True) * 100.0
+    M_key = np.hstack([M_key4, cpu_s0, cpu_s1, cpu_std, cpu_mid_frac])  # (N, 8)
 
     # ── 1. Build hull pool ────────────────────────────────────────────────────
+    # Index legend: 0=CPU%, 1=IO, 2=LLC, 3=BW, 4=CPU-S0, 5=CPU-S1,
+    #               6=CPU-STD, 7=CPU-MID-FRAC.
     GROUPS = [
-        (0, 2, 4),
-        (0, 3, 5),
-        (0, 5),
-        (2, 3),
-        (4, 5),
-        (6, 7),    # cpu-s0 vs cpu-s1 (socket CPU asymmetry)
+        (0, 2, 3),    # CPU% × LLC × BW   (compute-heavy hull)
+        (1, 2, 3),    # IO   × LLC × BW   (io-heavy hull)
+        (0, 1, 2),    # CPU% × IO  × LLC
+        (0, 1, 3),    # CPU% × IO  × BW
+        (0, 1),       # CPU% × IO
+        (2, 3),       # LLC  × BW         (cache vs memory traffic)
+        (4, 5),       # cpu-s0 vs cpu-s1  (socket CPU asymmetry)
     ]
 
     n_str   = len(A[0][0][0])
@@ -580,11 +679,11 @@ def initial_candidates(bounds, n_candidates, num_max_threads=20):
                 initial_action_weights[j] = 1.0
 
         candidate_max_threads = num_max_threads
-        if i == 10 or i == 11:
+        if i >= 10:
             # heuristic for I/O bound actions
-            candidate_max_threads = 1
-        elif i == 12:
             candidate_max_threads = 4
+        # elif i == 12:
+        #     candidate_max_threads = 4
         for num_threads in range(1, candidate_max_threads + 1):
             candidate = [initial_action_weights for _ in range(num_threads)]
             while len(candidate) < num_max_threads:
@@ -672,41 +771,420 @@ def filter_high_variance_data(A, M, var, metric_ranges, threshold=0.1):
 # hybrid proposer (rounds 1+)
 # ---------------------------------------------------------------------------
 
+def _action_purity_per_core(action_curr, kernel_thresh=0.5):
+    """Return list of (core_idx, dom_kernel) for each core where the dominant
+    kernel has weight >= kernel_thresh (i.e., the core is 'pure' on that kernel).
+    `action_curr` is the per-thread×per-kernel matrix at curr-timestep
+    (list[NUM_THREADS][NUM_ACTIONS]).
+    """
+    out = []
+    for c, row in enumerate(action_curr):
+        if not row: continue
+        s = sum(row)
+        if s < 0.05: continue
+        max_w = max(row)
+        if max_w >= kernel_thresh:
+            out.append((c, int(np.argmax(row))))
+    return out
+
+
+def propose_disjoint_composites(A, n_candidates, num_actions=NUM_ACTIONS,
+                                 num_threads=NUM_THREADS, kernel_thresh=0.5,
+                                 fallback_synthetic_prob=0.5):
+    """Pair two 'pure' parents from pool A with **disjoint active cores** and
+    union them: each core takes weights from whichever parent had it active.
+
+    A 'pure' parent here is an action whose active cores are dominated by a
+    single kernel each. Goal: produce composite actions of the form
+        kernel K1 on cores C1  +  kernel K2 on cores C2  (C1 ∩ C2 = ∅)
+    where K1 ≠ K2 — directly targeting the 'IO-CPU additivity' gap
+    (no such composites exist in the v6 corpus).
+
+    Falls back to a synthetic pure parent (one kernel on a random core subset
+    with weight in [0.5, 1.0]) when pool A doesn't have enough pure samples
+    for the desired kernel pair (controlled by `fallback_synthetic_prob`).
+
+    Action layout: list of timestamps, each = list[num_threads][num_actions].
+    We construct two timestamps (prev_action + curr_action) so the format
+    matches the rest of the pipeline.
+    """
+    if not A:
+        # No pool yet — produce all synthetic
+        purified = []
+    else:
+        # Identify pure parents in A — index by dominant-kernel sets
+        purified = []   # list of (action_arr, dict{core: dom_kernel})
+        for a in A:
+            curr_ts_idx = 1 if len(a) > 1 else 0
+            curr = a[curr_ts_idx]
+            pcores = _action_purity_per_core(curr, kernel_thresh)
+            if not pcores: continue
+            # 'Mostly pure': at least 80% of active cores are dominated by one kernel
+            active = sum(1 for row in curr if row and sum(row) > 0.05)
+            if len(pcores) >= max(1, int(0.8 * active)):
+                # Group cores by dominant kernel for this parent
+                by_kernel = {}
+                for c, k in pcores:
+                    by_kernel.setdefault(k, []).append(c)
+                # Single-kernel parents only — pick the dominant one if multiple
+                dom_kernel = max(by_kernel, key=lambda k: len(by_kernel[k]))
+                cores      = by_kernel[dom_kernel]
+                purified.append((np.asarray(curr, dtype=float), dom_kernel, set(cores)))
+
+    print(f"  [composite] pool A had {len(A)} actions; {len(purified)} pure parents available")
+    pure_by_kernel = {}
+    for arr, k, cs in purified:
+        pure_by_kernel.setdefault(k, []).append((arr, cs))
+
+    def _make_synthetic_pure(kernel, n_cores_range=(2, 10), w_range=(0.5, 1.0)):
+        """Build a synthetic pure parent: `kernel` on a random subset of cores
+        with random weight in [w_range], others idle."""
+        n_cores = random.randint(*n_cores_range)
+        # Pick random core subset
+        cores = random.sample(range(num_threads), n_cores)
+        w = random.uniform(*w_range)
+        arr = np.zeros((num_threads, num_actions), dtype=float)
+        for c in cores:
+            arr[c, kernel] = w
+        return arr, set(cores)
+
+    # Kernel groups so we can bias toward cross-resource composites
+    CPU_HEAVY = [5, 7, 8, 9]            # SWISSMAP_InsertManyOrdered/InsertMiss
+    IO_PURE   = [10, 11, 12]            # STRESS_NG_* (IO-bound)
+    MID_KERN  = [2, 3, 4, 6]            # LIBC/SIMD/SWISSMAP-mid
+    HASH_K    = [0, 1]                  # HASHING
+
+    candidates = []
+    for _ in range(n_candidates):
+        # Decide pair-of-kernel categories — bias toward CPU_HEAVY × IO_PURE
+        # to directly close the (k=8 + k=12) gap; sample others too for breadth.
+        roll = random.random()
+        if roll < 0.50:
+            grp1, grp2 = CPU_HEAVY, IO_PURE
+        elif roll < 0.75:
+            grp1, grp2 = CPU_HEAVY, MID_KERN
+        elif roll < 0.90:
+            grp1, grp2 = MID_KERN, IO_PURE
+        else:
+            grp1, grp2 = HASH_K, IO_PURE
+
+        k1 = random.choice(grp1); k2 = random.choice(grp2)
+        if k1 == k2: continue  # rare overlap
+
+        # Pull pure parents (from pool A or synthetic)
+        def _get_parent(kernel):
+            real = pure_by_kernel.get(kernel, [])
+            if real and random.random() > fallback_synthetic_prob:
+                return random.choice(real)
+            return _make_synthetic_pure(kernel)
+
+        p1_arr, p1_cores = _get_parent(k1)
+        p2_arr, p2_cores = _get_parent(k2)
+
+        # Disjoint: if overlap, reassign p2 cores to the complement
+        overlap = p1_cores & p2_cores
+        if overlap:
+            free = list(set(range(num_threads)) - p1_cores)
+            if len(free) < len(p2_cores):
+                # Truncate p2 to fit the free pool
+                p2_cores = set(random.sample(free, min(len(free), len(p2_cores))))
+            else:
+                p2_cores = set(random.sample(free, len(p2_cores)))
+            # Rebuild p2_arr to live only on the new cores
+            new_p2 = np.zeros_like(p2_arr)
+            for c in p2_cores:
+                new_p2[c, k2] = random.uniform(0.5, 1.0)
+            p2_arr = new_p2
+
+        # Union: prefer p1 weights on its cores, p2 on its cores; idle elsewhere
+        composite = np.zeros((num_threads, num_actions), dtype=float)
+        for c in p1_cores:
+            composite[c] = p1_arr[c]
+        for c in p2_cores:
+            composite[c] = p2_arr[c]
+
+        # Apply a per-thread uniform[0.8, 1.0] scale so intensity varies
+        thread_scales = np.random.uniform(0.8, 1.0, size=num_threads)
+        composite = composite * thread_scales[:, None]
+
+        # Build two-timestep action (prev = composite, curr = composite for now;
+        # active-learning loop uses index 1 as curr_action)
+        action = [composite.tolist(), composite.tolist()]
+        candidates.append(action)
+
+    return candidates
+
+
+def _action_key(action, decimals=2):
+    """Canonical dedup key — hash of rounded curr_action weights.
+
+    Rounds to 2 decimal places (matches the empirical observation that ~99%
+    of v6 duplicates are byte-identical, with no FP-noise variants). Hashing
+    bytes is O(n_threads * n_kernels) and far cheaper than equality scans.
+    """
+    curr_idx = 1 if len(action) > 1 else 0
+    return hash(np.round(np.asarray(action[curr_idx], dtype=float), decimals).tobytes())
+
+
+def _restrict_to_single_socket(actions, mode="alternate", active_thresh=1e-6):
+    """Repack each action so all active threads land in ONE socket's core slots.
+    On c220g5: socket 0 = thread slots 0-9, socket 1 = thread slots 10-19.
+
+    mode='alternate' (default): alternate s0/s1 assignment per action (balanced).
+    mode='s0' | 's1': force all actions to that socket.
+    mode='random': uniform random per action.
+
+    Thread identity is preserved across timestamps: a thread's row in prev/curr
+    moves together. If an action has >10 active threads, the lowest-indexed 10
+    are kept and the rest are dropped (single-socket holds 10 cores).
+    """
+    N_THREADS = 20
+    N_PER_SOCKET = 10
+    for i, a in enumerate(actions):
+        if not a or not a[0]:
+            continue
+        if mode == "alternate":
+            target = i % 2
+        elif mode == "s0":
+            target = 0
+        elif mode == "s1":
+            target = 1
+        else:
+            target = random.randint(0, 1)
+        base = 0 if target == 0 else 10
+        n_kernels = len(a[0][0])
+        active = []
+        for j in range(len(a[0])):
+            for ts in a:
+                if j < len(ts) and any(w > active_thresh for w in ts[j]):
+                    active.append(j); break
+        active = active[:N_PER_SOCKET]
+        new_action = []
+        for ts in a:
+            new_ts = [[0.0] * n_kernels for _ in range(N_THREADS)]
+            for slot_i, orig_j in enumerate(active):
+                if orig_j < len(ts):
+                    new_ts[base + slot_i] = list(ts[orig_j])
+            new_action.append(new_ts)
+        actions[i] = new_action
+    return actions
+
+
+def _apply_action_noise(actions, eps=0.1, renormalize=True, active_thresh=1e-6):
+    """Add Uniform(-eps, +eps) noise to ACTIVE cells only (weight > active_thresh).
+    Idle cells (weight == 0) stay exactly 0 — preserving the idle-core structure.
+    Clips perturbed cells to [0, 1]. If renormalize=True and a thread's weight
+    sums to > 1, rescales that thread back down to sum=1. Mutates in place —
+    also returns the list for chaining.
+    """
+    if eps <= 0: return actions
+    for a in actions:
+        for ts_idx in range(len(a)):
+            arr = np.asarray(a[ts_idx], dtype=float)
+            if arr.size == 0: continue
+            active_mask = arr > active_thresh
+            if not active_mask.any(): continue
+            noise = np.random.uniform(-eps, eps, size=arr.shape)
+            # Apply noise only on active cells
+            arr[active_mask] = np.clip(arr[active_mask] + noise[active_mask], 0.0, 1.0)
+            if renormalize:
+                sums = arr.sum(axis=-1, keepdims=True)
+                mask = (sums > 1.0).squeeze(-1) if sums.ndim > 1 else (sums > 1.0)
+                if mask.any():
+                    arr[mask] = arr[mask] / sums[mask]
+            a[ts_idx] = arr.tolist()
+    return actions
+
+
 def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
-    """via hull_mixed_fps_hybrid"""
-    n_hull_fps = n_candidates
+    """via hull_mixed_fps_hybrid, optionally mixed with disjoint composites.
 
-    print(f"  [propose] n_hull_fps={n_hull_fps} (hull_fps_ratio={HULL_FPS_RATIO:.3f})")
+    Env vars:
+      MIMESYS_COMPOSITE_FRACTION (default 0.0)  fraction of batch from composites
+      MIMESYS_DEDUP              (default "1")  set to "0" to disable dedup
+    """
+    composite_frac = float(os.environ.get("MIMESYS_COMPOSITE_FRACTION", "0.0"))
+    composite_frac = max(0.0, min(1.0, composite_frac))
+    n_composite = int(round(n_candidates * composite_frac))
+    n_hull_fps  = n_candidates - n_composite
+    do_dedup    = os.environ.get("MIMESYS_DEDUP", "1") != "0"
 
-    hull_fps = propose_by_hull_mixed_fps_hybrid(
-        A, M, n_hull_fps, hull_fps_ratio=HULL_FPS_RATIO)
+    # Build pool-A dedup set (existing actions we already collected)
+    if do_dedup and A:
+        pool_keys = {_action_key(a) for a in A}
+        print(f"  [dedup] pool A: {len(A)} actions → {len(pool_keys)} unique signatures "
+              f"({100*(len(A)-len(pool_keys))/max(len(A),1):.1f}% dupes already)")
+    else:
+        pool_keys = set()
 
-    random.shuffle(hull_fps)
-    print(f"  [propose] total={len(hull_fps)}")
-    return hull_fps
+    # Over-propose hull/FPS to absorb dedup drops (composites use random
+    # uniform weights so collisions are already astronomically rare)
+    OVERSHOOT = 1.4
+    raw_hull = (propose_by_hull_mixed_fps_hybrid(
+                    A, M, int(n_hull_fps * OVERSHOOT), hull_fps_ratio=HULL_FPS_RATIO)
+                if n_hull_fps > 0 else [])
+    raw_comp = (propose_disjoint_composites(A, n_composite)
+                if n_composite > 0 else [])
+
+    def _dedup_filter(cands, seen):
+        """Drop entries whose key is in `seen` or pool_keys; update `seen` with kept keys."""
+        kept = []
+        for c in cands:
+            k = _action_key(c)
+            if k in seen or k in pool_keys: continue
+            seen.add(k)
+            kept.append(c)
+        return kept
+
+    used = set()
+    if do_dedup:
+        kept_hull = _dedup_filter(raw_hull, used)
+        kept_comp = _dedup_filter(raw_comp, used)
+    else:
+        kept_hull = list(raw_hull)
+        kept_comp = list(raw_comp)
+
+    # Truncate to target
+    hull_fps   = kept_hull[:n_hull_fps]
+    composites = kept_comp[:n_composite]
+
+    short = n_candidates - len(hull_fps) - len(composites)
+    if short > 0:
+        # Top-up with extra random proposals if dedup left us short
+        extra = propose_candidates_by_random(n_candidates=int(short * 1.5))
+        if do_dedup:
+            extra = _dedup_filter(extra, used)
+        composites += extra[:short]
+
+    out = hull_fps + composites
+    random.shuffle(out)
+    dropped_hull = len(raw_hull) - len(hull_fps)
+    dropped_comp = max(0, len(raw_comp) - len(composites))
+    print(f"  [propose] n_hull_fps={n_hull_fps}  n_composite={n_composite} "
+          f"(composite_frac={composite_frac:.2f}, dedup={do_dedup})")
+    print(f"  [propose] kept hull/fps={len(hull_fps)} (dropped {dropped_hull}); "
+          f"composite={len(composites)}; total={len(out)}")
+
+    # Per-cell noise injection (default off; env var MIMESYS_ACTION_NOISE_EPS)
+    noise_eps = float(os.environ.get("MIMESYS_ACTION_NOISE_EPS", "0.0"))
+    if noise_eps > 0:
+        out = _apply_action_noise(out, eps=noise_eps, renormalize=True)
+        print(f"  [propose] applied per-cell noise eps=±{noise_eps:.2f} "
+              f"(clip→[0,1], renorm if thread_sum>1)")
+
+    # Single-socket restriction (default off; env MIMESYS_SINGLE_SOCKET={alternate,s0,s1,random})
+    single_sock = os.environ.get("MIMESYS_SINGLE_SOCKET", "").strip()
+    if single_sock:
+        out = _restrict_to_single_socket(out, mode=single_sock)
+        print(f"  [propose] restricted to single socket (mode={single_sock})")
+
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Round loading helper
 # ---------------------------------------------------------------------------
 
-def load_round(profiler, round_idx):
-    """Load plan_stat_pairs for an already-collected round_{round_idx}."""
-    dest = os.path.join(OUTPUT_PATH, f"round_{round_idx}")
-    found_files = {}
-    for root, _, files in os.walk(dest):
+def _ensure_extracted(round_dir):
+    """Make sure each chunk_X/ has its validation-*.zip extracted into chunk_X/results/.
+    The collection pipeline already extracts during profile_actions, but if this fn is
+    called against an existing on-disk round (e.g., resume), extract here defensively.
+    """
+    import zipfile
+    for root, _, files in os.walk(round_dir):
         for fname in files:
-            m = re.search(r"validation-(\d+)\.zip$", fname)
-            if m:
-                found_files[int(m.group(1))] = fname
-    if not found_files:
+            if re.search(r"validation-\d+\.zip$", fname):
+                zpath = os.path.join(root, fname)
+                try:
+                    with zipfile.ZipFile(zpath, "r") as z:
+                        z.extractall(root)
+                except Exception:
+                    pass
+
+
+def load_round(profiler, round_idx):
+    """Load plan_stat_pairs for an already-collected round_{round_idx}.
+
+    Replaces the previous Profiler.parse_metrics_from_zip path. That path had
+    non-deterministic action↔metrics pairing under ThreadPoolExecutor — pairs
+    sometimes ended up with metrics from a different plan than their action.
+    This implementation:
+      - walks chunk_*/plans/plan_*.h5 in sorted (deterministic) order
+      - for each plan, reads its matching stats-plan_*.txt file directly
+      - parses with process_trace_all and computes per-group median nonzero
+      - returns the same tuple format: (actions, avg_list, med_list, std_list, wall_s)
+    """
+    from collections import defaultdict
+    from mimesys.preprocessing.dataloader import parse_trace_file, process_trace_all
+
+    dest = os.path.join(OUTPUT_PATH, f"round_{round_idx}")
+    if not os.path.isdir(dest):
         return []
-    print(f"  loading round_{round_idx}: {len(found_files)} chunks from disk")
-    return profiler.parse_metrics_from_zip(found_files, dest)
+    # Defensively extract any validation zips not yet expanded.
+    _ensure_extracted(dest)
+
+    plan_paths = sorted(__import__("glob").glob(f"{dest}/chunk_*/plans/plan_*.h5"))
+    if not plan_paths:
+        return []
+    print(f"  loading round_{round_idx}: {len(plan_paths)} plans from disk (clean parse)")
+
+    pairs = []
+    for h5p in plan_paths:
+        sp = h5p.replace("/plans/plan_", "/results/stats-plan_").replace(".h5", ".txt")
+        if not os.path.exists(sp):
+            continue
+        try:
+            _, traces = parse_trace_file(sp)
+            pm = process_trace_all(traces, include_aggregated_cpu=True)
+        except Exception:
+            continue
+        if not pm:
+            continue
+        with h5py.File(h5p, "r") as f:
+            actions = f["execution_plan"][:].tolist()
+        num_actions = len(actions) + 1
+
+        # Per-group median of nonzero, per metric. Group i collects samples
+        # at sample_idx % num_actions == i (samples cycle through prev / curr /
+        # noop slots in the BM_Mimesys loop).
+        avg_metrics = defaultdict(dict)
+        med_metrics = defaultdict(dict)
+        std_metrics = defaultdict(dict)
+        for tm, vals in pm.items():
+            groups = defaultdict(list)
+            for i, v in enumerate(vals):
+                groups[i % num_actions].append(v)
+            for g, gvals in groups.items():
+                nz = [x for x in gvals if x != 0]
+                avg_metrics[g][tm] = (sum(nz) / len(nz)) if nz else 0.0
+                med_metrics[g][tm] = sorted(nz)[len(nz) // 2] if nz else 0.0
+                std_metrics[g][tm] = float(np.std(nz)) if nz else 0.0
+
+        # Flatten as the old code did: outer-group then inner-metric order
+        # (metric order = process_trace_all dict insertion order, deterministic).
+        flat_avg, flat_med, flat_std = [], [], []
+        keys = list(pm.keys())
+        for g in range(num_actions):
+            for tm in keys:
+                flat_avg.append(avg_metrics[g].get(tm, 0.0))
+                flat_med.append(med_metrics[g].get(tm, 0.0))
+                flat_std.append(std_metrics[g].get(tm, 0.0))
+
+        try:
+            ts0 = float(traces[0]["timestamp"][0].split()[0])
+            ts1 = float(traces[-1]["timestamp"][0].split()[0])
+            wall_s = max(0.0, ts1 - ts0)
+        except Exception:
+            wall_s = float("nan")
+
+        pairs.append((actions, flat_avg, flat_med, flat_std, wall_s))
+    return pairs
 
 
 def pairs_to_AM(pairs, max_len=0):
-    """Convert plan_stat_pairs → (A list, M array, var array) with padding."""
+    """Convert plan_stat_pairs → (A list, M array, var array) with padding.
+    Tolerates pairs of length 4 (legacy) or 5 (new — wall-clock tucked at
+    index 4)."""
     valid = [p for p in pairs if p is not None]
     if not valid:
         return [], None, None
@@ -719,11 +1197,51 @@ def pairs_to_AM(pairs, max_len=0):
 
 
 # ---------------------------------------------------------------------------
+# Straggler filter: drop plans whose wall-clock blew the slot budget
+# ---------------------------------------------------------------------------
+
+# Worker side: each plan runs for MIMESYS_ITERS × (T+1) slots × slot_seconds.
+# With T=2 timesteps, do_sleep=true, MIMESYS_ITERS=3, slot=1 s ⇒ ~9 s budget.
+# Add 2 s for benchmark startup + tmp-file cleanup per plan.
+EXPECTED_PLAN_SECONDS = 18.0  # T=2 timesteps × MIMESYS_ITERS=3 × slot=2s = 18s
+PLAN_OVERHEAD_SECONDS = 2.0
+STRAGGLER_THRESHOLD   = 1.5   # drop plans > 1.5× expected
+
+
+def filter_straggler_plans(pairs, expected_s=EXPECTED_PLAN_SECONDS,
+                            overhead_s=PLAN_OVERHEAD_SECONDS,
+                            threshold=STRAGGLER_THRESHOLD):
+    """Drop plan_stat_pairs whose wall-clock (5th tuple element) exceeded
+    `(expected_s + overhead_s) × threshold`. Pairs without wall-clock (legacy
+    4-tuples) are passed through.
+    Returns (kept_pairs, dropped_count, max_seen_seconds)."""
+    if not pairs:
+        return pairs, 0, 0.0
+    budget_s = (expected_s + overhead_s) * threshold
+    kept, dropped, max_seen = [], 0, 0.0
+    for p in pairs:
+        if p is None:
+            continue
+        if len(p) < 5 or p[4] != p[4]:    # NaN check
+            kept.append(p); continue
+        wall_s = float(p[4])
+        max_seen = max(max_seen, wall_s)
+        if wall_s > budget_s:
+            dropped += 1
+        else:
+            kept.append(p)
+    print(f"  [straggler-filter] kept {len(kept)}/{len(pairs)} "
+          f"(dropped {dropped} with wall_s > {budget_s:.1f} s; "
+          f"max_seen={max_seen:.1f} s, expected~{expected_s+overhead_s:.1f} s)")
+    return kept, dropped, max_seen
+
+
+# ---------------------------------------------------------------------------
 # Metric summary
 # ---------------------------------------------------------------------------
 
 def report_metrics(M, label=""):
-    labels = ["CPU%", "IO KB/s", "L3-S0", "L3-S1", "BW-S0", "BW-S1"]
+    labels = ["CPU%", "IO KB/s", "L3 MB/s", "BW %"]
     M_key  = M[:, _KEY_METRIC_INDICES]
     hdr = f"  [{label}]" if label else ""
     print(f"\n{'Metric':<12}  {'min':>10}  {'median':>10}  {'max':>10}  (N={len(M)}){hdr}")
@@ -773,7 +1291,10 @@ def run_collection(n_rounds: int, restart: bool = False):
         print(f"\n=== Round 0  (initial_candidates: {len(A_init)} plans) ===")
         dest0 = os.path.join(OUTPUT_PATH, "round_0")
         write_actions_to_execution_plans(A_init, dest0, PROFILING_MACHINES)
-        pairs0 = asyncio.run(profiler.profile_actions(dest0))
+        # Dispatch + extract zips on workers; skip the buggy in-line parse.
+        asyncio.run(profiler.profile_actions(dest0, skip_parsing=True))
+        # Clean parse from on-disk raw stats.
+        pairs0 = load_round(profiler, 0)
         n_valid0 = sum(1 for p in pairs0 if p is not None)
         print(f"  Valid: {n_valid0}/{len(pairs0)}")
         existing.append(0)
@@ -794,10 +1315,11 @@ def run_collection(n_rounds: int, restart: bool = False):
     print(f"  After variance filter: {len(A0)} samples")
     report_metrics(M0, "round 0")
 
-    # ── Load any existing rounds 1+ ───────────────────────────────────────────
+    # ── Load any existing rounds 1+ (apply same filters as live runs) ─────────
     A, M, var = list(A0), M0, var0
     for r_idx in sorted(r for r in existing if r > 0):
         pairs = load_round(profiler, r_idx)
+        pairs, n_dropped, _ = filter_straggler_plans(pairs)
         A_r, M_r, var_r = pairs_to_AM(pairs, max_len=M.shape[1])
         if M_r is None:
             continue
@@ -806,6 +1328,10 @@ def run_collection(n_rounds: int, restart: bool = False):
         if pad > 0:
             M   = np.pad(M,   ((0,0),(0,pad)))
             var = np.pad(var, ((0,0),(0,pad)))
+        mins_new = np.min(np.vstack([M, M_r]), axis=0)
+        maxs_new = np.max(np.vstack([M, M_r]), axis=0)
+        A_r, M_r, var_r = filter_high_variance_data(
+            A_r, M_r, var_r, maxs_new - mins_new, threshold=0.1)
         A.extend(A_r)
         M   = np.vstack([M, M_r])
         var = np.vstack([var, var_r])
@@ -823,10 +1349,15 @@ def run_collection(n_rounds: int, restart: bool = False):
         dest = os.path.join(OUTPUT_PATH, f"round_{r}")
         write_actions_to_execution_plans(batch, dest, PROFILING_MACHINES)
 
-        pairs = asyncio.run(profiler.profile_actions(dest))
+        # Dispatch + extract zips on workers; skip the buggy in-line parse.
+        asyncio.run(profiler.profile_actions(dest, skip_parsing=True))
+        # Clean parse from on-disk raw stats.
+        pairs = load_round(profiler, r)
+        # Drop straggler plans (wall-clock > 1.5× expected slot budget)
+        pairs, n_dropped, max_seen = filter_straggler_plans(pairs)
         A_r, M_r, var_r = pairs_to_AM(pairs, max_len=M.shape[1])
         n_valid = 0 if M_r is None else len(A_r)
-        print(f"  Valid: {n_valid}/{len(pairs)}")
+        print(f"  Valid: {n_valid}/{len(pairs) + n_dropped}  (stragglers dropped: {n_dropped})")
 
         if M_r is None:
             print("  No valid results, skipping round")

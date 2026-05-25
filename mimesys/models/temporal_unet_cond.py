@@ -115,6 +115,117 @@ class ConcatContextEncoder(nn.Module):
         return self.head(x)
 
 
+class ConcatSymContextEncoder(nn.Module):
+    """Concat-v2: symmetric (sum_row + sum_col) action encoding, like the
+    Transformer encoder uses, then concat with metric and pass through MLP.
+    Permutation-invariant on threads & on stressors → much harder to overfit
+    on prev-action patterns that don't generalize at test time.
+    Expects action_dim = num_threads + num_stressors (e.g., 20 + 13 = 33)."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(cfg.action_dim + cfg.input_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']          # (B, input_dim)
+        action = context_cond['prev_action']     # (B, H, C)  H=stressors, C=threads
+        sum_row = action.sum(dim=1)              # (B, C)  per-thread total
+        sum_col = action.sum(dim=2)              # (B, H)  per-stressor total
+        action_sym = torch.cat([sum_row, sum_col], dim=1)  # (B, H+C=33)
+        x = torch.cat([action_sym, metric], dim=-1)
+        return self.head(x)
+
+
+class TransformerFullContextEncoder(nn.Module):
+    """Same architecture as TransformerContextEncoder, but feeds the FULL 260-D
+    flattened prev_action through the action projection instead of the 33-D
+    [sum_row, sum_col] aggregation. Direct apples-to-apples test of whether the
+    additional per-(thread, stressor) detail is useful.
+    Expects action_dim = num_stressors * num_threads (e.g., 13 * 20 = 260)."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.metric_encoder = nn.Linear(cfg.input_dim,  cfg.hidden_dim)
+        self.action_encoder = nn.Linear(cfg.action_dim, cfg.hidden_dim)
+        self.encoder = nn.Sequential(
+            nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=cfg.hidden_dim,
+                    nhead=cfg.num_heads,
+                    dim_feedforward=cfg.hidden_dim * 4,
+                    dropout=cfg.dropout,
+                    activation="gelu",
+                ),
+                num_layers=cfg.num_layers,
+            ),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, lam=0.1, sensitivity_drop_p=0.0):
+        metric = context_cond['metric']
+        action = context_cond['prev_action']     # (B, H=stressors, C=threads)
+        metric = metric * (torch.rand_like(metric) > sensitivity_drop_p)
+        metric_emb = self.metric_encoder(metric)
+
+        action_flat = action.flatten(1)          # (B, H*C = 260)
+        action_emb = self.action_encoder(action_flat)
+
+        x = (1 - lam) * metric_emb + lam * action_emb
+        x = nn.Mish()(x)
+        return self.encoder(x)
+
+
+class TransformerTokensContextEncoder(nn.Module):
+    """Real multi-token transformer encoder over per-thread tokens.
+
+    Tokenizes prev_action as 20 per-thread tokens (each = 13-D stressor vector),
+    projects each to hidden_dim, prepends a [METRIC] token (projected metric),
+    adds learnable positional embeddings, and runs a true self-attention stack.
+    The [METRIC] token output is taken as the context embedding. Unlike
+    ConcatTransformerContextEncoder, there's NO raw-concat skip — this is a
+    pure test of what the transformer's attention extracts from the 260-D
+    prev_action.
+    Expects action_dim = num_stressors * num_threads (e.g., 260)."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.n_stressors = int(cfg.get("n_stressors", 13))
+        self.n_threads   = int(cfg.get("n_threads",   20))
+        H = cfg.hidden_dim
+
+        self.thread_proj = nn.Linear(self.n_stressors, H)
+        self.metric_proj = nn.Linear(cfg.input_dim,    H)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_threads + 1, H))
+        nn.init.normal_(self.pos_embed, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=H, nhead=cfg.num_heads,
+            dim_feedforward=H * 4, dropout=cfg.dropout,
+            activation="gelu", batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.num_layers)
+        self.head = nn.Linear(H, cfg.context_dim)
+
+    def forward(self, context_cond, lam=0.1, sensitivity_drop_p=0.0):
+        metric = context_cond['metric']                   # (B, input_dim)
+        action = context_cond['prev_action']              # (B, C=n_stressors, H=n_threads)
+        metric = metric * (torch.rand_like(metric) > sensitivity_drop_p)
+
+        thread_input = action.transpose(1, 2)             # (B, H=n_threads, C=n_stressors)
+        thread_tok = self.thread_proj(thread_input)       # (B, H, hidden_dim)
+        metric_tok = self.metric_proj(metric).unsqueeze(1)  # (B, 1, hidden_dim)
+        x = torch.cat([metric_tok, thread_tok], dim=1)    # (B, H+1, hidden_dim)
+        x = x + self.pos_embed
+        x = self.encoder(x)                               # (B, H+1, hidden_dim)
+        pooled = x[:, 0]                                  # [METRIC] token output
+        return self.head(pooled)
+
+
 class FiLMContextEncoder(nn.Module):
     """FiLM: metrics produce scale+shift to condition full 260-dim action embedding."""
     def __init__(self, cfg: DictConfig):
@@ -137,6 +248,105 @@ class FiLMContextEncoder(nn.Module):
         fused = ea * (1 + gamma) + beta                 # (B, hidden_dim)
 
         return self.head(F.mish(fused))                 # (B, context_dim)
+
+
+class AdditionContextEncoder(nn.Module):
+    """Addition: project action and metric to same hidden dim, sum, MLP head."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.metric_proj = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+        self.action_proj = nn.Linear(cfg.action_dim, cfg.hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']
+        action = context_cond['prev_action'].flatten(1)
+        em = self.metric_proj(metric)
+        ea = self.action_proj(action)
+        return self.head(F.mish(em + ea))
+
+
+class GatedContextEncoder(nn.Module):
+    """Gated addition: metric produces a sigmoid gate over the action embedding."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.metric_proj = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+        self.action_proj = nn.Linear(cfg.action_dim, cfg.hidden_dim)
+        self.gate_fc     = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']
+        action = context_cond['prev_action'].flatten(1)
+        em = self.metric_proj(metric)
+        ea = self.action_proj(action)
+        gate = torch.sigmoid(self.gate_fc(metric))
+        return self.head(F.mish(em + gate * ea))
+
+
+class ConcatTransformerContextEncoder(nn.Module):
+    """Per-thread transformer + raw concat skip → MLP head.
+
+    Transformer attends over (H+1) tokens: one [METRIC] token plus one token
+    per thread (C-dim stressor vector projected to hidden_dim). The pooled
+    [METRIC] output is concatenated with the raw flat action + raw metric and
+    projected to context_dim. The raw-skip path preserves the strong direct
+    signal that made ConcatContextEncoder the v6 winner, while the transformer
+    branch contributes inter-thread structure on top.
+    """
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.n_stressors = int(cfg.get("n_stressors", 13))
+        self.n_threads   = int(cfg.get("n_threads",   20))
+        H = cfg.hidden_dim
+
+        self.thread_proj = nn.Linear(self.n_stressors, H)
+        self.metric_proj = nn.Linear(cfg.input_dim, H)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_threads + 1, H))
+        nn.init.normal_(self.pos_embed, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=H, nhead=cfg.num_heads,
+            dim_feedforward=H * 4, dropout=cfg.dropout,
+            activation="gelu", batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.num_layers)
+
+        head_in = H + cfg.action_dim + cfg.input_dim
+        self.head = nn.Sequential(
+            nn.Linear(head_in, H),
+            nn.Mish(),
+            nn.Linear(H, H),
+            nn.Mish(),
+            nn.Linear(H, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, lam=0.1, sensitivity_drop_p=0.0):
+        metric = context_cond['metric']           # (B, input_dim)
+        action = context_cond['prev_action']      # (B, C=n_stressors, H=n_threads)
+        if sensitivity_drop_p > 0:
+            metric = metric * (torch.rand_like(metric) > sensitivity_drop_p)
+
+        thread_input = action.transpose(1, 2)             # (B, H, C)
+        thread_tok = self.thread_proj(thread_input)       # (B, H, hidden_dim)
+        metric_tok = self.metric_proj(metric).unsqueeze(1)
+        x = torch.cat([metric_tok, thread_tok], dim=1)    # (B, H+1, hidden_dim)
+        x = x + self.pos_embed
+        x = self.encoder(x)                               # (B, H+1, hidden_dim)
+        pooled = x[:, 0]                                  # [METRIC] token output
+
+        flat_action = action.flatten(1)                   # (B, C*H)
+        skip = torch.cat([pooled, flat_action, metric], dim=-1)
+        return self.head(skip)
 
 
 class ActionAutoencoder(nn.Module):
@@ -390,6 +600,18 @@ class TemporalUnetCond(nn.Module):
             self.context_encoding = FiLMContextEncoder(context_args)
         elif _encoder_type == 'concat':
             self.context_encoding = ConcatContextEncoder(context_args)
+        elif _encoder_type == 'concat_sym':
+            self.context_encoding = ConcatSymContextEncoder(context_args)
+        elif _encoder_type == 'addition':
+            self.context_encoding = AdditionContextEncoder(context_args)
+        elif _encoder_type == 'gated':
+            self.context_encoding = GatedContextEncoder(context_args)
+        elif _encoder_type == 'concat_transformer':
+            self.context_encoding = ConcatTransformerContextEncoder(context_args)
+        elif _encoder_type == 'transformer_full':
+            self.context_encoding = TransformerFullContextEncoder(context_args)
+        elif _encoder_type == 'transformer_tokens':
+            self.context_encoding = TransformerTokensContextEncoder(context_args)
         else:  # 'transformer' (default, existing behaviour)
             self.context_encoding = TransformerContextEncoder(context_args)
 

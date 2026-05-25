@@ -136,20 +136,56 @@ class MimesysTrainer(pl.LightningModule):
         is_training_data = batch["training_data"]
 
         prev_states = -torch.ones_like(x0).cuda()
-        chains, _ = self.trainer_model.p_sample_loop_with_logprobs(
-            x0.shape, {"metric": prev_trace, "prev_action": prev_states}
-        )
-        prev_states = chains[-1]
+        prev_medoid_n = int(self.cfg.train.ddpo.get("prev_medoid_n", 1))
+        if prev_medoid_n > 1:
+            # Sample K candidates per row in a single inflated-batch diffusion call,
+            # then pick the per-row medoid (sample minimising sum-of-L1 to others).
+            # This reduces per-step prev-state variance vs single-sample inference.
+            K = prev_medoid_n
+            prev_trace_K   = prev_trace.repeat_interleave(K, dim=0).cuda()    # (K*N, dim)
+            prev_states_K  = prev_states.repeat_interleave(K, dim=0)           # (K*N, S, T)
+            shape_K        = (K * N,) + tuple(x0.shape[1:])
+            with torch.no_grad():
+                chains_K, _ = self.trainer_model.p_sample_loop_with_logprobs(
+                    shape_K, {"metric": prev_trace_K, "prev_action": prev_states_K}
+                )
+            final = chains_K[-1].view(N, K, *x0.shape[1:])     # (N, K, S, T)
+            final_np = final.detach().cpu().numpy()
+            S = x0.shape[1]; Tth = x0.shape[2]
+            import numpy as _np
+            medoid_out = _np.empty((N, S, Tth), dtype=_np.float32)
+            for _i in range(N):
+                F = final_np[_i].reshape(K, -1)
+                sd = _np.array([float(_np.abs(F - F[k:k+1]).mean(axis=1).sum())
+                                for k in range(K)])
+                medoid_out[_i] = final_np[_i, int(_np.argmin(sd))]
+            prev_states = torch.tensor(medoid_out, dtype=x0.dtype,
+                                       device=x0.device).cuda()
+        else:
+            chains, _ = self.trainer_model.p_sample_loop_with_logprobs(
+                x0.shape, {"metric": prev_trace, "prev_action": prev_states}
+            )
+            prev_states = chains[-1]
         for idx in range(N):
             if is_training_data[idx]:
                 prev_states[idx] = prev_labels[idx]
 
         trace = (trace + torch.randn_like(trace) * 1e-4).cuda()
 
+        best_of_n = int(self.cfg.train.ddpo.get("best_of_n", 1))
+        all_chains = []
+        all_log_probs = []
         with torch.no_grad():
-            chains, log_probs = self.trainer_model.p_sample_loop_with_logprobs(
-                x0.shape, {"metric": trace, "prev_action": prev_states}
-            )
+            for _k in range(best_of_n):
+                chains_k, log_probs_k = self.trainer_model.p_sample_loop_with_logprobs(
+                    x0.shape, {"metric": trace, "prev_action": prev_states}
+                )
+                all_chains.append(chains_k)
+                all_log_probs.append(log_probs_k)
+        # Default-path tensors (matching the K=1 case) reference the first sample;
+        # we overwrite chains/log_probs after profiling selects per-sample winners.
+        chains = all_chains[0]
+        log_probs = all_log_probs[0]
         predicted_labels = chains[-1].cpu().detach().numpy()
         predicted_actions_tensor = (
             torch.tensor(predicted_labels).float().cuda().view(N, -1)
@@ -164,29 +200,38 @@ class MimesysTrainer(pl.LightningModule):
 
         elif reward_type == "profiling":
             checkpoint_dir = self.cfg.train.callbacks.checkpoint.dirpath
-            for sample_idx, (prev_state, action) in enumerate(zip(prev_states, predicted_labels)):
-                print("Saving results for sample", sample_idx)
-                dirname = os.path.join(
-                    checkpoint_dir, exp_path,
-                    f"step_{self.global_step}_batch_{sample_idx}",
-                )
-                os.makedirs(dirname, exist_ok=True)
-                self.write_system_traces_to_file(dirname, batch["clean_trace"][sample_idx])
-                write_fleetbench_actions_to_h5_file(
-                    [prev_state, action],
-                    os.path.join(dirname, "predicted_actions_trainer_0.h5"),
-                )
+            # Write N * best_of_n batch dirs: dir index = sample_idx * best_of_n + k
+            for sample_idx, prev_state in enumerate(prev_states):
+                for k in range(best_of_n):
+                    action_k = all_chains[k][-1][sample_idx].cpu().detach().numpy()
+                    dir_idx = sample_idx * best_of_n + k
+                    dirname = os.path.join(
+                        checkpoint_dir, exp_path,
+                        f"step_{self.global_step}_batch_{dir_idx}",
+                    )
+                    os.makedirs(dirname, exist_ok=True)
+                    if k == 0:
+                        # target metric is shared across k; write only once equivalently
+                        self.write_system_traces_to_file(dirname, batch["clean_trace"][sample_idx])
+                    else:
+                        self.write_system_traces_to_file(dirname, batch["clean_trace"][sample_idx])
+                    write_fleetbench_actions_to_h5_file(
+                        [prev_state, action_k],
+                        os.path.join(dirname, "predicted_actions_trainer_0.h5"),
+                    )
 
             profile_request = ProfileRequest(
                 validation_data_path=f"{checkpoint_dir}/{exp_path}",
                 my_destination_path=self.cfg.profiler.destination_path,
                 step=self.global_step,
-                num_batches=N,
+                num_batches=N * best_of_n,
                 num_trials=1,
                 logger=self.trainer.logger,
                 model_type="trainer",
                 io_reward_weight=self.cfg.train.ddpo.get("io_reward_weight", 1.0),
                 low_resource_penalty_weight=self.cfg.train.ddpo.get("low_resource_penalty_weight", 0.0),
+                membw_reward_weight=self.cfg.train.ddpo.get("membw_reward_weight", 1.0),
+                llc_reward_weight=self.cfg.train.ddpo.get("llc_reward_weight", 1.0),
             )
             print("Profile request:", profile_request)
             _, avg_emd_by_batch, metrics_std_by_batch = asyncio.run(
@@ -196,14 +241,57 @@ class MimesysTrainer(pl.LightningModule):
                 )
             )
 
-            emd_error = torch.tensor(avg_emd_by_batch, dtype=torch.float32)
-            metrics_std = torch.tensor(metrics_std_by_batch, dtype=torch.float32)
-            rewards = -emd_error - metrics_std * 0.05
+            emd_error_flat = torch.tensor(avg_emd_by_batch, dtype=torch.float32)
+            metrics_std_flat = torch.tensor(metrics_std_by_batch, dtype=torch.float32)
+            rewards_flat = -emd_error_flat - metrics_std_flat * 0.05
+
+            # NaN-defense: a single NaN reward poisons mean/std in compute_advantage,
+            # making *all* future advantages NaN forever. NaN appears when the
+            # profiler's _parse_local_stats divides by len(normalized_metrics)=0
+            # (plan crashed mid-profile, no samples in the second-slot filter).
+            # Replace NaN/Inf with a "bad-but-not-poisoning" reward of -2.0, and
+            # clip extremes to keep advantage normalization stable.
+            if torch.isnan(rewards_flat).any() or torch.isinf(rewards_flat).any():
+                n_nan = int(torch.isnan(rewards_flat).sum() + torch.isinf(rewards_flat).sum())
+                rewards_flat = torch.nan_to_num(rewards_flat, nan=-2.0, posinf=2.0, neginf=-2.0)
+                print(f"[reward-nan-defense] replaced {n_nan} NaN/Inf rewards with -2.0")
+            rewards_flat = torch.clamp(rewards_flat, -2.0, 2.0)
+
+            if best_of_n > 1:
+                # Pad / truncate rewards_flat to expected size (N*best_of_n).
+                # Workers occasionally drop a profile (timeout/scp fail) which would
+                # leave fewer entries than expected; pad missing entries with the
+                # mean so the reshape works and the "missing" k is unlikely to win.
+                expected = N * best_of_n
+                if rewards_flat.numel() < expected:
+                    pad_val = rewards_flat.mean().item() if rewards_flat.numel() > 0 else 0.0
+                    pad = torch.full((expected - rewards_flat.numel(),), pad_val,
+                                     dtype=rewards_flat.dtype)
+                    rewards_flat = torch.cat([rewards_flat, pad])
+                    print(f"[best_of_n] padded {pad.numel()} missing rewards with mean={pad_val:.4f}")
+                elif rewards_flat.numel() > expected:
+                    rewards_flat = rewards_flat[:expected]
+                # Reshape (N*K,) -> (N, K), pick best k per sample
+                rewards_mat = rewards_flat.view(N, best_of_n)
+                best_k = rewards_mat.argmax(dim=1)
+                rewards = rewards_mat.gather(1, best_k.unsqueeze(1)).squeeze(1)
+                # Pick chains/log_probs for the winning k per sample
+                chains_picked_list = []
+                log_probs_picked_list = []
+                for i in range(N):
+                    ki = int(best_k[i].item())
+                    chains_picked_list.append(all_chains[ki][:, i, :, :])    # (T_diff+1, S, T_threads)
+                    log_probs_picked_list.append(all_log_probs[ki][:, i])     # (T_diff+1,)
+                chains = torch.stack(chains_picked_list, dim=1)               # (T_diff+1, N, S, T_threads)
+                log_probs = torch.stack(log_probs_picked_list, dim=1)         # (T_diff+1, N)
+            else:
+                rewards = rewards_flat
 
             chains = torch.flip(chains, dims=[0])
             log_probs = torch.flip(log_probs, dims=[0])
             chains_batched = chains.permute(1, 0, 2, 3)
             log_probs_batched = log_probs.permute(1, 0)
+            rl_aug = int(self.cfg.train.ddpo.get("rl_aug_factor", 1))
             for i in range(N):
                 trajectory = chains_batched[i]
                 log_prob = log_probs_batched[i]
@@ -222,25 +310,80 @@ class MimesysTrainer(pl.LightningModule):
                         final_state=trajectory[0],
                     )
 
+                # Augmentation (rl_aug-1 extra copies). Always intra-socket perm; if
+                # socket_swap_aug=True, half of the copies also swap socket 0<->1.
+                # Threads 0-9 belong to socket 0, 10-19 to socket 1. LLC and BW
+                # metrics are now socket-aggregated (single fields each), so no
+                # per-socket metric swap is needed under socket swap.
+                socket_swap_aug = bool(self.cfg.train.ddpo.get("socket_swap_aug", False))
+                for aug_idx in range(rl_aug - 1):
+                    do_socket_swap = socket_swap_aug and (aug_idx % 2 == 1)
+                    if do_socket_swap:
+                        # Within each socket intra-perm, then place socket-1 threads at
+                        # positions 0..9 and socket-0 threads at 10..19.
+                        p_s1 = torch.randperm(10, device=trajectory.device) + 10
+                        p_s0 = torch.randperm(10, device=trajectory.device)
+                        thread_perm = torch.cat([p_s1, p_s0])
+                    else:
+                        p0 = torch.randperm(10, device=trajectory.device)
+                        p1 = torch.randperm(10, device=trajectory.device) + 10
+                        thread_perm = torch.cat([p0, p1])
+
+                    # action / trajectory shape (T_diff+1, S=13, T_threads=20) -> permute last axis
+                    new_trajectory = trajectory.index_select(-1, thread_perm)
+
+                    # context / prev_trace flat shape (23,): positions 0-19 are CPU cores,
+                    # [20]=io, [21]=l3_cache_usage, [22]=memory_bandwidth (all aggregated).
+                    new_context = context.clone()
+                    new_context[:20] = context[thread_perm]
+                    new_prev_trace = prev_trace_i.clone()
+                    new_prev_trace[:20] = prev_trace_i[thread_perm]
+
+                    for t in range(1, T):
+                        self.replay_buffer.add_to_buffer(
+                            state=(new_trajectory[t + 1], torch.tensor(t),
+                                   new_context, new_prev_trace),
+                            action=new_trajectory[t],
+                            reward=reward,
+                            log_probs=log_prob[t],
+                            final_state=new_trajectory[0],
+                        )
+
         return rewards
 
     def compute_advantage(self):
         T = self.trainer_model.n_timesteps
+        if not self.replay_buffer.rewards:
+            # Whole profiling round returned no stats (e.g., chunk parse failures,
+            # ssh hiccups, or every plan landed in an empty chunk). Skip this epoch's
+            # advantage computation instead of crashing torch.stack([]).
+            print("[compute_advantage] replay_buffer empty — skipping (no profile data for this step)")
+            return
         rewards_dedup = torch.tensor(
             self.replay_buffer.rewards[::T], dtype=torch.float32
         )
+        # Defense: if any pre-poisoned NaN slipped past the reward filter, scrub here.
+        rewards_dedup = torch.nan_to_num(rewards_dedup, nan=-2.0, posinf=2.0, neginf=-2.0)
         self.advantage_deque.extend(rewards_dedup)
 
         if len(self.advantage_deque) < self.min_count:
             mean = rewards_dedup.mean()
             std = rewards_dedup.std() + 1e-6
         else:
-            mean = torch.tensor(np.mean(self.advantage_deque)).float()
-            std = torch.tensor(np.std(self.advantage_deque)).float() + 1e-6
+            deque_arr = np.asarray(self.advantage_deque, dtype=np.float64)
+            deque_arr = deque_arr[np.isfinite(deque_arr)]
+            mean = torch.tensor(float(np.mean(deque_arr)) if deque_arr.size else 0.0).float()
+            std = torch.tensor(float(np.std(deque_arr)) if deque_arr.size else 1.0).float() + 1e-6
 
         rewards = torch.stack(self.replay_buffer.rewards).float()
+        rewards = torch.nan_to_num(rewards, nan=-2.0, posinf=2.0, neginf=-2.0)
         advantages = (rewards - mean) / std if len(rewards_dedup) > 1 else rewards - mean
         clipped = torch.clip(advantages, -3.0, 3.0)
+        # Belt-and-suspenders: should be impossible to reach here with NaN, but
+        # if std is somehow NaN, fall back to centered-only.
+        if not torch.isfinite(clipped).all():
+            clipped = torch.nan_to_num(clipped, nan=0.0, posinf=3.0, neginf=-3.0)
+            print(f"[advantage-nan-defense] clipped NaN/Inf to 0")
         print("Advantage:", clipped)
         self.replay_buffer.set_advantages(clipped)
 
@@ -487,8 +630,14 @@ def train(cfg: DictConfig):
         intra_only_aug=cfg.data.get("intra_only_aug", False),
         high_io_aug_factor=cfg.data.get("high_io_aug_factor", 1),
         io_raw_threshold=cfg.data.get("io_raw_threshold", 1000.0),
+        cpu_avg_threshold=cfg.data.get("cpu_avg_threshold", 50.0),
+        llc_max_threshold=cfg.data.get("llc_max_threshold", 100.0),
+        bw_max_threshold=cfg.data.get("bw_max_threshold", 5.0),
         rl_train_ratio=cfg.data.get("rl_train_ratio", 0.333),
-        rl_high_io_fraction=cfg.data.get("rl_high_io_fraction", 0.5),
+        rl_high_io_fraction=cfg.data.get("rl_high_io_fraction", 0.20),
+        rl_high_cpu_fraction=cfg.data.get("rl_high_cpu_fraction", 0.20),
+        rl_high_llc_fraction=cfg.data.get("rl_high_llc_fraction", 0.20),
+        rl_high_bw_fraction=cfg.data.get("rl_high_bw_fraction", 0.20),
     )
 
     cfg.data.trace_range = {

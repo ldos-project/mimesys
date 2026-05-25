@@ -23,7 +23,7 @@ context:
     context_dim: 256
 
 clip:
-    modality1_input_dim: 25
+    modality1_input_dim: 23
     modality2_input_dim: 23
     modality1: transformer
     modality2: transformer

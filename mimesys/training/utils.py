@@ -167,6 +167,7 @@ def initialize_callbacks(cfg: DictConfig) -> list:
         save_top_k=cfg.checkpoint.save_top_k,
         every_n_epochs=cfg.checkpoint.every_n_epochs,
         save_last=cfg.checkpoint.get("save_last", False),
+        save_on_train_epoch_end=cfg.checkpoint.get("save_on_train_epoch_end", None),
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
     return [checkpoint_callback, lr_monitor]

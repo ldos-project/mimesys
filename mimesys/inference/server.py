@@ -95,7 +95,7 @@ class GenerateRequest(BaseModel):
             "Values in raw physical units (%, KB/s, MB, GB/s). See GET /metrics."
         ),
         examples=[{"avg_cpu_utilizations_core_00": 72.5, "io": 3200.0,
-                   "l3_cache_usage_socket_0": 8500.0, "memory_bandwidth_socket_0": 12.3}],
+                   "l3_cache_usage": 8500.0, "memory_bandwidth": 12.3}],
     )
     method: METHOD_CHOICES = Field(
         "diffusion",

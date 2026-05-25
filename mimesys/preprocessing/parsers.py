@@ -518,11 +518,16 @@ def process_trace_granular(
             continue
         read_kb_sum, write_kb_sum = calculate_io_utilization_from_list(trace["block"])
 
+        # Aggregate across sockets — per-socket attribution is unreliable on
+        # dual-socket cache-resident workloads (CHA winner-takes-most artifact).
+        memory_bandwidth_total = sum(memory_bandwidths)
+        l3_cache_usage_total   = sum(l3_cache_usages)
+
         if prev["timestamp"] == 0:
             prev.update({
                 "timestamp": timestamp,
-                **{f"memory_bandwidth_socket_{i}": bw for i, bw in enumerate(memory_bandwidths)},
-                **{f"l3_cache_usage_socket_{i}": lu for i, lu in enumerate(l3_cache_usages)},
+                "memory_bandwidth": memory_bandwidth_total,
+                "l3_cache_usage":   l3_cache_usage_total,
                 "qpi_usage": qpi_usage,
                 "pcie_usage": pcie_usage,
                 "cpu_utilization": cpu_utilization,
@@ -535,14 +540,12 @@ def process_trace_granular(
         if period is not None and delta_time <= period - epsilon:
             continue
 
-        for socket_id, memory_bandwidth in enumerate(memory_bandwidths):
-            bandwidth_diff = (memory_bandwidth - prev[f"memory_bandwidth_socket_{socket_id}"]) / 1e9
-            metrics[f"memory_bandwidth_socket_{socket_id}"].append(
-                bandwidth_diff / delta_time / float(system_spec["Memory BW"]) * 100
-            )
-        for socket_id, l3_cache_usage in enumerate(l3_cache_usages):
-            l3_cache_diff = (l3_cache_usage - prev[f"l3_cache_usage_socket_{socket_id}"]) / 1e6
-            metrics[f"l3_cache_usage_socket_{socket_id}"].append(l3_cache_diff / delta_time)
+        bandwidth_diff = (memory_bandwidth_total - prev["memory_bandwidth"]) / 1e9
+        metrics["memory_bandwidth"].append(
+            bandwidth_diff / delta_time / float(system_spec["Memory BW"]) * 100
+        )
+        l3_cache_diff = (l3_cache_usage_total - prev["l3_cache_usage"]) / 1e6
+        metrics["l3_cache_usage"].append(l3_cache_diff / delta_time)
 
         cpu_util_per_core = average_cpu_utilization(prev["cpu_utilization"], cpu_utilization)
         for cpu_id, util in enumerate(cpu_util_per_core):
@@ -554,8 +557,8 @@ def process_trace_granular(
 
         prev.update({
             "timestamp": timestamp,
-            **{f"memory_bandwidth_socket_{i}": bw for i, bw in enumerate(memory_bandwidths)},
-            **{f"l3_cache_usage_socket_{i}": lu for i, lu in enumerate(l3_cache_usages)},
+            "memory_bandwidth": memory_bandwidth_total,
+            "l3_cache_usage":   l3_cache_usage_total,
             "qpi_usage": qpi_usage,
             "pcie_usage": pcie_usage,
             "cpu_utilization": cpu_utilization,

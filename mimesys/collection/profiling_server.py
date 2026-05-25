@@ -39,6 +39,8 @@ class ProfileRequest(BaseModel):
     logger: Optional[Logger] = None
     model_type: str = "ema"
     low_resource_penalty_weight: float = 0.0  # blend in relative L1 to penalize low-target errors more
+    membw_reward_weight: float = 1.0  # multiplier on memory_bandwidth L1 reward term (socket-aggregated)
+    llc_reward_weight: float = 1.0    # multiplier on l3_cache_usage L1 reward term (socket-aggregated)
 
     class Config:
         arbitrary_types_allowed = True
@@ -158,17 +160,32 @@ class Profiler:
 
         print(f"File {file_path} transferred to {machine.hostname}")
 
+        # Count plans we just uploaded so the remote can verify extraction matches.
+        expected_plan_count = sum(1 for _ in os.listdir(plan_path) if _.endswith(".h5"))
+
         # Run the command on the remote machine
-        print(f"Start running command on {machine.hostname} with {os.path.basename(file_path)}")
-        # Unzip the file and remove the zip file
-        command=f"cd {remote_execution_plan_path} && rm *.h5 2>/dev/null || true && unzip -o {os.path.basename(file_path)} && rm {os.path.basename(file_path)}"
+        print(f"Start running command on {machine.hostname} with {os.path.basename(file_path)} ({expected_plan_count} plans)")
+        # Unzip the file and remove the zip file. Then verify extraction count matches.
+        # Without the count check, a partial unzip + background script start can race so
+        # the script sees only a handful of plans, silently runs them, and ships back
+        # whatever stale stats files happen to be in ~/results from a previous run.
+        command = (
+            f"cd {remote_execution_plan_path} && "
+            f"rm -f *.h5 && "
+            f"unzip -o {os.path.basename(file_path)} && "
+            f"rm -f {os.path.basename(file_path)} && "
+            f"actual=$(ls plan_*.h5 2>/dev/null | wc -l) && "
+            f'if [ "$actual" -ne {expected_plan_count} ]; then '
+            f'echo "PLAN_COUNT_MISMATCH expected={expected_plan_count} actual=$actual" >&2; exit 9; '
+            f'fi'
+        )
         machine.run_command(
             client=client,
             command=command,
         )
 
         print("Start collection command")
-        mimesys_iters = os.environ.get("MIMESYS_ITERS", "1")
+        mimesys_iters = os.environ.get("MIMESYS_ITERS", "3")
         machine.run_command_background(
             client=client,
             command=f"cd /users/{self.user_name} && MIMESYS_ITERS={mimesys_iters} bash collect_mimesys_metrics.sh {self.user_name} {self.my_hostname} {destination_path} {host_idx} > collect_mimesys_metrics.log 2>&1"
@@ -349,7 +366,19 @@ class Profiler:
                     med_metrics_list = [value for metrics in med_metrics.values() for value in metrics.values()]
                     std_metrics_list = [value for metrics in std_metrics.values() for value in metrics.values()]
 
-                    plan_stat_pairs.append((actions, avg_metrics_list, med_metrics_list, std_metrics_list))
+                    # Per-plan wall-clock = first → last snapshot timestamp.
+                    # Used downstream to filter out straggler plans whose total
+                    # runtime exceeded the slot budget by some factor.
+                    try:
+                        ts_first = float(parsed_traces[0]["timestamp"][0].split()[0])
+                        ts_last  = float(parsed_traces[-1]["timestamp"][0].split()[0])
+                        wall_s   = max(0.0, ts_last - ts_first)
+                    except Exception:
+                        wall_s = float("nan")
+
+                    plan_stat_pairs.append(
+                        (actions, avg_metrics_list, med_metrics_list, std_metrics_list, wall_s)
+                    )
 
             return plan_stat_pairs
 
@@ -421,6 +450,11 @@ class Profiler:
                         continue
 
                     metrics_weight = [1.0] * len(profiled_metrics)
+                    for _wi, _name in enumerate(profiled_metrics.keys()):
+                        if _name == "memory_bandwidth":
+                            metrics_weight[_wi] = req.membw_reward_weight
+                        elif _name == "l3_cache_usage":
+                            metrics_weight[_wi] = req.llc_reward_weight
 
                     for metric_idx, (target_metric, metrics) in enumerate(profiled_metrics.items()):
                         if target_metric in ground_truth:

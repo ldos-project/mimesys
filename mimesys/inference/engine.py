@@ -17,7 +17,7 @@ Usage
     )
 
     pred = engine.generate_step(
-        trace_raw={"io": 3000, "l3_cache_usage_socket_0": 9000},
+        trace_raw={"io": 3000, "l3_cache_usage": 9000},
         method="diffusion",
     )
 """
@@ -42,19 +42,15 @@ ACTION_THREADS:   int = 20
 METRIC_KEYS: list[str] = [
     *[f"avg_cpu_utilizations_core_{i:02d}" for i in range(20)],
     "io",
-    "l3_cache_usage_socket_0",
-    "l3_cache_usage_socket_1",
-    "memory_bandwidth_socket_0",
-    "memory_bandwidth_socket_1",
+    "l3_cache_usage",     # socket-aggregated
+    "memory_bandwidth",   # socket-aggregated
 ]
 
 METRIC_UNITS: dict[str, str] = {
     **{f"avg_cpu_utilizations_core_{i:02d}": "%" for i in range(20)},
-    "io":                        "KB/s",
-    "l3_cache_usage_socket_0":   "MB",
-    "l3_cache_usage_socket_1":   "MB",
-    "memory_bandwidth_socket_0": "GB/s",
-    "memory_bandwidth_socket_1": "GB/s",
+    "io":               "KB/s",
+    "l3_cache_usage":   "MB",
+    "memory_bandwidth": "GB/s",
 }
 
 STRESSOR_NAMES: list[str] = [

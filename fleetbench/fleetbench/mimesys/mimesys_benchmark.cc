@@ -24,8 +24,16 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <fcntl.h>
+#include "absl/crc/crc32c.h"
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <numaif.h>
+#include <sched.h>
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <cstdlib>
@@ -359,6 +367,549 @@ std::vector<int> ToExecutionOrder(std::vector<int> num_iters) {
   return order;
 }
 
+// ── Direct-invoke kernels (skip GoogleBenchmark RunSpecifiedBenchmarks) ─────
+//
+// For a few hot CRC32 workloads, replace the framework round-trip with a
+// direct tight loop calling absl::ExtendCrc32c / absl::ComputeCrc32c until the
+// per-slot deadline expires. Buffer + str_lengths are built once per thread,
+// reused across slot invocations.
+namespace direct_kernels {
+
+struct CrcCtx {
+  std::string buffer;
+  absl::string_view sv;
+  std::vector<int> str_lengths;
+  bool init_done = false;
+};
+
+static thread_local CrcCtx g_ctx;
+
+static void InitCrcCtx() {
+  if (g_ctx.init_done) return;
+  // 64 MB buffer comfortably exceeds L3 on c220g5 (2*~25 MB).
+  g_ctx.buffer.assign(64ull * 1024 * 1024, 'x');
+  g_ctx.sv = absl::string_view(g_ctx.buffer);
+  // Representative size distribution (bytes per call).
+  static const int sizes[] = {16, 32, 64, 128, 256, 512, 1024, 2048};
+  g_ctx.str_lengths.reserve(1000);
+  for (int i = 0; i < 1000; ++i) {
+    g_ctx.str_lengths.push_back(sizes[i % 8]);
+  }
+  g_ctx.init_done = true;
+}
+
+static void DirectExtendCrc32c(long deadline_us) {
+  InitCrcCtx();
+  auto& ctx = g_ctx;
+  absl::crc32c_t v0{0};
+  size_t start = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        now - loop_start).count();
+    if (elapsed_us >= deadline_us) break;
+    for (auto l : ctx.str_lengths) {
+      if (start + l >= ctx.sv.length()) start = 0;
+      absl::string_view buf = ctx.sv.substr(start, l);
+      start += l + 4096;
+      v0 = absl::ExtendCrc32c(v0, buf);
+      benchmark::DoNotOptimize(v0);
+    }
+  }
+}
+
+static void DirectComputeCrc32c(long deadline_us) {
+  InitCrcCtx();
+  auto& ctx = g_ctx;
+  size_t start = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        now - loop_start).count();
+    if (elapsed_us >= deadline_us) break;
+    for (auto l : ctx.str_lengths) {
+      if (start + l >= ctx.sv.length()) start = 0;
+      absl::string_view buf = ctx.sv.substr(start, l);
+      start += l + 4096;
+      auto res = absl::ComputeCrc32c(buf);
+      benchmark::DoNotOptimize(res);
+    }
+  }
+}
+
+struct MemcpyCtx {
+  char* src = nullptr;
+  char* dst = nullptr;
+  size_t bufsize = 0;
+  bool init = false;
+};
+static thread_local MemcpyCtx mem_ctx;
+
+static void DirectMemcpy(long deadline_us) {
+  if (!mem_ctx.init) {
+    mem_ctx.bufsize = 32 * 1024;  // L1d size on c220g5
+    if (posix_memalign(reinterpret_cast<void**>(&mem_ctx.src), 512, mem_ctx.bufsize) != 0
+        || posix_memalign(reinterpret_cast<void**>(&mem_ctx.dst), 512, mem_ctx.bufsize) != 0) {
+      return;  // alloc failed
+    }
+    std::memset(mem_ctx.src, 0xAB, mem_ctx.bufsize);
+    std::memset(mem_ctx.dst, 0x00, mem_ctx.bufsize);
+    mem_ctx.init = true;
+  }
+  // Distribution of copy sizes (roughly matches Fleet small-string memcpy).
+  static constexpr int kSizes[] = {16, 32, 64, 128, 256, 512, 1024, 2048};
+  size_t src_off = 0, dst_off = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    for (int len : kSizes) {
+      if (src_off + len > mem_ctx.bufsize) src_off = 0;
+      if (dst_off + len > mem_ctx.bufsize) dst_off = 0;
+      auto* r = std::memcpy(mem_ctx.dst + dst_off, mem_ctx.src + src_off, len);
+      benchmark::DoNotOptimize(r);
+      src_off += len;
+      dst_off += len;
+    }
+  }
+}
+
+// Bind a freshly-allocated (still-unmapped) buffer to the local NUMA node of
+// the calling thread. Must be called BEFORE first-touch (i.e., before any
+// memset/memcpy into the buffer) so the physical pages are placed on the
+// local node. c220g5: cores 0..9 → node 0, cores 10..19 → node 1.
+static void BindToLocalNumaNode(void* addr, size_t len) {
+  int cpu = sched_getcpu();
+  int node = (cpu >= 10) ? 1 : 0;
+  unsigned long mask = 1UL << node;
+  // maxnode must be > largest valid node ID; mbind expects it as bits + 1.
+  // We use 64 (size in bits of one unsigned long) which covers up to node 63.
+  long rc = mbind(addr, len, MPOL_BIND, &mask, 8 * sizeof(mask), 0);
+  (void)rc;  // best-effort; if mbind unavailable we silently fall back
+}
+
+// LLC-resident memory kernels: ~12 MB buffers per thread (~LLC/2 on c220g5).
+// At single-thread, this fits in LLC and stays cache-resident; multi-thread
+// aggregate working sets exceed LLC and start spilling to DRAM, producing
+// the high-LLC + moderate-BW signatures observed in test workloads.
+struct MemLlcCtx {
+  char* a = nullptr;
+  char* b = nullptr;
+  size_t bufsize = 0;
+  bool init = false;
+};
+static thread_local MemLlcCtx llc_mem_ctx;
+
+static void EnsureLlcMemCtx() {
+  if (llc_mem_ctx.init) return;
+  llc_mem_ctx.bufsize = 12ull * 1024 * 1024;  // ~half LLC on c220g5 (24 MB total)
+  if (posix_memalign(reinterpret_cast<void**>(&llc_mem_ctx.a), 4096, llc_mem_ctx.bufsize) != 0
+      || posix_memalign(reinterpret_cast<void**>(&llc_mem_ctx.b), 4096, llc_mem_ctx.bufsize) != 0) {
+    return;  // alloc failed
+  }
+  // Bind to local NUMA node BEFORE first-touch so pages physically land
+  // on the same socket as this worker thread.
+  BindToLocalNumaNode(llc_mem_ctx.a, llc_mem_ctx.bufsize);
+  BindToLocalNumaNode(llc_mem_ctx.b, llc_mem_ctx.bufsize);
+  std::memset(llc_mem_ctx.a, 0xAB, llc_mem_ctx.bufsize);
+  // Set b equal to a so memcmp doesn't bail early on a mismatch.
+  std::memset(llc_mem_ctx.b, 0xAB, llc_mem_ctx.bufsize);
+  llc_mem_ctx.init = true;
+}
+
+static void DirectMemcmpLLC(long deadline_us) {
+  EnsureLlcMemCtx();
+  if (!llc_mem_ctx.init) return;
+  // Larger chunk sizes so each call touches enough cache lines to drive
+  // the LLC and so loop overhead doesn't dominate.
+  static constexpr int kSizes[] = {4096, 16384, 65536, 262144, 1048576};
+  size_t off_a = 0, off_b = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    for (int len : kSizes) {
+      if (off_a + len > llc_mem_ctx.bufsize) off_a = 0;
+      if (off_b + len > llc_mem_ctx.bufsize) off_b = 0;
+      int r = std::memcmp(llc_mem_ctx.a + off_a, llc_mem_ctx.b + off_b, len);
+      benchmark::DoNotOptimize(r);
+      // Stride forward; offset b by an extra cacheline so the two streams
+      // walk different parts of the buffer simultaneously.
+      off_a += len;
+      off_b += len + 64;
+    }
+  }
+}
+
+static void DirectMemmoveLLC(long deadline_us) {
+  EnsureLlcMemCtx();
+  if (!llc_mem_ctx.init) return;
+  static constexpr int kSizes[] = {4096, 16384, 65536, 262144, 1048576};
+  size_t off_src = 0, off_dst = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    for (int len : kSizes) {
+      if (off_src + len > llc_mem_ctx.bufsize) off_src = 0;
+      if (off_dst + len > llc_mem_ctx.bufsize) off_dst = 0;
+      auto* r = std::memmove(llc_mem_ctx.b + off_dst, llc_mem_ctx.a + off_src, len);
+      benchmark::DoNotOptimize(r);
+      off_src += len;
+      off_dst += len + 64;
+    }
+  }
+}
+
+// L2-resident memory kernels: ~512 KB buffers per thread (~L2/2 on c220g5;
+// L2 is 1 MB/core on Skylake-X). Single-thread stays in L2; multi-thread
+// aggregate working set fits in shared LLC without spilling to DRAM,
+// producing the high-LLC + low-DRAM-BW signature characteristic of cache-
+// warm test workloads.
+struct MemL2Ctx {
+  char* a = nullptr;
+  char* b = nullptr;
+  size_t bufsize = 0;
+  bool init = false;
+};
+static thread_local MemL2Ctx l2_mem_ctx;
+
+static void EnsureL2MemCtx() {
+  if (l2_mem_ctx.init) return;
+  l2_mem_ctx.bufsize = 512ull * 1024;  // half L2 on c220g5 (L2 = 1 MB/core)
+  if (posix_memalign(reinterpret_cast<void**>(&l2_mem_ctx.a), 4096, l2_mem_ctx.bufsize) != 0
+      || posix_memalign(reinterpret_cast<void**>(&l2_mem_ctx.b), 4096, l2_mem_ctx.bufsize) != 0) {
+    return;
+  }
+  // Bind to local NUMA node BEFORE first-touch.
+  BindToLocalNumaNode(l2_mem_ctx.a, l2_mem_ctx.bufsize);
+  BindToLocalNumaNode(l2_mem_ctx.b, l2_mem_ctx.bufsize);
+  std::memset(l2_mem_ctx.a, 0xCD, l2_mem_ctx.bufsize);
+  std::memset(l2_mem_ctx.b, 0xCD, l2_mem_ctx.bufsize);
+  l2_mem_ctx.init = true;
+}
+
+static void DirectMemcpyL2(long deadline_us) {
+  EnsureL2MemCtx();
+  if (!l2_mem_ctx.init) return;
+  static constexpr int kSizes[] = {1024, 4096, 16384, 65536};
+  size_t off_src = 0, off_dst = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    for (int len : kSizes) {
+      if (off_src + len > l2_mem_ctx.bufsize) off_src = 0;
+      if (off_dst + len > l2_mem_ctx.bufsize) off_dst = 0;
+      auto* r = std::memcpy(l2_mem_ctx.b + off_dst, l2_mem_ctx.a + off_src, len);
+      benchmark::DoNotOptimize(r);
+      off_src += len;
+      off_dst += len + 64;
+    }
+  }
+}
+
+static void DirectMemcmpL2(long deadline_us) {
+  EnsureL2MemCtx();
+  if (!l2_mem_ctx.init) return;
+  static constexpr int kSizes[] = {1024, 4096, 16384, 65536};
+  size_t off_a = 0, off_b = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    for (int len : kSizes) {
+      if (off_a + len > l2_mem_ctx.bufsize) off_a = 0;
+      if (off_b + len > l2_mem_ctx.bufsize) off_b = 0;
+      int r = std::memcmp(l2_mem_ctx.a + off_a, l2_mem_ctx.b + off_b, len);
+      benchmark::DoNotOptimize(r);
+      off_a += len;
+      off_b += len + 64;
+    }
+  }
+}
+
+// SIMD-friendly direct kernel: auto-vectorizes to AVX FMA.
+static void DirectSerialDistance(long deadline_us) {
+  static thread_local std::vector<float> a, b, c;
+  if (a.empty()) {
+    a.resize(1024); b.resize(1024); c.resize(1024, 0.0f);
+    for (int i = 0; i < 1024; ++i) {
+      a[i] = static_cast<float>(i) * 0.5f;
+      b[i] = static_cast<float>(i) * 0.3f;
+    }
+  }
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    for (int i = 0; i < 1024; ++i) c[i] += a[i] * b[i];
+    benchmark::DoNotOptimize(c.data());
+    // Reset to keep magnitudes bounded.
+    if (c[0] > 1e30f) std::fill(c.begin(), c.end(), 0.0f);
+  }
+}
+
+// SwissMap direct kernels: fill+drop a fresh hash set repeatedly.
+// Checks the deadline every 1024 insertions (and breaks the inner fill loop
+// early if exceeded) so the duty-cycle wrapper can throttle large-N sets
+// without overshooting its busy budget by ~tens-of-ms.
+template <size_t N>
+static void DirectSwissmapInsert(long deadline_us, bool ordered) {
+  constexpr size_t kCheckMask = 1023;  // check every 1024 insertions
+  auto loop_start = std::chrono::steady_clock::now();
+  auto deadline_passed = [&]() {
+    auto e = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    return e >= deadline_us;
+  };
+  while (!deadline_passed()) {
+    absl::flat_hash_set<uint64_t> s;
+    s.reserve(N);
+    if (ordered) {
+      for (uint64_t i = 0; i < N; ++i) {
+        s.insert(i);
+        if ((i & kCheckMask) == kCheckMask && deadline_passed()) break;
+      }
+    } else {
+      // "Miss" pattern: pseudo-random keys (mixed via golden-ratio hash).
+      uint64_t k = 0x9E3779B97F4A7C15ULL;
+      for (uint64_t i = 0; i < N; ++i) {
+        k = k * 2654435761ULL + i;
+        s.insert(k);
+        if ((i & kCheckMask) == kCheckMask && deadline_passed()) break;
+      }
+    }
+    benchmark::DoNotOptimize(s.size());
+  }
+}
+static void DirectSwissmapInsertMiss_32K(long d)        { DirectSwissmapInsert<32768>(d, false); }
+static void DirectSwissmapInsertMiss_262K(long d)       { DirectSwissmapInsert<262144>(d, false); }
+static void DirectSwissmapInsertMiss_1M(long d)         { DirectSwissmapInsert<1048576>(d, false); }
+static void DirectSwissmapInsertOrdered_262K(long d)    { DirectSwissmapInsert<262144>(d, true); }
+static void DirectSwissmapInsertOrdered_1M(long d)      { DirectSwissmapInsert<1048576>(d, true); }
+
+// ── IO direct kernels (stress_ng-equivalent patterns, simplified) ──────────
+//
+// Each thread uses its own temp file under /tmp keyed by pthread_self() so
+// concurrent workers don't collide. State is thread_local.
+
+static std::string PerThreadPath(const char* tag) {
+  char p[128];
+  snprintf(p, sizeof(p), "/tmp/mimesys_direct_%s_%lu", tag,
+           static_cast<unsigned long>(pthread_self()));
+  return std::string(p);
+}
+
+static void DirectReadahead(long deadline_us) {
+  static thread_local int fd = -1;
+  static thread_local std::vector<char> buf;
+  static thread_local std::string path;
+  static constexpr size_t kFileBytes = 64 * 1024 * 1024;  // 64 MB
+  static constexpr size_t kChunk     = 64 * 1024;         // 64 KB
+  if (fd < 0) {
+    path = PerThreadPath("readahead");
+    fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    // Unlink from filesystem now; the kernel keeps the inode alive as long as
+    // fd is open, but disk space is reclaimed immediately when the process
+    // exits (even via SIGKILL). Prevents the 64 MB per-thread file from
+    // leaking across benchmark invocations.
+    unlink(path.c_str());
+    buf.assign(kChunk, 'X');
+    for (size_t i = 0; i < kFileBytes / kChunk; ++i) {
+      if (write(fd, buf.data(), buf.size()) <= 0) break;
+    }
+    fsync(fd);
+  }
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    posix_fadvise(fd, 0, kFileBytes, POSIX_FADV_DONTNEED);
+    posix_fadvise(fd, 0, kFileBytes, POSIX_FADV_WILLNEED);
+    lseek(fd, 0, SEEK_SET);
+    for (size_t i = 0; i < kFileBytes / kChunk; ++i) {
+      auto n = read(fd, buf.data(), buf.size());
+      benchmark::DoNotOptimize(n);
+      if (n <= 0) break;
+    }
+  }
+}
+
+static void DirectFallocate4MB(long deadline_us) {
+  static thread_local std::string path;
+  static constexpr off_t kSize = 4 * 1024 * 1024;
+  if (path.empty()) path = PerThreadPath("fallocate");
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) continue;
+    int rc = fallocate(fd, 0, 0, kSize);
+    benchmark::DoNotOptimize(rc);
+    fsync(fd);
+    close(fd);
+    unlink(path.c_str());
+  }
+}
+
+// Small-file fallocate: 256 KB preallocation per iteration. Lower-IO variant
+// covering the small-block low-bandwidth IO regime.
+static void DirectFallocate256KB(long deadline_us) {
+  static thread_local std::string path;
+  static constexpr off_t kSize = 256 * 1024;
+  if (path.empty()) path = PerThreadPath("fallocate256");
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) continue;
+    int rc = fallocate(fd, 0, 0, kSize);
+    benchmark::DoNotOptimize(rc);
+    fsync(fd);
+    close(fd);
+    unlink(path.c_str());
+  }
+}
+
+static void DirectHdd1MB(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local std::string path;
+  static constexpr size_t kSize = 1024 * 1024;
+  if (buf.empty()) {
+    buf.assign(kSize, 'Z');
+    path = PerThreadPath("hdd");
+  }
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) continue;
+    auto n = write(fd, buf.data(), buf.size());
+    benchmark::DoNotOptimize(n);
+    fsync(fd);
+    close(fd);
+    unlink(path.c_str());
+  }
+}
+
+// Low-IO 64 KB Hdd variant: ~16× smaller write per iteration than Hdd_1MB.
+// Sustains lower aggregate IO bandwidth, covering the low-IO regime of test
+// workloads that the 1 MB variant misses.
+static void DirectHdd64KB(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local std::string path;
+  static constexpr size_t kSize = 64 * 1024;
+  if (buf.empty()) {
+    buf.assign(kSize, 'Z');
+    path = PerThreadPath("hdd64");
+  }
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) continue;
+    auto n = write(fd, buf.data(), buf.size());
+    benchmark::DoNotOptimize(n);
+    fsync(fd);
+    close(fd);
+    unlink(path.c_str());
+  }
+}
+
+using KernelFn = std::function<void(long)>;
+static const std::unordered_map<std::string, KernelFn>& Kernels() {
+  static const std::unordered_map<std::string, KernelFn> m = {
+    {"BM_HASHING_Extendcrc32cinternal_Fleet_cold", DirectExtendCrc32c},
+    {"BM_HASHING_Computecrc32c_Fleet_cold",        DirectComputeCrc32c},
+    {"BM_LIBC_Memcpy_Fleet_L1",                    DirectMemcpy},
+    {"BM_LIBC_Memcmp_Fleet_LLC",                   DirectMemcmpLLC},
+    {"BM_LIBC_Memmove_Fleet_LLC",                  DirectMemmoveLLC},
+    {"BM_LIBC_Memcpy_Fleet_L2",                    DirectMemcpyL2},
+    {"BM_LIBC_Memcmp_Fleet_L2",                    DirectMemcmpL2},
+    // SIMD: both 256-block and 512-block variants share the same direct kernel
+    // (representative AVX-FMA loop); the original SCANN LUT16 distance compute
+    // is a similar pattern.
+    {"BM_SIMD_SerialDistanceComputation/num_blocks:256/enable_avx512:false/flush_cache:false", DirectSerialDistance},
+    {"BM_SIMD_SerialDistanceComputation/num_blocks:512/enable_avx512:false/flush_cache:false", DirectSerialDistance},
+    // SwissMap: parameterize by set_size; node_hash_set and flat_hash_set use
+    // the same kernel (absl::flat_hash_set) — exact data structure differs but
+    // the CPU profile is dominated by the insertion+probing loop.
+    {"BM_SWISSMAP_InsertMiss_Cold<::absl::flat_hash_set, 64>/set_size:262144/density:0",      DirectSwissmapInsertMiss_262K},
+    {"BM_SWISSMAP_InsertMiss_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:0",     DirectSwissmapInsertMiss_1M},
+    {"BM_SWISSMAP_InsertMiss_Cold<::absl::node_hash_set, 64>/set_size:32768/density:0",       DirectSwissmapInsertMiss_32K},
+    {"BM_SWISSMAP_InsertManyOrdered_Cold<::absl::flat_hash_set, 64>/set_size:262144/density:1", DirectSwissmapInsertOrdered_262K},
+    {"BM_SWISSMAP_InsertManyOrdered_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:1", DirectSwissmapInsertOrdered_1M},
+    {"BM_SWISSMAP_InsertManyOrdered_Cold<::absl::node_hash_set, 64>/set_size:1048576/density:1", DirectSwissmapInsertOrdered_1M},
+    // IO stressors — replicate stress-ng patterns via direct syscalls.
+    // Per-thread temp file under /tmp keyed by pthread_self() to avoid
+    // contention between concurrent worker threads.
+    {"BM_STRESS_NG_Readahead",       DirectReadahead},
+    {"BM_STRESS_NG_Fallocate_4MB",   DirectFallocate4MB},
+    {"BM_STRESS_NG_Fallocate_256KB", DirectFallocate256KB},
+    {"BM_STRESS_NG_Hdd_1MB",         DirectHdd1MB},
+    {"BM_STRESS_NG_Hdd_64KB",        DirectHdd64KB},
+  };
+  return m;
+}
+
+// Sub-iteration duty cycling: alternate (chunk*duty) busy with
+// (chunk*(1-duty)) sleep, repeating until deadline. The supplied KernelFn is
+// called with progressively smaller deadlines so it can return inside one chunk.
+// Used to make per-thread CPU% follow `duty` smoothly instead of saturating.
+static void RunWithDutyCycle(const KernelFn& fn, long deadline_us, double duty) {
+  if (deadline_us <= 0) return;
+  if (duty >= 0.99) { fn(deadline_us); return; }
+  if (duty <= 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  // 5 ms chunk gives ~5 % min duty (250 us busy floor) at decent granularity.
+  // Light kernels (Memcpy, Crc32c, SIMD) honor the deadline at sub-µs and
+  // deliver near-linear duty cycling. Heavy SwissMap_1M is left non-monotonic
+  // here — its per-iteration allocation cost is the bottleneck and a larger
+  // chunk doesn't help; would need a kernel-level refactor (persistent set).
+  const long chunk_us = 5000;
+  long busy_us = std::max<long>(250, static_cast<long>(chunk_us * duty));
+  long sleep_us = std::max<long>(0, chunk_us - busy_us);
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto now = std::chrono::steady_clock::now();
+    long elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        now - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    long remaining = deadline_us - elapsed;
+    long this_busy = std::min(busy_us, remaining);
+    fn(this_busy);
+    long after_busy = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    long this_sleep = std::min<long>(sleep_us, deadline_us - after_busy);
+    if (this_sleep > 0) {
+      std::this_thread::sleep_for(std::chrono::microseconds(this_sleep));
+    }
+  }
+}
+
+}  // namespace direct_kernels
+
 void RunMimesysExecutionOrder(
     const std::vector<int>& execution_order,
     double no_op_ratio,
@@ -398,20 +949,43 @@ void RunMimesysExecutionOrder(
         std::advance(it, spec_idx);
         const std::string& spec = it->first;
         auto start = std::chrono::steady_clock::now();
-        benchmark::RunSpecifiedBenchmarks(&display_reporter, spec);
+        bool used_duty_cycle = false;
+        {
+          auto& kernels = direct_kernels::Kernels();
+          auto kit = kernels.find(spec);
+          if (kit != kernels.end()) {
+            // Direct invocation: run until remaining slot deadline, but with
+            // sub-iteration duty cycling so per-thread CPU% follows the
+            // per-thread total weight (1 - no_op_ratio) instead of saturating
+            // for any non-zero weight.
+            auto start_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                start.time_since_epoch()).count();
+            long remaining_us = static_cast<long>(duration_us)
+                              - (start_us - loop_start_time_us);
+            if (remaining_us > 0) {
+              double duty = std::max(0.0, std::min(1.0, 1.0 - no_op_ratio));
+              direct_kernels::RunWithDutyCycle(kit->second, remaining_us, duty);
+              used_duty_cycle = true;
+            }
+          } else {
+            benchmark::RunSpecifiedBenchmarks(&display_reporter, spec);
+          }
+        }
         auto end = std::chrono::steady_clock::now();
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
         // std::cerr << "[BM_Mimesys] Finished benchmark:" << spec << ">" << elapsed_us << std::endl;
         index_invocation_count[spec_idx] += elapsed_us;
-        auto sleep_time = static_cast<int>(elapsed_us * no_op_ratio / (1 - no_op_ratio));
-        auto current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        // Outer sleep is only needed when the kernel ran as a tight loop (i.e.
+        // we did NOT do sub-iteration duty cycling above).
+        long long current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count();
-        auto slack_time = duration_us - (current_time_us - loop_start_time_us);
-        sleep_time = std::min(static_cast<int>(slack_time), sleep_time);
-        if (sleep_time > 0) {
-          // Sleep to simulate the no-op ratio
-          // std::cerr << "[BM_Mimesys] Sleeping for " << sleep_time << " us (no_op_ratio=" << no_op_ratio << ", spec=" << spec << ")" << std::endl;
-          std::this_thread::sleep_for(std::chrono::microseconds(sleep_time));
+        if (!used_duty_cycle) {
+          auto sleep_time = static_cast<int>(elapsed_us * no_op_ratio / (1 - no_op_ratio));
+          auto slack_time = duration_us - (current_time_us - loop_start_time_us);
+          sleep_time = std::min(static_cast<int>(slack_time), sleep_time);
+          if (sleep_time > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(sleep_time));
+          }
         }
 
         // if (PAPI_read(EventSet, values) != PAPI_OK) {
@@ -558,6 +1132,167 @@ void ProfileActions(const std::vector<std::string>& action_names) {
   }
 }
 
+// ── Persistent worker pool (Q2 experiment) ──────────────────────────────────
+//
+// Replaces the per-slot fork-and-spawn-N-threads pattern with a pool of N
+// long-lived threads created once and reused across all slots / plans.
+// Each worker is pinned to one CPU. Dispatch flow per slot:
+//   parent: stash per-thread (execution_order, no_op_ratio, deadline) and bump
+//           a sequence counter, notify_all
+//   worker: wake, run RunMimesysExecutionOrder until deadline (cooperative
+//           termination — no SIGKILL), signal completion
+//   parent: wait until all done sequence counters catch up
+//
+// Tradeoffs vs fork mode:
+//   - No SIGKILL timeout enforcement: relies on cooperative deadline checks
+//     inside RunMimesysExecutionOrder's outer while loop. For one-hot CRC
+//     plans (the Q2 target) the cooperative check is sufficient.
+//   - Per-slot transitions go from ~5-10 ms (fork+spawn+join+wait) to ~10 us
+//     (cv notify+wait round trip).
+//   - Workers carry warm L1/TLB across slots (intentional for max CPU%).
+namespace persistent_pool {
+
+struct WorkerTask {
+  bool exit = false;
+  const std::vector<int>* execution_order = nullptr;
+  double no_op_ratio = 0.0;
+  long long deadline_us = 0;
+  bool sleep_only = false;
+};
+
+class WorkerPool {
+ public:
+  void Init(size_t n) {
+    if (workers_.size() == n) return;
+    Shutdown();
+    n_ = n;
+    tasks_.assign(n, {});
+    task_seq_.assign(n, 0);
+    done_seq_.assign(n, 0);
+    workers_.reserve(n);
+    for (size_t j = 0; j < n; ++j) {
+      workers_.emplace_back([this, j]() { WorkerLoop(j); });
+    }
+  }
+
+  void DispatchSlot(const std::vector<std::vector<int>>& exec_orders,
+                    const std::vector<double>& no_op_ratios,
+                    long long deadline_us) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (size_t j = 0; j < n_; ++j) {
+        WorkerTask t;
+        t.deadline_us = deadline_us;
+        t.exit = false;
+        if (j < exec_orders.size() && !exec_orders[j].empty()) {
+          t.execution_order = &exec_orders[j];
+          t.no_op_ratio = (j < no_op_ratios.size()) ? no_op_ratios[j] : 0.0;
+          t.sleep_only = false;
+        } else {
+          t.execution_order = nullptr;
+          t.sleep_only = true;
+        }
+        tasks_[j] = t;
+        task_seq_[j]++;
+      }
+    }
+    cv_dispatch_.notify_all();
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_complete_.wait(lk, [&]() {
+      for (size_t j = 0; j < n_; ++j) {
+        if (done_seq_[j] != task_seq_[j]) return false;
+      }
+      return true;
+    });
+  }
+
+  void Shutdown() {
+    if (workers_.empty()) return;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (size_t j = 0; j < n_; ++j) {
+        tasks_[j].exit = true;
+        task_seq_[j]++;
+      }
+    }
+    cv_dispatch_.notify_all();
+    for (auto& t : workers_) t.join();
+    workers_.clear();
+    tasks_.clear();
+    task_seq_.clear();
+    done_seq_.clear();
+    n_ = 0;
+  }
+
+  ~WorkerPool() { Shutdown(); }
+
+ private:
+  static long long NowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  void WorkerLoop(size_t j) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(j % std::thread::hardware_concurrency(), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    // NUMA: pin allocations to the local node for this CPU. set_mempolicy is
+    // per-thread on Linux; combined with the pinned affinity above, all
+    // subsequent thread_local first-touches land on the local memory node.
+    syscall(SYS_set_mempolicy, 4 /* MPOL_LOCAL */, nullptr, 0);
+    uint64_t last_seq = 0;
+    while (true) {
+      WorkerTask local;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_dispatch_.wait(lk, [&]() { return task_seq_[j] != last_seq; });
+        last_seq = task_seq_[j];
+        local = tasks_[j];
+      }
+      if (local.exit) {
+        std::lock_guard<std::mutex> lk(mu_);
+        done_seq_[j] = last_seq;
+        cv_complete_.notify_one();
+        return;
+      }
+      long long remaining = local.deadline_us - NowUs();
+      if (local.sleep_only) {
+        if (remaining > 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(remaining));
+        }
+      } else if (local.execution_order && !local.execution_order->empty()
+                 && remaining > 0) {
+        std::unordered_map<int, int> dummy_count;
+        SilentReporter dummy_reporter;
+        RunMimesysExecutionOrder(
+            *local.execution_order, local.no_op_ratio,
+            dummy_count, dummy_reporter,
+            static_cast<unsigned int>(remaining));
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        done_seq_[j] = last_seq;
+      }
+      cv_complete_.notify_one();
+    }
+  }
+
+  size_t n_ = 0;
+  std::vector<std::thread> workers_;
+  std::vector<WorkerTask> tasks_;
+  std::vector<uint64_t> task_seq_;
+  std::vector<uint64_t> done_seq_;
+  std::mutex mu_;
+  std::condition_variable cv_dispatch_;
+  std::condition_variable cv_complete_;
+};
+
+// Single pool shared across the lifetime of the process.
+static WorkerPool g_pool;
+
+}  // namespace persistent_pool
+
 // Stress Emulate Benchmark
 static void BM_Mimesys(benchmark::State& state) {
   std::vector<std::string> action_names;
@@ -621,8 +1356,19 @@ static void BM_Mimesys(benchmark::State& state) {
       auto start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
       auto current_time_us = start_time_us;
-      unsigned int expected_duration_us_total = 18000000; // 18 seconds
-      unsigned int expected_duration_us = 2000000; // 2 seconds per slot
+      // Slot duration is configurable via MIMESYS_SLOT_US (microseconds).
+      // Default 2,000,000 µs (2 s/slot). Total budget scales with #slots.
+      unsigned int expected_duration_us = 2000000; // default 2 s per slot
+      const char* slot_env = std::getenv("MIMESYS_SLOT_US");
+      if (slot_env) {
+        long long parsed = std::atoll(slot_env);
+        if (parsed > 0) expected_duration_us = static_cast<unsigned int>(parsed);
+      }
+      // expected_duration_us_total is only used for the time-diff floor
+      // computation later; it tracks expected_duration_us × (size+1) per iter.
+      // We initialize it for a single-iter loop and recompute below once we
+      // know execution_orders.size().
+      unsigned int expected_duration_us_total = expected_duration_us * 9;
       unsigned int duration_us = expected_duration_us;
       auto count = 0;
 
@@ -641,82 +1387,23 @@ static void BM_Mimesys(benchmark::State& state) {
       unsigned int loop_limit = do_sleep
           ? iteration * (static_cast<unsigned int>(execution_orders.size()) + 1)
           : iteration * static_cast<unsigned int>(execution_orders.size());
+
+      // ── Initialize persistent worker pool to max thread width seen ───────
+      size_t pool_n = 0;
+      for (const auto& eo : execution_orders) pool_n = std::max(pool_n, eo.size());
+      if (pool_n == 0) pool_n = std::thread::hardware_concurrency();
+      persistent_pool::g_pool.Init(pool_n);
+
       while (count < loop_limit) {
         for (size_t i = 0; i < execution_orders.size(); ++i) {
           if (duration_us > 0) {
             auto thread_start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now().time_since_epoch()).count();
-
-            // Fork a child process to run this slot so the parent can
-            // SIGKILL it if it overruns the time budget.
-            pid_t child_pid = fork();
-            if (child_pid == 0) {
-              // ── Child: spawn worker threads and run the slot ────────────
-              // Set NUMA memory policy to local-node allocation once for the
-              // whole child process; inherited by all threads below.
-              syscall(SYS_set_mempolicy, 4 /* MPOL_LOCAL */, nullptr, 0);
-
-              std::vector<std::thread> threads;
-              for (size_t j = 0; j < execution_orders[i].size(); ++j) {
-                threads.emplace_back([&, i, j, thread_start_time_us]() {
-                  cpu_set_t cpuset;
-                  CPU_ZERO(&cpuset);
-                  CPU_SET(j % std::thread::hardware_concurrency(), &cpuset);
-                  pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-
-                  std::unordered_map<int, int> child_index_invocation_count;
-                  SilentReporter child_reporter;
-
-                  auto thread_current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-                  auto thread_start_time_diff_us = thread_current_time_us - thread_start_time_us;
-
-                  if (!execution_orders[i][j].empty()) {
-                    RunMimesysExecutionOrder(
-                      execution_orders[i][j], no_op_ratios[i][j],
-                      child_index_invocation_count, child_reporter,
-                      duration_us - thread_start_time_diff_us
-                    );
-                  } else {
-                    std::this_thread::sleep_for(std::chrono::microseconds(
-                      duration_us - thread_start_time_diff_us));
-                  }
-                });
-              }
-              for (auto& t : threads) t.join();
-              _exit(0);
-
-            } else if (child_pid > 0) {
-              // ── Parent: poll until child exits or deadline passes ───────
-              // Allow a 100 ms grace period before issuing SIGKILL so that
-              // slots that finish just barely over budget still exit cleanly.
-              static constexpr long long kGracePeriodUs = 100000LL;
-              long long deadline_us = thread_start_time_us
-                                      + static_cast<long long>(duration_us)
-                                      + kGracePeriodUs;
-              while (true) {
-                int status;
-                pid_t r = waitpid(child_pid, &status, WNOHANG);
-                if (r > 0) break;   // child finished naturally
-                auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now().time_since_epoch()).count();
-                if (now_us >= deadline_us) {
-                  kill(child_pid, SIGKILL);
-                  waitpid(child_pid, nullptr, 0);
-                  std::cerr << "[BM_Mimesys] Force-killed slot " << i
-                            << " — overran budget by "
-                            << (now_us - thread_start_time_us
-                                - static_cast<long long>(duration_us))
-                            << " us" << std::endl;
-                  break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-              }
-
-            } else {
-              std::cerr << "[BM_Mimesys] fork() failed for slot " << i
-                        << ": " << std::strerror(errno) << std::endl;
-            }
+            // Dispatch to persistent pool; deadline is absolute time.
+            long long slot_deadline_us = thread_start_time_us
+                                       + static_cast<long long>(duration_us);
+            persistent_pool::g_pool.DispatchSlot(
+                execution_orders[i], no_op_ratios[i], slot_deadline_us);
           }
 
           CollectTACCStats(tacc_stats_dir);

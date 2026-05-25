@@ -13,14 +13,12 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Augmentation utilities
 # ---------------------------------------------------------------------------
-# Metric vector layout (sorted alphabetically, 25-dim):
+# Metric vector layout (sorted alphabetically, 23-dim):
 #   [0:10]  avg_cpu_utilizations_core_00..09  (socket 0)
 #   [10:20] avg_cpu_utilizations_core_10..19  (socket 1)
 #   [20]    io
-#   [21]    l3_cache_usage_socket_0
-#   [22]    l3_cache_usage_socket_1
-#   [23]    memory_bandwidth_socket_0
-#   [24]    memory_bandwidth_socket_1
+#   [21]    l3_cache_usage    (socket-aggregated)
+#   [22]    memory_bandwidth  (socket-aggregated)
 #
 # Action label layout (after transpose): [stressors, threads=20]
 #   columns [0:10]  = socket 0 threads
@@ -37,8 +35,7 @@ def _apply_swap_to_trace(trace: np.ndarray) -> np.ndarray:
     out = trace.copy()
     out[0:10]  = trace[10:20]
     out[10:20] = trace[0:10]
-    out[21], out[22] = trace[22], trace[21]
-    out[23], out[24] = trace[24], trace[23]
+    # LLC/BW are socket-aggregated → no per-socket swap needed.
     return out
 
 
@@ -438,8 +435,14 @@ class CustomDataLoader(pl.LightningDataModule):
         intra_only_aug: bool = False,
         high_io_aug_factor: int = 1,
         io_raw_threshold: float = 1000.0,
+        cpu_avg_threshold: float = 50.0,
+        llc_max_threshold: float = 100.0,
+        bw_max_threshold: float = 5.0,
         rl_train_ratio: float = 0.333,
-        rl_high_io_fraction: float = 0.5,
+        rl_high_io_fraction: float = 0.20,
+        rl_high_cpu_fraction: float = 0.20,
+        rl_high_llc_fraction: float = 0.20,
+        rl_high_bw_fraction: float = 0.20,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -467,18 +470,45 @@ class CustomDataLoader(pl.LightningDataModule):
 
         print(f"{len(test_data)} test samples before augmentation, {len(train_data)} train samples")
         if use_rl:
-            # For RL: supplement with high-IO training samples (io = clean_trace[20])
-            IO_IDX = 20
-            high_io_train = [d for d in train_data if d["clean_trace"][IO_IDX] > io_raw_threshold]
+            # For RL: supplement with high-resource training samples stratified across
+            # all four resource classes (IO, CPU, LLC, BW). Use the RAW values in
+            # info["collated_trace"] — `clean_trace` is normalized to [-1, 1] so the
+            # raw-scale thresholds (io>1000, cpu>50, etc.) would never match.
+            # Layout: [0..19]=per-core CPU%, [20]=io, [21]=l3_cache_usage (agg),
+            #         [22]=memory_bandwidth (agg).
+            IO_IDX  = 20
+            LLC_IDX = 21
+            BW_IDX  = 22
+
+            def _raw(d): return d["info"]["collated_trace"]
+
+            high_io_train  = [d for d in train_data if _raw(d)[IO_IDX] > io_raw_threshold]
+            high_cpu_train = [d for d in train_data if float(np.mean(_raw(d)[:20])) > cpu_avg_threshold]
+            high_llc_train = [d for d in train_data if _raw(d)[LLC_IDX] > llc_max_threshold]
+            high_bw_train  = [d for d in train_data if _raw(d)[BW_IDX]  > bw_max_threshold]
+
             n_total_train = int(len(test_data) * rl_train_ratio)
-            n_high_io = min(len(high_io_train), int(n_total_train * rl_high_io_fraction))
-            n_normal = n_total_train - n_high_io
+            n_high_io  = min(len(high_io_train),  int(n_total_train * rl_high_io_fraction))
+            n_high_cpu = min(len(high_cpu_train), int(n_total_train * rl_high_cpu_fraction))
+            n_high_llc = min(len(high_llc_train), int(n_total_train * rl_high_llc_fraction))
+            n_high_bw  = min(len(high_bw_train),  int(n_total_train * rl_high_bw_fraction))
+            n_normal   = max(0, n_total_train - n_high_io - n_high_cpu - n_high_llc - n_high_bw)
+
+            for lst in (high_io_train, high_cpu_train, high_llc_train, high_bw_train):
+                random.shuffle(lst)
             normal_train = train_data[:n_normal]
-            random.shuffle(high_io_train)
-            print(f"RL data: {len(test_data)} test + {n_normal} normal-train + "
-                  f"{n_high_io}/{len(high_io_train)} high-IO train "
-                  f"(ratio={rl_train_ratio:.2f}, hi_io_frac={rl_high_io_fraction:.2f})")
-            test_data = test_data + normal_train + high_io_train[:n_high_io]
+
+            print(f"RL data: {len(test_data)} test  +  {n_normal} normal-train  +  "
+                  f"{n_high_io}/{len(high_io_train)} high-IO (>{io_raw_threshold:.0f})  +  "
+                  f"{n_high_cpu}/{len(high_cpu_train)} high-CPU (avg>{cpu_avg_threshold:.0f}%)  +  "
+                  f"{n_high_llc}/{len(high_llc_train)} high-LLC (max>{llc_max_threshold:.0f})  +  "
+                  f"{n_high_bw}/{len(high_bw_train)} high-BW (max>{bw_max_threshold:.0f})")
+
+            test_data = (test_data + normal_train
+                         + high_io_train[:n_high_io]
+                         + high_cpu_train[:n_high_cpu]
+                         + high_llc_train[:n_high_llc]
+                         + high_bw_train[:n_high_bw])
         else:
             test_data = test_data + train_data[: len(test_data) // 3]
 

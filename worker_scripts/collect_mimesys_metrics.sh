@@ -16,11 +16,18 @@ chunk_idx="$4"
 host_name=$(hostname)
 
 fleetbench_dir="/users/$username/fleetbench"
+
+# Wipe stale stats from any previous run on this host so we never ship recycled data.
+sudo rm -rf "$HOME/results" 2>/dev/null
+mkdir -p "$HOME/results"
+
 cd "$fleetbench_dir"
 bash collect_mimesys_data.sh
 
 cd "$HOME"
 target_dir="validation-$chunk_idx"
+n_stats=$(ls results/stats-plan_*.txt 2>/dev/null | wc -l)
+echo "collect_mimesys_metrics: $n_stats stats files in results/"
 zip -r "$target_dir.zip" results
 
 # Retry the scp because transient SSH/network errors during long collection runs are common.
