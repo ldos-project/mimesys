@@ -88,6 +88,35 @@ class MimesysTrainer(pl.LightningModule):
         self.samples = []
         self.ref_model = None  # frozen pretrained snapshot for KL regularization
 
+        # Dynamic reward-weight state (Lagrangian-style adaptive λ_m). Enabled via
+        # train.ddpo.dynamic_weights=true. After each profiling step the trainer
+        # reads the RAW per-metric medians, appends to a rolling window, and updates
+        # λ_m toward the relative violation from per-metric targets (pretrain K=200
+        # baselines by default). λ_m is clamped to [0.1, dynamic_max_weight] and
+        # passed into the NEXT ProfileRequest as the static io/llc/membw/cpu_reward_weight.
+        ddpo_cfg = self.cfg.train.ddpo
+        self.dyn_enabled = bool(ddpo_cfg.get("dynamic_weights", False))
+        if self.dyn_enabled:
+            self.dyn_window = int(ddpo_cfg.get("dynamic_window", 5))
+            self.dyn_step   = float(ddpo_cfg.get("dynamic_step", 0.5))
+            self.dyn_max    = float(ddpo_cfg.get("dynamic_max_weight", 5.0))
+            self.dyn_lambdas = {
+                "io":               float(ddpo_cfg.get("io_reward_weight", 1.0)),
+                "l3_cache_usage":   float(ddpo_cfg.get("llc_reward_weight", 1.0)),
+                "memory_bandwidth": float(ddpo_cfg.get("membw_reward_weight", 1.0)),
+                "cpu":              float(ddpo_cfg.get("cpu_reward_weight", 1.0)),
+            }
+            # Targets default to pretrain v10 concat K=200 medians
+            self.dyn_targets = {
+                "io":               float(ddpo_cfg.get("dynamic_target_io",  0.0232)),
+                "l3_cache_usage":   float(ddpo_cfg.get("dynamic_target_llc", 0.0362)),
+                "memory_bandwidth": float(ddpo_cfg.get("dynamic_target_bw",  0.0330)),
+                "cpu":              float(ddpo_cfg.get("dynamic_target_cpu", 0.0367)),
+            }
+            self.dyn_history = {k: deque(maxlen=self.dyn_window) for k in self.dyn_lambdas}
+            print(f"[dyn-λ] enabled; window={self.dyn_window} step={self.dyn_step} "
+                  f"max={self.dyn_max} targets={self.dyn_targets} init λ={self.dyn_lambdas}")
+
     # ------------------------------------------------------------------
     # Auxiliary model loading
     # ------------------------------------------------------------------
@@ -136,56 +165,93 @@ class MimesysTrainer(pl.LightningModule):
         is_training_data = batch["training_data"]
 
         prev_states = -torch.ones_like(x0).cuda()
-        prev_medoid_n = int(self.cfg.train.ddpo.get("prev_medoid_n", 1))
-        if prev_medoid_n > 1:
-            # Sample K candidates per row in a single inflated-batch diffusion call,
-            # then pick the per-row medoid (sample minimising sum-of-L1 to others).
-            # This reduces per-step prev-state variance vs single-sample inference.
+        # When skip_prev_state=True (metrics_only encoder convention): no
+        # prev_action signal is meaningful, so we leave prev_states at -1 (idle
+        # in scaled space), skip the prev_medoid diffusion, and write 1-window
+        # plans below. The deploy then has cycle (curr, sleep) × ITERS.
+        skip_prev_state = bool(self.cfg.train.ddpo.get("skip_prev_state", False))
+        if skip_prev_state:
+            pass  # leave prev_states at -ones
+        elif (prev_medoid_n := int(self.cfg.train.ddpo.get("prev_medoid_n", 1))) > 1:
+            # Match predict_autoregressive_h5.py's prev_raw computation for one step:
+            #   prev_raw_init = zeros (raw [0,1])  →  scaled = -ones (idle)
+            #   for K candidates: diffusion(cond={"metric": prev_trace, "prev_action": idle})
+            #   medoid = argmin_k sum_j mean_d |a_j[d] - a_k[d]|     (sum-L1, dim-averaged)
+            # The selected medoid (scaled [-1,+1]) is used as prev_action input to the
+            # subsequent curr-action diffusion call (matches inference t=0 → t=1 transition).
             K = prev_medoid_n
-            prev_trace_K   = prev_trace.repeat_interleave(K, dim=0).cuda()    # (K*N, dim)
-            prev_states_K  = prev_states.repeat_interleave(K, dim=0)           # (K*N, S, T)
-            shape_K        = (K * N,) + tuple(x0.shape[1:])
+            prev_trace_K  = prev_trace.repeat_interleave(K, dim=0).cuda()     # (N*K, dim)
+            prev_states_K = prev_states.repeat_interleave(K, dim=0)            # (N*K, S, T)  all -1 (idle)
+            shape_K       = (N * K,) + tuple(x0.shape[1:])
             with torch.no_grad():
                 chains_K, _ = self.trainer_model.p_sample_loop_with_logprobs(
                     shape_K, {"metric": prev_trace_K, "prev_action": prev_states_K}
                 )
-            final = chains_K[-1].view(N, K, *x0.shape[1:])     # (N, K, S, T)
-            final_np = final.detach().cpu().numpy()
-            S = x0.shape[1]; Tth = x0.shape[2]
-            import numpy as _np
-            medoid_out = _np.empty((N, S, Tth), dtype=_np.float32)
-            for _i in range(N):
-                F = final_np[_i].reshape(K, -1)
-                sd = _np.array([float(_np.abs(F - F[k:k+1]).mean(axis=1).sum())
-                                for k in range(K)])
-                medoid_out[_i] = final_np[_i, int(_np.argmin(sd))]
-            prev_states = torch.tensor(medoid_out, dtype=x0.dtype,
-                                       device=x0.device).cuda()
+            final = chains_K[-1].view(N, K, *x0.shape[1:])                     # (N, K, S, T) scaled
+            # Medoid by min sum-L1 (dim-averaged), GPU-resident; identical formula to inference.
+            flat = final.reshape(N, K, -1)                                     # (N, K, S*T)
+            # pairwise: (N, K_query, K_other, D) → mean over D → sum over K_other → (N, K_query)
+            d = (flat.unsqueeze(2) - flat.unsqueeze(1)).abs().mean(dim=-1).sum(dim=2)  # (N, K)
+            medoid_idx = d.argmin(dim=1)                                       # (N,)
+            prev_states = final[torch.arange(N, device=final.device), medoid_idx]   # (N, S, T)
         else:
             chains, _ = self.trainer_model.p_sample_loop_with_logprobs(
                 x0.shape, {"metric": prev_trace, "prev_action": prev_states}
             )
             prev_states = chains[-1]
-        for idx in range(N):
-            if is_training_data[idx]:
-                prev_states[idx] = prev_labels[idx]
+        if not skip_prev_state:
+            for idx in range(N):
+                if is_training_data[idx]:
+                    prev_states[idx] = prev_labels[idx]
 
         trace = (trace + torch.randn_like(trace) * 1e-4).cuda()
 
-        best_of_n = int(self.cfg.train.ddpo.get("best_of_n", 1))
-        all_chains = []
-        all_log_probs = []
-        with torch.no_grad():
-            for _k in range(best_of_n):
-                chains_k, log_probs_k = self.trainer_model.p_sample_loop_with_logprobs(
-                    x0.shape, {"metric": trace, "prev_action": prev_states}
+        # === curr_action selection ===
+        # curr_medoid_n=K: sample K candidates per row in one inflated-batch diffusion
+        # call, pick the per-row medoid (min sum-L1 to other candidates) — matches
+        # predict_autoregressive_h5.py's curr-action selection. The medoid's chain
+        # and log_probs are kept for the DDPO gradient (other K-1 chains discarded).
+        # Falls back to best_of_n=1 single-sample when curr_medoid_n<=1.
+        curr_medoid_n = int(self.cfg.train.ddpo.get("curr_medoid_n", 1))
+        if curr_medoid_n > 1:
+            K = curr_medoid_n
+            trace_K       = trace.repeat_interleave(K, dim=0).cuda()         # (N*K, dim)
+            prev_states_K = prev_states.repeat_interleave(K, dim=0).cuda()    # (N*K, S, T)
+            shape_K       = (N * K,) + tuple(x0.shape[1:])
+            with torch.no_grad():
+                chains_K, log_probs_K = self.trainer_model.p_sample_loop_with_logprobs(
+                    shape_K, {"metric": trace_K, "prev_action": prev_states_K}
                 )
-                all_chains.append(chains_k)
-                all_log_probs.append(log_probs_k)
-        # Default-path tensors (matching the K=1 case) reference the first sample;
-        # we overwrite chains/log_probs after profiling selects per-sample winners.
-        chains = all_chains[0]
-        log_probs = all_log_probs[0]
+            # chains_K: (T+1, N*K, S, T_a) ; log_probs_K: (T, N*K)
+            T_p1 = chains_K.shape[0]
+            T_dif = log_probs_K.shape[0]
+            chains_NK    = chains_K.view(T_p1, N, K, *x0.shape[1:])
+            log_probs_NK = log_probs_K.view(T_dif, N, K)
+            final = chains_NK[-1]                                              # (N, K, S, T_a)
+            flat  = final.reshape(N, K, -1)                                    # (N, K, S*T)
+            d = (flat.unsqueeze(2) - flat.unsqueeze(1)).abs().mean(dim=-1).sum(dim=2)  # (N, K)
+            medoid_idx = d.argmin(dim=1)                                       # (N,)
+            row_idx = torch.arange(N, device=final.device)
+            chains    = chains_NK[:, row_idx, medoid_idx]                      # (T+1, N, S, T_a)
+            log_probs = log_probs_NK[:, row_idx, medoid_idx]                   # (T, N)
+            all_chains    = [chains]
+            all_log_probs = [log_probs]
+            best_of_n     = 1                                                  # downstream loops over best_of_n
+        else:
+            best_of_n = int(self.cfg.train.ddpo.get("best_of_n", 1))
+            all_chains = []
+            all_log_probs = []
+            with torch.no_grad():
+                for _k in range(best_of_n):
+                    chains_k, log_probs_k = self.trainer_model.p_sample_loop_with_logprobs(
+                        x0.shape, {"metric": trace, "prev_action": prev_states}
+                    )
+                    all_chains.append(chains_k)
+                    all_log_probs.append(log_probs_k)
+            # Default-path tensors (matching the K=1 case) reference the first sample;
+            # we overwrite chains/log_probs after profiling selects per-sample winners.
+            chains = all_chains[0]
+            log_probs = all_log_probs[0]
         predicted_labels = chains[-1].cpu().detach().numpy()
         predicted_actions_tensor = (
             torch.tensor(predicted_labels).float().cuda().view(N, -1)
@@ -215,11 +281,35 @@ class MimesysTrainer(pl.LightningModule):
                         self.write_system_traces_to_file(dirname, batch["clean_trace"][sample_idx])
                     else:
                         self.write_system_traces_to_file(dirname, batch["clean_trace"][sample_idx])
+                    # Skip prev window entirely when skip_prev_state — the
+                    # benchmark sees a 1-window plan; deploy cycle becomes
+                    # (curr, sleep) × ITERS instead of (prev, curr, sleep) × ITERS.
+                    plan_windows = (
+                        [action_k] if skip_prev_state
+                        else [prev_state, action_k]
+                    )
                     write_fleetbench_actions_to_h5_file(
-                        [prev_state, action_k],
+                        plan_windows,
                         os.path.join(dirname, "predicted_actions_trainer_0.h5"),
                     )
 
+            # Current step's reward weights: dynamic λ if enabled, else static config.
+            if self.dyn_enabled:
+                w_io  = float(self.dyn_lambdas["io"])
+                w_llc = float(self.dyn_lambdas["l3_cache_usage"])
+                w_bw  = float(self.dyn_lambdas["memory_bandwidth"])
+                w_cpu = float(self.dyn_lambdas["cpu"])
+            else:
+                w_io  = self.cfg.train.ddpo.get("io_reward_weight", 1.0)
+                w_llc = self.cfg.train.ddpo.get("llc_reward_weight", 1.0)
+                w_bw  = self.cfg.train.ddpo.get("membw_reward_weight", 1.0)
+                w_cpu = self.cfg.train.ddpo.get("cpu_reward_weight", 1.0)
+            # Reward-slice indexing: skip_prev_state produces a (curr, sleep)×ITERS
+            # measurement stream, so pick even indices (period=2, offset=0). The
+            # historical 2-window deploy uses (period=3, offset=1) to land on the
+            # curr entry of each (prev, curr, sleep) triplet.
+            default_slice_period = 2 if skip_prev_state else 3
+            default_slice_offset = 0 if skip_prev_state else 1
             profile_request = ProfileRequest(
                 validation_data_path=f"{checkpoint_dir}/{exp_path}",
                 my_destination_path=self.cfg.profiler.destination_path,
@@ -228,18 +318,109 @@ class MimesysTrainer(pl.LightningModule):
                 num_trials=1,
                 logger=self.trainer.logger,
                 model_type="trainer",
-                io_reward_weight=self.cfg.train.ddpo.get("io_reward_weight", 1.0),
+                io_reward_weight=w_io,
                 low_resource_penalty_weight=self.cfg.train.ddpo.get("low_resource_penalty_weight", 0.0),
-                membw_reward_weight=self.cfg.train.ddpo.get("membw_reward_weight", 1.0),
-                llc_reward_weight=self.cfg.train.ddpo.get("llc_reward_weight", 1.0),
+                membw_reward_weight=w_bw,
+                llc_reward_weight=w_llc,
+                cpu_reward_weight=w_cpu,
+                reward_slice_period=int(self.cfg.train.ddpo.get("reward_slice_period", default_slice_period)),
+                reward_slice_offset=int(self.cfg.train.ddpo.get("reward_slice_offset", default_slice_offset)),
+                use_raw_mean_reward=bool(self.cfg.train.ddpo.get("use_raw_mean_reward", False)),
             )
             print("Profile request:", profile_request)
-            _, avg_emd_by_batch, metrics_std_by_batch = asyncio.run(
+            avg_emd_by_metrics, avg_emd_by_batch, metrics_std_by_batch = asyncio.run(
                 self.profiler.profile(
                     profile_request, self.cfg.data.trace_range,
                     period=2, duration=6, aggregate_time_series=True,
                 )
             )
+
+            # Log per-metric RAW L1 errors (unweighted by λ) to wandb so we can see
+            # whether mem-BW / LLC actually improved, independent of the reward signal.
+            # Aggregates avg_cpu_utilizations* keys into a single "cpu".
+            if avg_emd_by_metrics:
+                _cpu_vals = []
+                _all_raw_means = []
+                for m_name, errs in avg_emd_by_metrics.items():
+                    if not errs:
+                        continue
+                    mean_err = float(np.mean(errs))
+                    _all_raw_means.append(mean_err)
+                    if m_name == "io":
+                        self.log("emd/io",    mean_err, prog_bar=False, logger=True, on_epoch=True)
+                    elif m_name == "l3_cache_usage":
+                        self.log("emd/llc",   mean_err, prog_bar=False, logger=True, on_epoch=True)
+                    elif m_name == "memory_bandwidth":
+                        self.log("emd/membw", mean_err, prog_bar=False, logger=True, on_epoch=True)
+                    elif m_name.startswith("avg_cpu_utilizations"):
+                        _cpu_vals.append(mean_err)
+                if _cpu_vals:
+                    self.log("emd/cpu", float(np.mean(_cpu_vals)),
+                             prog_bar=False, logger=True, on_epoch=True)
+                # Mean RAW L1 across all metric keys (what the reward WOULD be if all λ=1).
+                if _all_raw_means:
+                    self.log("emd/raw_mean", float(np.mean(_all_raw_means)),
+                             prog_bar=False, logger=True, on_epoch=True)
+            # WEIGHTED L1 (the actual value that becomes −reward, before std penalty).
+            # avg_emd_by_batch is the per-batch mean of λ_m · err_m — exactly what's
+            # turned into rewards_flat = −emd_error_flat − 0.05·metrics_std_flat below.
+            if len(avg_emd_by_batch) > 0:
+                self.log("emd/weighted_mean", float(np.mean(avg_emd_by_batch)),
+                         prog_bar=True, logger=True, on_epoch=True)
+
+            # Update dynamic λ_m via SOFTMAX over per-family rolling violations.
+            # Properties (vs the old Lagrangian PI update):
+            #   * sum(λ_m) is held constant at K=4 → total reward magnitude
+            #     does not inflate over time (fixes the "reward gets worse even when
+            #     emd improves" pathology caused by unbounded λ growth).
+            #   * If a metric is satisfied (violation==0) it doesn't get extra weight,
+            #     but it also doesn't strangle the others — softmax handles it gracefully.
+            #   * Targets being "unreachable" doesn't matter — softmax cares about
+            #     the RELATIVE ordering of violations across families.
+            # dyn_step is reinterpreted as softmax temperature τ; larger τ = more peaked.
+            if self.dyn_enabled and avg_emd_by_metrics:
+                # 1) per-family rolling median (aggregate cpu sub-keys to one family)
+                for m_name, errs in avg_emd_by_metrics.items():
+                    if not errs:
+                        continue
+                    key = "cpu" if m_name.startswith("avg_cpu_utilizations") else m_name
+                    if key in self.dyn_lambdas:
+                        # avg_emd_by_metrics values are RAW (unweighted) — see profiling_server.py
+                        self.dyn_history[key].append(float(np.median(errs)))
+                # 2) softmax(τ · max(0, rolling/target − 1)) → λ_m
+                order = ["io", "l3_cache_usage", "memory_bandwidth", "cpu"]
+                rolling_arr, viol_arr = [], []
+                for k in order:
+                    if self.dyn_history[k]:
+                        r = float(np.median(list(self.dyn_history[k])))
+                    else:
+                        r = self.dyn_targets[k]   # no data yet → uniform
+                    rolling_arr.append(r)
+                    viol_arr.append(max(0.0, r / max(self.dyn_targets[k], 1e-9) - 1.0))
+                viol_arr = np.asarray(viol_arr, dtype=np.float64)
+                tau = float(self.dyn_step)
+                # numerically-stable softmax
+                z = tau * viol_arr; z -= z.max()
+                w = np.exp(z); w = w / w.sum()
+                K = float(len(order))
+                lambdas = K * w   # sums to K; uniform λ=1 each when all violations equal
+                for i, k in enumerate(order):
+                    self.dyn_lambdas[k] = float(lambdas[i])
+                update_info = {k: (round(rolling_arr[i], 4),
+                                   round(viol_arr[i], 3),
+                                   round(lambdas[i], 3))
+                               for i, k in enumerate(order)}
+                print(f"[dyn-w] (rolling, violation, λ): {update_info}")
+                # Log to wandb
+                _lam_key = {"io": "lambda/io", "l3_cache_usage": "lambda/llc",
+                            "memory_bandwidth": "lambda/membw", "cpu": "lambda/cpu"}
+                _viol_key = {"io": "violation/io", "l3_cache_usage": "violation/llc",
+                             "memory_bandwidth": "violation/membw", "cpu": "violation/cpu"}
+                for i, k in enumerate(order):
+                    self.log(_lam_key[k],  float(lambdas[i]),
+                             prog_bar=False, logger=True, on_epoch=True)
+                    self.log(_viol_key[k], float(viol_arr[i]),
+                             prog_bar=False, logger=True, on_epoch=True)
 
             emd_error_flat = torch.tensor(avg_emd_by_batch, dtype=torch.float32)
             metrics_std_flat = torch.tensor(metrics_std_by_batch, dtype=torch.float32)
@@ -400,6 +581,23 @@ class MimesysTrainer(pl.LightningModule):
             del state_dict[k]
         if ref_keys:
             print(f"[on_load_checkpoint] Stripped {len(ref_keys)} ref_model keys from checkpoint")
+        # Warm-start support: when fine-tuning a NEW architecture (e.g. residual_prev
+        # adds prev_head + gate) from an old checkpoint that lacks those params,
+        # backfill the missing keys from the freshly-initialised current model so the
+        # strict load succeeds and the new params keep their (zero) init.
+        cur = self.state_dict()
+        added = [k for k in cur if k not in state_dict]
+        for k in added:
+            state_dict[k] = cur[k]
+        if added:
+            print(f"[on_load_checkpoint] Backfilled {len(added)} new-param keys "
+                  f"(e.g. {added[:3]}) from current init — warm-start mode")
+            # New architecture ⇒ the saved optimizer/scheduler param groups no longer
+            # match. on_train_start resets the optimizer regardless, so drop them so
+            # Lightning doesn't fail restoring a mismatched optimizer state.
+            checkpoint["optimizer_states"] = []
+            checkpoint["lr_schedulers"] = []
+            print("[on_load_checkpoint] Cleared optimizer/scheduler states (warm-start)")
 
     def on_train_start(self):
         optimizer = self.optimizers()
@@ -476,6 +674,155 @@ class MimesysTrainer(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True, logger=True, on_epoch=True)
         return loss
 
+    # ---------------------------------------------------------------------------
+    # Windowed-DTW RL path
+    # ---------------------------------------------------------------------------
+    def _init_windowed_pool(self):
+        """Build the K-means medoid → W-sec window pool once. Caches on self."""
+        from mimesys.training.windowed_dtw_rl import deploy_windowed_plans  # ensure module loads
+        K = int(self.cfg.train.ddpo.get("windowed_kmean_k", 3000))
+        W = int(self.cfg.train.ddpo.get("window_size", 5))
+        dm = self.trainer.datamodule
+        print(f"[windowed-dtw] building K={K} W={W} pool ...")
+        pool = dm._sample_rl_test_data_kmean_windowed(
+            self.cfg.data.test_data_path, dm.trace_range, K=K, window=W,
+        )
+        self._windowed_pool = pool
+        # METRIC_MAX for DTW normalization (cpu fixed to 100; rest from trace_range)
+        self._windowed_metric_max = {
+            "cpu": 100.0,
+            "io":  float(dm.trace_range["io"][1]),
+            "llc": float(dm.trace_range["l3_cache_usage"][1]),
+            "bw":  float(dm.trace_range["memory_bandwidth"][1]),
+        }
+        print(f"[windowed-dtw] pool size {len(pool)} ; METRIC_MAX={self._windowed_metric_max}")
+
+    def _on_train_epoch_start_windowed(self) -> None:
+        """Windowed-DTW RL epoch driver. Replaces the standard merged_batch path.
+
+        Per epoch:
+          1. Sample N = num_batches_per_episode windowed entries from the pool
+          2. Auto-regressively generate W actions per sample (with K=prev_medoid_n
+             medoid selection at each step)
+          3. Deploy each sample's W-window plan on a cluster host (1 sec/window)
+          4. Compute per-family normalized DTW vs GT 5-sec metric → reward (avg of 4)
+          5. Push to replay_buffer for the standard DDPO training_step downstream
+        """
+        from pathlib import Path
+        import numpy as _np
+        from mimesys.training.windowed_dtw_rl import (
+            rollout_windowed_with_medoid, deploy_windowed_plans, dtw_reward_per_sample,
+        )
+
+        if not hasattr(self, "_windowed_pool"):
+            self._init_windowed_pool()
+
+        self.replay_buffer.clear()
+
+        N = int(self.cfg.train.ddpo.num_batches_per_episode)
+        W = int(self.cfg.train.ddpo.get("window_size", 5))
+        prev_K = int(self.cfg.train.ddpo.get("prev_medoid_n", 32))
+
+        if len(self._windowed_pool) < N:
+            print(f"[windowed-dtw] WARN: pool ({len(self._windowed_pool)}) < N ({N}); replay")
+            indices = _np.random.choice(len(self._windowed_pool), N, replace=True)
+        else:
+            indices = _np.random.choice(len(self._windowed_pool), N, replace=False)
+        sel = [self._windowed_pool[int(i)] for i in indices]
+
+        metric_seq = torch.tensor([s["metric_seq"] for s in sel], dtype=torch.float32, device="cuda")   # (N, W, 23)
+        prev_first = torch.tensor([s["prev_clean_trace"] for s in sel], dtype=torch.float32, device="cuda")  # (N, 23)
+        raw_gt_4d  = _np.array([s["raw_metric_seq_4d"] for s in sel], dtype=_np.float64)               # (N, W, 4)
+        # Per-core CPU GT (W, 20). Only used when per_core_cpu_reward=true and the pool
+        # entries contain `raw_metric_seq_percore` (older cached pools may not).
+        if sel and "raw_metric_seq_percore" in sel[0]:
+            raw_gt_percore = _np.array([s["raw_metric_seq_percore"] for s in sel],
+                                       dtype=_np.float64)                                              # (N, W, 20)
+        else:
+            raw_gt_percore = None
+
+        # ---- (2) auto-regressive rollout
+        chains_per_step, log_probs_per_step, plans_raw = rollout_windowed_with_medoid(
+            self.trainer_model, metric_seq, prev_first, window=W, prev_medoid_n=prev_K
+        )
+        plans_raw_np = plans_raw.cpu().numpy()                                                          # (N, W, S, T_a)
+
+        # ---- (3) deploy each N-window plan on the cluster
+        out_dir = Path(self.cfg.train.callbacks.checkpoint.dirpath) / "training" / f"step_{self.global_step}_windowed"
+        iters_per_window = int(self.cfg.train.ddpo.get("mimesys_iters_per_window", 1))
+        # Use the data.test_machines list (from the hydra override) explicitly so the
+        # deploy doesn't silently fall back to worker_scripts/config.HOSTNAMES, which
+        # may point at a different cluster than what training intends.
+        measured = deploy_windowed_plans(plans_raw_np, out_dir, window_size=W,
+                                         hosts=list(self.test_machines),
+                                         iters_per_window=iters_per_window)
+
+        # ---- (4) DTW reward per sample
+        # Pick up per-family weights and the optional per-core CPU term.
+        use_percore = bool(self.cfg.train.ddpo.get("per_core_cpu_reward", False))
+        reward_weights = {
+            "cpu":          float(self.cfg.train.ddpo.get("cpu_reward_weight",   1.0)),
+            "io":           float(self.cfg.train.ddpo.get("io_reward_weight",    1.0)),
+            "llc":          float(self.cfg.train.ddpo.get("llc_reward_weight",   1.0)),
+            "bw":           float(self.cfg.train.ddpo.get("membw_reward_weight", 1.0)),
+            "per_core_cpu": float(self.cfg.train.ddpo.get("per_core_cpu_reward_weight", 1.0)),
+        }
+        distance = str(self.cfg.train.ddpo.get("windowed_dtw_distance", "l1"))
+        rewards_list, dtw_diag = [], []
+        for i in range(N):
+            if measured[i] is None:
+                rewards_list.append(0.0)
+                dtw_diag.append(None)
+                continue
+            gt_pc_i = (raw_gt_percore[i] if use_percore and raw_gt_percore is not None
+                       else None)
+            d = dtw_reward_per_sample(measured[i], raw_gt_4d[i],
+                                       self._windowed_metric_max, window_size=W,
+                                       gt_percore=gt_pc_i, weights=reward_weights,
+                                       distance=distance)
+            rewards_list.append(-float(d["mean_dtw"]))     # minimize DTW → negative reward
+            dtw_diag.append(d)
+        rewards = torch.tensor(rewards_list, dtype=torch.float32, device="cuda")
+
+        # Logging summary
+        ok = [d for d in dtw_diag if d is not None]
+        if ok:
+            log_keys = ["cpu_dtw", "io_dtw", "llc_dtw", "bw_dtw", "mean_dtw"]
+            if use_percore:
+                log_keys.append("per_core_cpu_dtw")
+            for k in log_keys:
+                vals = [d[k] for d in ok if not np.isnan(d.get(k, float("nan")))]
+                if not vals: continue
+                v = float(np.mean(vals))
+                self.log(f"win_dtw/{k.replace('_dtw','')}", v, prog_bar=(k=='mean_dtw'),
+                         logger=True, on_epoch=True)
+        self.log("win_dtw/n_ok", float(len(ok)), prog_bar=False, logger=True, on_epoch=True)
+
+        # ---- (5) push to replay buffer (per window step, per diffusion step)
+        T_diff = chains_per_step[0].shape[0] - 1   # n_timesteps
+        for i in range(N):
+            for w in range(W):
+                trajectory = chains_per_step[w][:, i]     # (T_diff+1, S, T_a)
+                log_prob   = log_probs_per_step[w][:, i]  # (T_diff,)
+                cond_w     = metric_seq[i, w]              # (23,)
+                # prev_state for this window step (scaled [-1,+1]); first step = idle
+                if w == 0:
+                    prev_state_w = -torch.ones_like(trajectory[0])
+                else:
+                    prev_state_w = chains_per_step[w - 1][-1, i]
+                for t in range(1, T_diff):
+                    self.replay_buffer.add_to_buffer(
+                        state=(trajectory[t + 1], torch.tensor(t), cond_w, prev_state_w),
+                        action=trajectory[t],
+                        reward=rewards[i],
+                        log_probs=log_prob[t],
+                        final_state=trajectory[0],
+                    )
+
+        _mean_dtw_str = f"{float(np.mean([d['mean_dtw'] for d in ok])):.4f}" if ok else "n/a"
+        print(f"[windowed-dtw] step={self.global_step} epoch={self.current_epoch} "
+              f"N={N} W={W} mean_reward={float(rewards.mean()):.4f} mean_dtw={_mean_dtw_str}")
+
     def on_train_epoch_start(self) -> None:
         if not self.cfg.train.use_rl:
             return
@@ -485,6 +832,13 @@ class MimesysTrainer(pl.LightningModule):
                 self.load_trace_predictor_model(self.cfg)
 
         if self.current_epoch % self.cfg.train.ddpo.num_inner_epochs != 0:
+            return
+
+        # Windowed-DTW RL path (each "sample" = W-sec consecutive window from K-means
+        # medoid; rollout 5 actions auto-regressively, deploy as chained plan, reward =
+        # mean per-family normalized DTW vs GT 5-sec metric).
+        if bool(self.cfg.train.ddpo.get("windowed_dtw", False)):
+            self._on_train_epoch_start_windowed()
             return
 
         self.trainer.datamodule.train_dataloader().dataset.shuffle_data(
@@ -499,11 +853,17 @@ class MimesysTrainer(pl.LightningModule):
             if batch_idx >= self.cfg.train.ddpo.num_batches_per_episode - 1:
                 break
 
-        stack_keys = {"clean_trace", "label", "prev_clean_trace"}
-        merged_batch_tensor = {
-            key: (torch.stack(val).squeeze(1).to("cuda") if key in stack_keys else val)
-            for key, val in merged_batch.items()
-        }
+        stack_keys = {"clean_trace", "label", "prev_clean_trace", "prev_label"}
+        # Also concat 1-D per-sample fields (medoid_id, training_data flag) to a flat tensor
+        cat_keys = {"prev_medoid_id", "training_data"}
+        merged_batch_tensor = {}
+        for key, val in merged_batch.items():
+            if key in stack_keys:
+                merged_batch_tensor[key] = torch.stack(val).squeeze(1).to("cuda")
+            elif key in cat_keys:
+                merged_batch_tensor[key] = torch.cat([torch.as_tensor(v) for v in val]).to("cuda")
+            else:
+                merged_batch_tensor[key] = val
 
         rewards = self.sample_and_calculate_rewards(merged_batch_tensor)
         self.compute_advantage()
@@ -638,6 +998,9 @@ def train(cfg: DictConfig):
         rl_high_cpu_fraction=cfg.data.get("rl_high_cpu_fraction", 0.20),
         rl_high_llc_fraction=cfg.data.get("rl_high_llc_fraction", 0.20),
         rl_high_bw_fraction=cfg.data.get("rl_high_bw_fraction", 0.20),
+        rl_sample_method=cfg.data.get("rl_sample_method", "kmean"),
+        rl_kmean_k=cfg.data.get("rl_kmean_k", 3000),
+        rl_use_high_resource_supplements=cfg.data.get("rl_use_high_resource_supplements", False),
     )
 
     cfg.data.trace_range = {

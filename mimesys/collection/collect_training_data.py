@@ -52,7 +52,18 @@ sys.path.insert(0, REPO_ROOT)
 _WORKER_SCRIPTS_DIR = os.path.join(REPO_ROOT, "worker_scripts")
 if _WORKER_SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _WORKER_SCRIPTS_DIR)
-import config as worker_config
+# Env-var override: MIMESYS_WORKER_CONFIG_PATH lets you point at any config
+# file (including one with a space in its name like "config copy.py"). Falls
+# back to the regular `import config` from worker_scripts/.
+_worker_cfg_path = os.environ.get("MIMESYS_WORKER_CONFIG_PATH")
+if _worker_cfg_path:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("worker_config", _worker_cfg_path)
+    worker_config = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(worker_config)
+    print(f"[collect] worker_config loaded from {_worker_cfg_path}")
+else:
+    import config as worker_config
 
 OUTPUT_PATH = os.path.expanduser(
     os.environ.get("MIMESYS_OUTPUT_PATH",
@@ -65,12 +76,71 @@ MY_HOSTNAME        = worker_config.MY_HOSTNAME
 
 NUM_ACTIONS    = 13
 NUM_THREADS    = 20
-BATCH_SIZE     = worker_config.PER_MACHINE_BATCH * len(PROFILING_MACHINES)   # active-learning round size
+BATCH_SIZE     = int(os.environ.get("MIMESYS_BATCH_SIZE",
+                     worker_config.PER_MACHINE_BATCH * len(PROFILING_MACHINES)))   # active-learning round size (env-overridable)
+# Per active round, for each none-current curr we also collect K prev-variants
+# [prev, curr]. Prevs are drawn PER-CURR at random from an FPS shortlist of
+# ~K*PREV_SHORTLIST_MULT none-current pool actions (the shortlist spans the metric
+# space → high LLC / mem-BW prevs stay represented). 0 disables variants. See
+# build_prev_variants.
+K_PREV_VARIANTS = int(os.environ.get("MIMESYS_PREV_VARIANTS", "2"))
+PREV_SHORTLIST_MULT = int(os.environ.get("MIMESYS_PREV_SHORTLIST_MULT", "10"))
+# Strategy (a): concentrate prevs in the high-LLC regime (carry-over is strongest
+# there; low-LLC prevs only add noise) and emit each (prev,curr) as N independent
+# replicate plans so the carry-over Δ beats the per-plan measurement noise.
+PREV_N_REP = int(os.environ.get("MIMESYS_PREV_N_REP", "3"))
+PREV_HIGH_LLC_FRAC = float(os.environ.get("MIMESYS_PREV_HIGH_LLC_FRAC", "0.5"))  # top fraction of pool by LLC
+# Selection mode for prev_action candidate filter:
+#   "llc"           — top PREV_HIGH_LLC_FRAC of pool by LLC only (legacy default)
+#   "high_resource" — union of top frac by LLC, BW, and IO + random sample
+#                     (mixes all carry-over types; IO carry-over is the largest
+#                      effect for the new HddRead/HddWriteNF stressors)
+PREV_FILTER_MODE = os.environ.get("MIMESYS_PREV_FILTER_MODE", "llc")
+PREV_RANDOM_FRAC = float(os.environ.get("MIMESYS_PREV_RANDOM_FRAC", "0.15"))   # fraction of pool to add as random
 # 24 = 20 per-core CPU% + 1 avg_cpu_utilizations_total + 1 io + 1 l3_cache_usage + 1 memory_bandwidth
 NUM_METRICS    = 24
 
-# 3:7:0 ratio parameters (30% hull, 70% fps, no IO mutation)
-HULL_FPS_RATIO = 3/7     # hull:fps split inside hull_mixed_fps_hybrid (3/7 → 30/70)
+# 5:5 ratio — equal stratified split between hull-cell-fill and fps-novelty.
+# The hull_fps_ratio passed into propose_by_hull_mixed_fps_hybrid both (a) sizes
+# the two source pools (target |hull_pool|/|fps_pool|) AND (b) sets the
+# stratified-sampling target for the final n_candidates draw (50% from each
+# pool when ratio=1.0). Previously 3/7 caused the merged-pool random sample
+# to skew ~30% hull / 70% fps regardless of intent.
+HULL_FPS_RATIO = 1.0
+
+# ── prev=None convention ────────────────────────────────────────────────────
+# This script collects NONE-CURRENT data: every plan is [NONE_PREV, curr]. The
+# "None" prev is a near-idle placeholder (1 thread, tiny weight) — it keeps each
+# plan 2-window so the metric slot layout (prev/curr/noop, curr=slot 1) is
+# unchanged, while contributing ~zero resource footprint (≈ "no prior action").
+# Paired collection (collect_paired_prev_data.py) reuses these helpers and
+# swaps NONE_PREV for a real prev sampled from the none-current pool.
+# "No previous action" = an all-zero prev window. write_actions drops all-zero
+# windows, so a [NONE_PREV, curr] action is written to the H5 as curr-only (one
+# window, ≈ a third less profiling time). load_round / the dataloader reconstruct
+# the 2-window [NONE_PREV, curr] action and a zero prev metric slot at read time.
+NONE_PREV = [[0.0] * NUM_ACTIONS for _ in range(NUM_THREADS)]
+
+def _action_depth(action):
+    """Nesting depth: 3 ⇒ 2-window [win][thread][stressor]; 2 ⇒ 1-window [thread][stressor]."""
+    d = 0; x = action
+    while isinstance(x, (list, tuple)) and len(x) > 0:
+        d += 1; x = x[0]
+    return d
+
+def curr_window(action):
+    """Return the current-action window (NUM_THREADS, NUM_ACTIONS) from an action
+    that is either 1-window (depth 2) or 2-window [prev, curr] (depth 3)."""
+    return action[-1] if _action_depth(action) == 3 else action
+
+def as_none_current(action):
+    """Force prev=None: return [NONE_PREV, curr] (always 2-window)."""
+    return [NONE_PREV, curr_window(action)]
+
+def ensure_two_window(action):
+    """Append NONE_PREV in front if the action is single-window, so 1- and 2-stage
+    collections always share the same (2-window) action dimension."""
+    return action if _action_depth(action) == 3 else [NONE_PREV, action]
 
 
 def sample_scaling_weight():
@@ -79,12 +149,28 @@ def sample_scaling_weight():
     return np.random.choice(weights, p=probabilities)
 
 def propose_candidates_by_random(timestamp=2, num_actions=13, num_threads=20, n_candidates=1000):
+    """Random candidates.
+
+    Two modes selectable via env var ``MIMESYS_DENSE_PROPOSALS`` (Tier 3.6):
+      "0" (default)  — original behavior: zeros 1..N-1 random thread rows
+                       and N/2..N-1 random stressor columns per thread.
+      "1"            — dense mode: zeros at most N/4 thread rows (so most
+                       threads stay active) and N/4..N/2 stressor columns
+                       per thread (denser per-thread stressor mix). Designed
+                       to match the all-cores-busy test distribution.
+    """
     candidates = []
     action_shape = (timestamp, num_threads, num_actions)
+    _dense_mode = os.environ.get("MIMESYS_DENSE_PROPOSALS", "0") == "1"
 
     def zero_out_random_rows(mutated):
-        max_rows_to_zero = max(1, len(mutated) - 1)
-        num_rows_to_zero = random.randint(1, max_rows_to_zero)
+        if _dense_mode:
+            max_rows_to_zero = max(0, len(mutated) // 4)        # 0..N/4 ≈ 0..5 of 20
+        else:
+            max_rows_to_zero = max(1, len(mutated) - 1)         # 1..N-1 ≈ 1..19 of 20
+        num_rows_to_zero = random.randint(0 if _dense_mode else 1, max_rows_to_zero)
+        if num_rows_to_zero == 0:
+            return mutated
         rows_to_zero = random.sample(range(len(mutated)), num_rows_to_zero)
         for row_idx in rows_to_zero:
             mutated[row_idx] = [0.0] * len(mutated[row_idx])
@@ -95,7 +181,13 @@ def propose_candidates_by_random(timestamp=2, num_actions=13, num_threads=20, n_
         for _ in range(action_shape[0]):
             thread = []
             for _ in range(action_shape[1]):
-                num_cols_to_zero = random.randint(action_shape[2] // 2, action_shape[2] - 1)
+                if _dense_mode:
+                    # Zero out 3..6 of 13 stressors per thread → 7..10 active stressors.
+                    num_cols_to_zero = random.randint(action_shape[2] // 4,
+                                                       action_shape[2] // 2)
+                else:
+                    num_cols_to_zero = random.randint(action_shape[2] // 2,
+                                                       action_shape[2] - 1)
                 action = [random.uniform(0.0, 1.0) for _ in range(action_shape[2])]
                 for _ in range(num_cols_to_zero):
                     zero_idx = random.randint(0, action_shape[2] - 1)
@@ -107,6 +199,112 @@ def propose_candidates_by_random(timestamp=2, num_actions=13, num_threads=20, n_
                 thread.append(action)
             thread = zero_out_random_rows(thread)
             candidate.append(thread)
+        candidates.append(candidate)
+
+    return candidates
+
+
+def propose_candidates_by_dense_seeds(timestamp=2, num_actions=13,
+                                       num_threads=20, n_candidates=1000):
+    """Dense-seed proposals mirroring the OLD surrogate_based_search.py
+    ``initial_candidates``: every thread is active (no idle threads, no scaling
+    < 1.0). Each candidate is built by:
+
+      1. Pick 1, 2, or 3 stressor indices uniformly at random.
+      2. Allocate Dirichlet(1) weights over those stressors that sum to 1.0
+         (so each thread's stressor weights sum exactly to 1.0).
+      3. Replicate this single thread-vector across ALL `num_threads`, then
+         shuffle the thread order (purely cosmetic — the model is exposed to
+         both ordered and shuffled forms via permutation augmentation).
+
+    Produces seeds with 20 active threads at full intensity per thread —
+    matches the per-core CPU distribution of the test traces (mean ~42% on
+    c220g5 instead of 22% for the standard random/hull proposals).
+    """
+    candidates = []
+    for _ in range(n_candidates):
+        candidate = []
+        for _ in range(timestamp):
+            # Choose 1-3 dominant stressors; full-weight Dirichlet.
+            n_dom   = random.choice([1, 1, 2, 3])
+            dom_idx = random.sample(range(num_actions), n_dom)
+            dirichlet_w = np.random.dirichlet(np.ones(n_dom))
+            base_thread = [0.0] * num_actions
+            for w, idx in zip(dirichlet_w, dom_idx):
+                base_thread[idx] = float(w)
+            # Replicate base thread across all 20 cores; small per-thread
+            # noise on the weight so we don't produce literally identical rows.
+            threads = []
+            for _ in range(num_threads):
+                noisy = [v * float(np.random.uniform(0.9, 1.0)) for v in base_thread]
+                # Renormalize so thread sum stays in [0, 1].
+                s = sum(noisy)
+                if s > 1.0:
+                    noisy = [v / s for v in noisy]
+                threads.append(noisy)
+            random.shuffle(threads)
+            candidate.append(threads)
+        candidates.append(candidate)
+    return candidates
+
+
+def propose_candidates_by_thread_sparsity(timestamp=2, num_actions=13,
+                                           num_threads=20, n_candidates=1000):
+    """Structured thread-sparse candidates: K threads at high utilization, rest idle.
+
+    Fills the gap where the existing random/composite/hull-FPS proposals tend to
+    spread activity across all threads.  Each candidate picks:
+      - K  ∈ {1, 2, 3, 4, 5, 6, 7, 8, 10, 12}  (biased toward small K)
+      - layout ∈ {first_K, last_K, random_K, socket0_K, socket1_K}
+      - per active thread: 1–2 dominant stressors at high scale (~0.9–1.0)
+      - all inactive threads forced to 0.
+
+    Returns the same nested-list shape as ``propose_candidates_by_random``:
+    list[n_candidates] of list[timestamp][num_threads][num_actions].
+    """
+    K_choices = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12]
+    K_probs   = [0.10, 0.15, 0.15, 0.15, 0.10, 0.10, 0.08, 0.07, 0.05, 0.05]
+    layouts   = ["first_K", "last_K", "random_K", "socket0_K", "socket1_K"]
+    half      = num_threads // 2
+
+    def gen_active_thread():
+        # 1-2 dominant stressors, weights summing to 1, scaled by 0.9-1.0.
+        n_dom   = random.choice([1, 1, 2])    # bias single-stressor cores
+        dom_idx = random.sample(range(num_actions), n_dom)
+        action  = [0.0] * num_actions
+        dirichlet_w = np.random.dirichlet(np.ones(n_dom))
+        scale = sample_scaling_weight() / 100.0    # 0.9 / 0.95 / 1.0
+        for w, idx in zip(dirichlet_w, dom_idx):
+            action[idx] = float(w) * scale
+        return action
+
+    candidates = []
+    for _ in range(n_candidates):
+        candidate = []
+        for _ in range(timestamp):
+            K      = int(np.random.choice(K_choices, p=K_probs))
+            layout = random.choice(layouts)
+            if layout == "first_K":
+                active = list(range(K))
+            elif layout == "last_K":
+                active = list(range(num_threads - K, num_threads))
+            elif layout == "random_K":
+                active = random.sample(range(num_threads), K)
+            elif layout == "socket0_K":
+                K_eff  = min(K, half)
+                active = random.sample(range(0, half), K_eff)
+            else:  # socket1_K
+                K_eff  = min(K, half)
+                active = random.sample(range(half, num_threads), K_eff)
+            active_set = set(active)
+
+            threads = []
+            for t in range(num_threads):
+                if t in active_set:
+                    threads.append(gen_active_thread())
+                else:
+                    threads.append([0.0] * num_actions)
+            candidate.append(threads)
         candidates.append(candidate)
 
     return candidates
@@ -265,8 +463,26 @@ def propose_candidates_by_pool_mutation(A, n_candidates=1000, noise_std=0.03):
             return result
         return _apply_to_curr(a_arrs, op)
 
+    # ── operator 7: socket remove — zero out ALL 10 threads on one socket ───
+    # Produces extreme S0:S1 asymmetry (one socket idle, the other working).
+    # Useful for sampling the per-socket CPU corners (cpu-s0=0 × cpu-s1=high,
+    # and vice versa) that other operators tend to miss.
+    def _socket_remove(a_arrs):
+        def op(curr):
+            n_th  = curr.shape[0]
+            split = n_th // 2
+            result = curr.copy()
+            # Pick which socket to zero (0 = S0, 1 = S1)
+            zero_socket = random.randint(0, 1)
+            if zero_socket == 0:
+                result[0:split] = 0.0
+            else:
+                result[split:n_th] = 0.0
+            return result
+        return _apply_to_curr(a_arrs, op)
+
     operators = ["thread_swap", "stressor_crossover", "blend", "scale_noise",
-                 "socket_crossover", "socket_scale"]
+                 "socket_crossover", "socket_scale", "socket_remove"]
     candidates = []
 
     for _ in range(n_candidates):
@@ -289,6 +505,8 @@ def propose_candidates_by_pool_mutation(A, n_candidates=1000, noise_std=0.03):
                 result_arrs = _socket_crossover(a1, a2)
             elif op == "socket_scale":
                 result_arrs = _socket_scale(a1)
+            elif op == "socket_remove":
+                result_arrs = _socket_remove(a1)
             else:  # scale_noise
                 result_arrs = _scale_noise(a1)
 
@@ -320,6 +538,97 @@ _KEY_METRIC_INDICES = [
         NUM_METRICS * 2 - 2,
         NUM_METRICS * 2 - 1
     ]
+
+
+# ---------------------------------------------------------------------------
+# prev-action variant sampling (paired curr × prev data, collected inline)
+# ---------------------------------------------------------------------------
+
+def _fps_indices(X, k):
+    """Farthest-point sampling: k row indices of X spread across the normalized
+    metric space (maximin → reaches the extremes, e.g. high LLC / mem-BW)."""
+    X = np.asarray(X, dtype=float)
+    n = len(X)
+    if n <= k:
+        return list(range(n))
+    mn, mx = X.min(0), X.max(0)
+    rng = np.where(mx - mn > 0, mx - mn, 1.0)
+    Xn = (X - mn) / rng
+    chosen = [int(np.argmax(np.linalg.norm(Xn - Xn.mean(0), axis=1)))]  # farthest from centroid
+    for _ in range(k - 1):
+        d = np.min([np.linalg.norm(Xn - Xn[c], axis=1) for c in chosen], axis=0)
+        chosen.append(int(np.argmax(d)))
+    return chosen
+
+
+def _prev_is_zero(action):
+    """True if a (2-window) action's prev window is all-zero — i.e. a none-current
+    sample. After load_round, none-current plans carry prev=NONE_PREV(=0); real
+    prev-variants carry a nonzero prev window."""
+    return len(action) >= 2 and all(all(v == 0.0 for v in row) for row in action[0])
+
+
+def _curr_is_empty(action, eps=1e-6):
+    """True if the curr (last) window has effectively no work (total weight ≤ eps).
+    Such a candidate would profile an idle plan (and, with NONE_PREV=0, used to write
+    an empty H5). Filtered at proposal time so we never waste a plan on a no-op."""
+    return sum(v for row in curr_window(action) for v in row) <= eps
+
+
+def build_prev_variants(currs, A_pool, M_pool, k=K_PREV_VARIANTS,
+                        shortlist_mult=PREV_SHORTLIST_MULT, n_rep=PREV_N_REP,
+                        high_llc_frac=PREV_HIGH_LLC_FRAC, seed=0):
+    """For each curr action, build variant plans [prev, curr] (strategy a):
+      1. restrict prev candidates to the top `high_llc_frac` of the pool by LLC —
+         carry-over is strongest there; low-LLC prevs only add noise;
+      2. FPS a diverse shortlist (~k*shortlist_mult) within that high-LLC subset;
+      3. draw k prevs at random per curr (per-sample variety);
+      4. emit each (prev, curr) as `n_rep` INDEPENDENT replicate plans so the
+         carry-over Δ can be medianed across plans, beating per-plan noise.
+    The pool is none-current only → no prev-prev contamination. Returns
+    (variants, shortlist_footprints); ([], []) if pool empty or k<=0."""
+    if k <= 0 or A_pool is None or len(A_pool) == 0 or M_pool is None or len(M_pool) == 0:
+        return [], []
+    M_pool_np = np.asarray(M_pool)
+    if PREV_FILTER_MODE == "high_resource":
+        # Take top `high_llc_frac` of pool by EACH of LLC, BW, IO; union them;
+        # then add a random sample of size `PREV_RANDOM_FRAC × len(pool)`.
+        # _KEY_METRIC_INDICES = [CPU_total, IO, LLC, BW] for curr-group metrics.
+        io_col, llc_col, bw_col = _KEY_METRIC_INDICES[1], _KEY_METRIC_INDICES[2], _KEY_METRIC_INDICES[3]
+        keep = max(k, int(np.ceil(len(M_pool_np) * high_llc_frac)))
+        top_llc = set(np.argsort(M_pool_np[:, llc_col])[-keep:].tolist())
+        top_bw  = set(np.argsort(M_pool_np[:, bw_col])[-keep:].tolist())
+        top_io  = set(np.argsort(M_pool_np[:, io_col])[-keep:].tolist())
+        n_rand  = max(0, int(np.ceil(len(M_pool_np) * PREV_RANDOM_FRAC)))
+        rand_idx = random.Random(seed + 7).sample(range(len(M_pool_np)),
+                                                  min(n_rand, len(M_pool_np)))
+        hi_idx = np.array(sorted(top_llc | top_bw | top_io | set(rand_idx)), dtype=int)
+    else:
+        # Legacy "llc" mode: top fraction by LLC only.
+        llc = M_pool_np[:, _KEY_METRIC_INDICES[2]]
+        keep = max(k, int(np.ceil(len(llc) * high_llc_frac)))
+        hi_idx = np.argsort(llc)[-keep:]
+    # 2. diverse FPS shortlist within the high-LLC subset.
+    n_short = min(len(hi_idx), max(k, k * shortlist_mult))
+    short_local = _fps_indices(M_pool[hi_idx][:, _KEY_METRIC_INDICES], n_short)
+    short_idxs = [int(hi_idx[i]) for i in short_local]
+    rng = random.Random(seed)
+    variants = []
+    for c in currs:
+        cw = curr_window(c)
+        for i in rng.sample(short_idxs, min(k, len(short_idxs))):   # 3. per-curr random subset
+            for _ in range(n_rep):                                   # 4. N replicate plans
+                variants.append([curr_window(A_pool[i]), cw])
+    foot = [[round(float(M_pool[i, j]), 1) for j in _KEY_METRIC_INDICES] for i in short_idxs]
+    return variants, foot
+
+
+def _split_none_current(pairs):
+    """Partition load_round pairs into (none_current, prev_variant) by prev window."""
+    valid = [p for p in pairs if p is not None]
+    none_cur = [p for p in valid if _prev_is_zero(p[0])]
+    variant  = [p for p in valid if not _prev_is_zero(p[0])]
+    return none_cur, variant
 
 
 def _flatten_action_for_knn(a):
@@ -450,24 +759,21 @@ def propose_by_hull_mixed_fps_hybrid(A, M, n_candidates, grid_bins=10, k_neighbo
     per_core_curr = M[:, G1_CPU_LO:G1_CPU_HI].astype(float)
     cpu_s0 = per_core_curr[:, :10].mean(axis=1, keepdims=True)
     cpu_s1 = per_core_curr[:, 10:].mean(axis=1, keepdims=True)
-    # Per-core shape features: encourage workloads that put cores in the
-    # mid-range (20..80%) rather than the bimodal 0/100 tails.
-    cpu_std      = per_core_curr.std(axis=1, keepdims=True)
-    cpu_mid_frac = ((per_core_curr >= 20.0) & (per_core_curr <= 80.0)) \
-                     .mean(axis=1, keepdims=True) * 100.0
-    M_key = np.hstack([M_key4, cpu_s0, cpu_s1, cpu_std, cpu_mid_frac])  # (N, 8)
+    M_key = np.hstack([M_key4, cpu_s0, cpu_s1])  # (N, 8)
 
     # ── 1. Build hull pool ────────────────────────────────────────────────────
     # Index legend: 0=CPU%, 1=IO, 2=LLC, 3=BW, 4=CPU-S0, 5=CPU-S1,
-    #               6=CPU-STD, 7=CPU-MID-FRAC.
+    #
+    # Previous v5 GROUPS had 4/7 dimensions involving IO (over-weighted vs
+    # LLC/BW). Rebalanced for v6: 2/9 involve IO (one 3-D, one 2-D), 5/9 emphasize
+    # CPU×LLC, CPU×BW, LLC×BW for better diversity in those metrics, plus 1 socket
+    # asymmetry and 1 CPU-shape dim.
     GROUPS = [
-        (0, 2, 3),    # CPU% × LLC × BW   (compute-heavy hull)
-        (1, 2, 3),    # IO   × LLC × BW   (io-heavy hull)
-        (0, 1, 2),    # CPU% × IO  × LLC
-        (0, 1, 3),    # CPU% × IO  × BW
-        (0, 1),       # CPU% × IO
-        (2, 3),       # LLC  × BW         (cache vs memory traffic)
-        (4, 5),       # cpu-s0 vs cpu-s1  (socket CPU asymmetry)
+        # (0, 2, 3),    # CPU% × LLC × BW   (compute-heavy hull)
+        # (1, 2, 3),    # IO   × LLC × BW   (single io-heavy 3-D)
+        # (0, 1),       # CPU% × IO         (more CPU×IO diversity)
+        # (4, 5),       # cpu-s0 vs cpu-s1  (socket CPU asymmetry)
+        (1, 2, 3, 4, 5)
     ]
 
     n_str   = len(A[0][0][0])
@@ -480,20 +786,84 @@ def propose_by_hull_mixed_fps_hybrid(A, M, n_candidates, grid_bins=10, k_neighbo
         rng = np.where(mx - mn > 0, mx - mn, 1.0)
         M_norm = (M_sub - mn) / rng
 
-        try:
-            tri = Delaunay(M_norm)
-        except Exception:
-            print(f"  [hull_fps_hybrid] dims={dims}: Delaunay failed, skipping")
-            continue
+        # When MIMESYS_BBOX_HULL=1, ignore the data-convex-hull and use the full
+        # [0, max] bounding box (in normalized space, [0, 1]) instead. This lets
+        # us sample EMPTY corners — combinations of high metrics never observed
+        # together — by elementwise-mixing the per-axis champion actions.
+        use_bbox = os.environ.get("MIMESYS_BBOX_HULL", "0") == "1"
+
+        # MIMESYS_FAST_HULL=1 skips Delaunay (exponential in d) and approximates
+        # inside/outside using nearest-data-point distance. Threshold = 1.5 cell
+        # widths in normalized space → a cell is "outside" if no data point sits
+        # within ~1.5 cells of it.
+        fast_hull = os.environ.get("MIMESYS_FAST_HULL", "0") == "1"
+        tri = None
+        tri_ok = False
+        if not fast_hull:
+            try:
+                tri = Delaunay(M_norm)
+                tri_ok = True
+            except Exception:
+                if not use_bbox:
+                    print(f"  [hull_fps_hybrid] dims={dims}: Delaunay failed, skipping")
+                    continue
 
         g = np.linspace(0.5 / grid_bins, 1.0 - 0.5 / grid_bins, grid_bins)
         grids = np.meshgrid(*[g] * d, indexing='ij')
         centres = np.stack([gg.ravel() for gg in grids], axis=1)
 
-        inside_mask = tri.find_simplex(centres) >= 0
-        inside_centres = centres[inside_mask]
-        if len(inside_centres) == 0:
-            continue
+        # Pre-compute per-centre nearest-data distance (used by fast_hull, and
+        # for cheap reuse by both inside/outside classification and priority).
+        if fast_hull:
+            nn_thresh = 1.5 / grid_bins
+            # Chunked nearest-data distance — avoid OOM for grid_bins^d × N matrix.
+            n_centres = len(centres)
+            nn_dist = np.empty(n_centres, dtype=np.float32)
+            chunk = max(1, min(8192, n_centres))
+            for i0 in range(0, n_centres, chunk):
+                blk = centres[i0:i0 + chunk]                              # (B, d)
+                cd  = np.linalg.norm(blk[:, None, :] - M_norm[None, :, :], axis=2)
+                nn_dist[i0:i0 + chunk] = cd.min(axis=1)
+            centre_outside = nn_dist > nn_thresh
+        else:
+            nn_dist = None
+            centre_outside = None
+
+        if use_bbox:
+            inside_centres = centres   # use ALL bbox cells (no hull filter)
+            inside_outside = centre_outside if fast_hull else None
+        elif fast_hull:
+            inside_mask = ~centre_outside
+            inside_centres = centres[inside_mask]
+            inside_outside = np.zeros(len(inside_centres), dtype=bool)
+            if len(inside_centres) == 0:
+                continue
+        else:
+            inside_mask = tri.find_simplex(centres) >= 0
+            inside_centres = centres[inside_mask]
+            inside_outside = None
+            if len(inside_centres) == 0:
+                continue
+
+        # When MIMESYS_BBOX_HULL_EMPTY_ONLY=1, restrict candidates to cells that
+        # are empty (no existing pool sample). This concentrates the candidate
+        # budget on true exploration regions rather than re-blending around
+        # already-covered cells.
+        empty_only = os.environ.get("MIMESYS_BBOX_HULL_EMPTY_ONLY", "0") == "1"
+        if empty_only and len(inside_centres) > 0:
+            def _cell_of_pt(c):
+                return tuple(np.clip((c * grid_bins).astype(int), 0, grid_bins - 1).tolist())
+            from collections import Counter as _Counter
+            _pre_counts = _Counter(map(tuple,
+                np.clip((M_norm * grid_bins).astype(int), 0, grid_bins - 1).tolist()))
+            keep_idx = [i for i, c in enumerate(inside_centres)
+                        if _pre_counts.get(_cell_of_pt(c), 0) == 0]
+            inside_centres = inside_centres[keep_idx] if len(keep_idx) else np.empty((0, d))
+            if inside_outside is not None and len(inside_outside) > 0:
+                inside_outside = inside_outside[keep_idx]
+            if len(inside_centres) == 0:
+                print(f"  [hull_fps_hybrid] dims={dims}: no empty cells (all covered), skipping")
+                continue
 
         def cell_of(pts):
             return np.clip((pts * grid_bins).astype(int), 0, grid_bins - 1)
@@ -506,38 +876,77 @@ def propose_by_hull_mixed_fps_hybrid(A, M, n_candidates, grid_bins=10, k_neighbo
             dist = float(np.linalg.norm(M_norm - c, axis=1).min())
             return (cnt, -dist)
 
-        sorted_centres = inside_centres[
-            sorted(range(len(inside_centres)), key=lambda k: priority(inside_centres[k]))
-        ]
+        order = sorted(range(len(inside_centres)),
+                       key=lambda k: priority(inside_centres[k]))
+        sorted_centres = inside_centres[order]
+        sorted_outside = (inside_outside[order]
+                          if inside_outside is not None and len(inside_outside) > 0
+                          else None)
 
+        # For BBOX mode, pre-compute per-axis champions of this subset of dims.
+        # When the target cell sits OUTSIDE the data hull, build the candidate by
+        # ELEMENTWISE MAX of the axis champions (each axis weighted by its target
+        # value in the cell) — this combines the stressors that drive each
+        # metric's max, attempting to reach corners.
+        if use_bbox:
+            axis_champ_actions = [A[int(np.argmax(M_norm[:, di]))] for di in range(d)]
         before = len(hull_pool)
-        for pt in sorted_centres:
-            dists  = np.linalg.norm(M_norm - pt, axis=1)
-            nn_idx = np.argsort(dists)[:k_neighbors]
-            w      = 1.0 / (dists[nn_idx] + 1e-8); w /= w.sum()
+        for ci, pt in enumerate(sorted_centres):
+            outside = False
+            if use_bbox:
+                if fast_hull and sorted_outside is not None:
+                    outside = bool(sorted_outside[ci])
+                elif tri_ok:
+                    outside = (tri.find_simplex(pt[None])[0] < 0)
+                else:
+                    outside = True
 
-            neighbor_A = [A[i] for i in nn_idx]
-            max_ts = max(len(a) for a in neighbor_A)
-            max_th = max(len(ts) for a in neighbor_A for ts in a)
-
-            result = []
-            for ti in range(max_ts):
+            if use_bbox and outside:
+                # Elementwise-max blend of axis champions, weighted by the target
+                # value of the cell in each axis (target ∈ [0,1] in M_norm space).
+                a_arrs = [np.asarray(a[-1]) for a in axis_champ_actions]  # curr only
+                max_th = max(arr.shape[0] for arr in a_arrs)
+                target_w = np.clip(pt, 0.0, 1.0)
+                target_w = target_w / max(target_w.sum(), 1e-6)   # normalize to weights
                 ts_out = []
                 for th in range(max_th):
                     sv = np.zeros(n_str)
-                    for a, wi in zip(neighbor_A, w):
-                        if ti < len(a) and th < len(a[ti]):
-                            sv += wi * np.array(a[ti][th])
+                    for di, arr in enumerate(a_arrs):
+                        if th < arr.shape[0]:
+                            row = arr[th] * (0.5 + target_w[di])  # weighted scale
+                            sv = np.maximum(sv, row)
                     s = sv.sum()
                     if s > 1.0: sv /= s
                     ts_out.append(sv.tolist())
-                result.append(ts_out)
+                result = [ts_out]   # curr-only (1 window) plan
+            else:
+                # Standard k-NN weighted blend
+                dists  = np.linalg.norm(M_norm - pt, axis=1)
+                nn_idx = np.argsort(dists)[:k_neighbors]
+                w      = 1.0 / (dists[nn_idx] + 1e-8); w /= w.sum()
+                neighbor_A = [A[i] for i in nn_idx]
+                max_ts = max(len(a) for a in neighbor_A)
+                max_th = max(len(ts) for a in neighbor_A for ts in a)
+                result = []
+                for ti in range(max_ts):
+                    ts_out = []
+                    for th in range(max_th):
+                        sv = np.zeros(n_str)
+                        for a, wi in zip(neighbor_A, w):
+                            if ti < len(a) and th < len(a[ti]):
+                                sv += wi * np.array(a[ti][th])
+                        s = sv.sum()
+                        if s > 1.0: sv /= s
+                        ts_out.append(sv.tolist())
+                    result.append(ts_out)
             hull_pool.append(result)
 
         n_empty = sum(1 for c in inside_centres
                       if cell_counts.get(tuple(cell_of(c[None])[0].tolist()), 0) == 0)
-        print(f"  [hull_fps_hybrid] dims={dims}: {len(inside_centres)} cells "
-              f"({n_empty} empty) → +{len(hull_pool) - before} candidates")
+        n_out = (int(sorted_outside.sum()) if sorted_outside is not None else 0)
+        tag = "fast" if fast_hull else ("delaunay" if tri_ok else "no-tri")
+        print(f"  [hull_fps_hybrid] dims={dims} [{tag}]: {len(inside_centres)} cells "
+              f"({n_empty} empty, {n_out} outside) → +{len(hull_pool) - before} candidates")
 
     N = len(hull_pool)
     fps_n = max(1, int(N // hull_fps_ratio))
@@ -653,22 +1062,50 @@ def propose_by_hull_mixed_fps_hybrid(A, M, n_candidates, grid_bins=10, k_neighbo
         print(f"  [hull_fps_hybrid] fps novelty pool size={len(fps_pool)} "
               f"(from {len(candidates)} candidates)  total propose: {_time.perf_counter()-t0:.1f}s")
 
-    # ── 3. Merge and randomly sample ─────────────────────────────────────────
-    combined = hull_pool + fps_pool
-    print(f"  [hull_fps_hybrid] combined pool={len(combined)} → random sample {n_candidates}")
-
-    if not combined:
+    # ── 3. Stratified sample: hull_fps_ratio sets the split ─────────────────
+    # ratio = |hull_sample| / |fps_sample|.  e.g. 1.0 → 50/50 (5:5).
+    # If either pool is short, the deficit spills to the other pool so we
+    # always return n_candidates total when at least one is non-empty.
+    total_pool = len(hull_pool) + len(fps_pool)
+    if total_pool == 0:
         print("  [hull_fps_hybrid] empty pool, falling back to random")
         return propose_candidates_by_random(n_candidates=n_candidates)
-    if len(combined) <= n_candidates:
-        return combined
 
-    idx = np.random.choice(len(combined), size=n_candidates, replace=False)
-    return [combined[i] for i in idx]
+    target_hull = int(round(n_candidates * hull_fps_ratio / (hull_fps_ratio + 1.0)))
+    target_fps  = n_candidates - target_hull
+    take_hull = min(target_hull, len(hull_pool))
+    take_fps  = min(target_fps,  len(fps_pool))
+    # Spill any deficit to the other pool.
+    deficit = n_candidates - take_hull - take_fps
+    if deficit > 0:
+        take_hull += min(deficit, len(hull_pool) - take_hull)
+        deficit = n_candidates - take_hull - take_fps
+    if deficit > 0:
+        take_fps += min(deficit, len(fps_pool) - take_fps)
+    print(f"  [hull_fps_hybrid] stratified sample (ratio={hull_fps_ratio:.2f}): "
+          f"hull {take_hull}/{len(hull_pool)} + fps {take_fps}/{len(fps_pool)} "
+          f"= {take_hull + take_fps} of {n_candidates} requested")
+
+    hull_idx = np.random.choice(len(hull_pool), size=take_hull, replace=False) \
+                 if take_hull and hull_pool else []
+    fps_idx  = np.random.choice(len(fps_pool),  size=take_fps,  replace=False) \
+                 if take_fps  and fps_pool  else []
+    out = [hull_pool[i] for i in hull_idx] + [fps_pool[i] for i in fps_idx]
+    return out
 
 
 def initial_candidates(bounds, n_candidates, num_max_threads=20):
-    """ Generate initial candidates as one-hot vectors within the given bounds. """
+    """ Generate initial candidates as one-hot vectors within the given bounds.
+
+    Two modes selectable via env var ``MIMESYS_INITIAL_OLD_STYLE`` (default 0):
+      "0" — current "sweep" mode: num_threads ∈ [1, candidate_max_threads],
+            weight ∈ [0.2, 0.4, 0.6, 0.8, 1.0]. Produces ~2000 sparse-dominant
+            seeds per round 0.
+      "1" — old surrogate_based_search.py style: only num_threads=candidate_max
+            (or 1 for IO-bound heuristic) and weight=1.0. Produces ~70 dense
+            seeds per round 0 — should match the test per-core CPU profile.
+    """
+    old_style = os.environ.get("MIMESYS_INITIAL_OLD_STYLE", "0") == "1"
     k = len(bounds)
     candidates = []
     zero_action_weights = [0.0] * k
@@ -678,32 +1115,47 @@ def initial_candidates(bounds, n_candidates, num_max_threads=20):
             if i == j:
                 initial_action_weights[j] = 1.0
 
+# Unified sweep — every stressor (including IO indices 10..12) gets the
+        # same num_threads × weight grid, with a single shuffled thread layout
+        # per combination. The earlier i>=10 heuristic capped IO stressors at
+        # max_threads=4 (or 1 in old_style) and compensated with extra shuffles
+        # at lower thread counts; removing that bias gives a uniform [1..20] ×
+        # weights sweep across all 13 stressors so the per-core CPU% distribution
+        # is shaped by the workload itself, not by a hand-tuned per-stressor cap.
         candidate_max_threads = num_max_threads
-        if i >= 10:
-            # heuristic for I/O bound actions
-            candidate_max_threads = 4
-        # elif i == 12:
-        #     candidate_max_threads = 4
-        for num_threads in range(1, candidate_max_threads + 1):
+
+        if old_style:
+            # Single iter at max threads, single weight (1.0)
+            num_threads_range = [candidate_max_threads]
+            weight_range = [1.0]
+        else:
+            num_threads_range = range(1, candidate_max_threads + 1)
+            # Default: 4 weights (0.25, 0.5, 0.75, 1.0). Override via
+            # MIMESYS_INITIAL_WEIGHT_RANGE (comma-separated). e.g. "1.0"
+            # restricts the sweep to weight=1.0 only across the same
+            # num_threads sweep (1..candidate_max_threads).
+            _wr_env = os.environ.get("MIMESYS_INITIAL_WEIGHT_RANGE", "")
+            if _wr_env:
+                weight_range = [float(x) for x in _wr_env.split(",") if x.strip()]
+            else:
+                weight_range = [0.25, 0.5, 0.75, 1.0]
+
+        for num_threads in num_threads_range:
             candidate = [initial_action_weights for _ in range(num_threads)]
             while len(candidate) < num_max_threads:
                 candidate.append(zero_action_weights)
 
-            for weight in [0.2, 0.4, 0.6, 0.8, 1.0]:
+            for weight in weight_range:
                 scaled_candidate = [[w * weight for w in thread] for thread in candidate]
-                if i < 10:
-                    random.shuffle(scaled_candidate)
-                    candidates.append(scaled_candidate)
-                else:
-                    for _ in range(num_max_threads - num_threads + 1):
-                        random.shuffle(scaled_candidate)
-                        candidates.append(scaled_candidate)
+                random.shuffle(scaled_candidate)
+                candidates.append(scaled_candidate)
 
     final_candidates = []
     weight = 1.0
     for action in candidates:
         scaled_action = [[w * weight for w in thread] for thread in action]
-        final_candidates.append([scaled_action, scaled_action])
+        # none-current: prev = NONE_PREV (was [scaled_action, scaled_action] = prev=curr)
+        final_candidates.append([NONE_PREV, scaled_action])
 
     return final_candidates
 
@@ -714,6 +1166,10 @@ def write_to_hdf5(action_weights, file_path):
 
 
 def write_actions_to_execution_plans(actions, destination_path: str, profiling_machines: list[str]):
+    """Write each action to a per-chunk plan H5. All-zero windows are dropped, so a
+    none-current action [NONE_PREV(=zeros), curr] is written as a curr-only plan
+    (one window) — the worker skips profiling the empty prev. Readers reconstruct
+    [NONE_PREV, curr] + a zero prev metric slot from such curr-only plans."""
     machines = [Machine.from_hostname(hostname) for hostname in profiling_machines]
     num_machines = len(machines)
     chunk_size = len(actions) // num_machines  # Ceiling division
@@ -727,13 +1183,14 @@ def write_actions_to_execution_plans(actions, destination_path: str, profiling_m
             action_chunk = actions[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
         for action_idx, action in enumerate(action_chunk):
             file_path = f"{destination_path}/chunk_{chunk_idx}/plans/plan_{action_idx:06d}.h5"
-            updated_action = []
-            for action_timestamp in action:
-                if all(all(value == 0.0 for value in thread) for thread in action_timestamp):
-                    continue
-                updated_action.append(action_timestamp)
-
-            write_to_hdf5(updated_action, file_path)
+            # Drop a leading all-zero (none) prev window so none-current plans become
+            # curr-only and skip profiling the empty prev. But NEVER drop the curr
+            # (last) window or emit an empty plan: an empty H5 is not 3D and
+            # segfaults the benchmark ("Dataset is not 3D").
+            windows = list(action)
+            while len(windows) > 1 and all(all(v == 0.0 for v in t) for t in windows[0]):
+                windows.pop(0)
+            write_to_hdf5(windows, file_path)
 
 
 def filter_high_variance_data(A, M, var, metric_ranges, threshold=0.1):
@@ -907,9 +1364,8 @@ def propose_disjoint_composites(A, n_candidates, num_actions=NUM_ACTIONS,
         thread_scales = np.random.uniform(0.8, 1.0, size=num_threads)
         composite = composite * thread_scales[:, None]
 
-        # Build two-timestep action (prev = composite, curr = composite for now;
-        # active-learning loop uses index 1 as curr_action)
-        action = [composite.tolist(), composite.tolist()]
+        # none-current: prev = NONE_PREV, curr = composite (was prev = composite)
+        action = [NONE_PREV, composite.tolist()]
         candidates.append(action)
 
     return candidates
@@ -1004,9 +1460,18 @@ def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
       MIMESYS_DEDUP              (default "1")  set to "0" to disable dedup
     """
     composite_frac = float(os.environ.get("MIMESYS_COMPOSITE_FRACTION", "0.0"))
-    composite_frac = max(0.0, min(1.0, composite_frac))
-    n_composite = int(round(n_candidates * composite_frac))
-    n_hull_fps  = n_candidates - n_composite
+    sparsity_frac  = float(os.environ.get("MIMESYS_THREAD_SPARSE_FRACTION", "0.0"))
+    dense_seed_frac = float(os.environ.get("MIMESYS_DENSE_SEED_FRACTION", "0.0"))
+    composite_frac  = max(0.0, min(1.0, composite_frac))
+    sparsity_frac   = max(0.0, min(1.0, sparsity_frac))
+    dense_seed_frac = max(0.0, min(1.0, dense_seed_frac))
+    # Carve out thread-sparse and dense-seed budgets first, then split the
+    # remainder composite/hull-FPS using the existing fraction.
+    n_sparsity   = int(round(n_candidates * sparsity_frac))
+    n_dense_seed = int(round(n_candidates * dense_seed_frac))
+    n_remaining = n_candidates - n_sparsity - n_dense_seed
+    n_composite = int(round(n_remaining * composite_frac))
+    n_hull_fps  = n_remaining - n_composite
     do_dedup    = os.environ.get("MIMESYS_DEDUP", "1") != "0"
 
     # Build pool-A dedup set (existing actions we already collected)
@@ -1025,6 +1490,10 @@ def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
                 if n_hull_fps > 0 else [])
     raw_comp = (propose_disjoint_composites(A, n_composite)
                 if n_composite > 0 else [])
+    raw_sparsity = (propose_candidates_by_thread_sparsity(n_candidates=int(n_sparsity * OVERSHOOT))
+                    if n_sparsity > 0 else [])
+    raw_dense_seed = (propose_candidates_by_dense_seeds(n_candidates=int(n_dense_seed * OVERSHOOT))
+                      if n_dense_seed > 0 else [])
 
     def _dedup_filter(cands, seen):
         """Drop entries whose key is in `seen` or pool_keys; update `seen` with kept keys."""
@@ -1038,17 +1507,23 @@ def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
 
     used = set()
     if do_dedup:
-        kept_hull = _dedup_filter(raw_hull, used)
-        kept_comp = _dedup_filter(raw_comp, used)
+        kept_hull       = _dedup_filter(raw_hull, used)
+        kept_comp       = _dedup_filter(raw_comp, used)
+        kept_sparsity   = _dedup_filter(raw_sparsity, used)
+        kept_dense_seed = _dedup_filter(raw_dense_seed, used)
     else:
-        kept_hull = list(raw_hull)
-        kept_comp = list(raw_comp)
+        kept_hull       = list(raw_hull)
+        kept_comp       = list(raw_comp)
+        kept_sparsity   = list(raw_sparsity)
+        kept_dense_seed = list(raw_dense_seed)
 
     # Truncate to target
-    hull_fps   = kept_hull[:n_hull_fps]
-    composites = kept_comp[:n_composite]
+    hull_fps       = kept_hull[:n_hull_fps]
+    composites     = kept_comp[:n_composite]
+    sparsity_out   = kept_sparsity[:n_sparsity]
+    dense_seed_out = kept_dense_seed[:n_dense_seed]
 
-    short = n_candidates - len(hull_fps) - len(composites)
+    short = n_candidates - len(hull_fps) - len(composites) - len(sparsity_out) - len(dense_seed_out)
     if short > 0:
         # Top-up with extra random proposals if dedup left us short
         extra = propose_candidates_by_random(n_candidates=int(short * 1.5))
@@ -1056,14 +1531,35 @@ def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
             extra = _dedup_filter(extra, used)
         composites += extra[:short]
 
-    out = hull_fps + composites
+    out = hull_fps + composites + sparsity_out + dense_seed_out
     random.shuffle(out)
-    dropped_hull = len(raw_hull) - len(hull_fps)
-    dropped_comp = max(0, len(raw_comp) - len(composites))
-    print(f"  [propose] n_hull_fps={n_hull_fps}  n_composite={n_composite} "
-          f"(composite_frac={composite_frac:.2f}, dedup={do_dedup})")
+    dropped_hull       = len(raw_hull) - len(hull_fps)
+    dropped_comp       = max(0, len(raw_comp) - len(composites))
+    dropped_sparsity   = len(raw_sparsity) - len(sparsity_out)
+    dropped_dense_seed = len(raw_dense_seed) - len(dense_seed_out)
+    print(f"  [propose] n_hull_fps={n_hull_fps}  n_composite={n_composite}  "
+          f"n_sparsity={n_sparsity}  n_dense_seed={n_dense_seed}  "
+          f"(composite_frac={composite_frac:.2f}, sparsity_frac={sparsity_frac:.2f}, "
+          f"dense_seed_frac={dense_seed_frac:.2f}, dedup={do_dedup})")
     print(f"  [propose] kept hull/fps={len(hull_fps)} (dropped {dropped_hull}); "
-          f"composite={len(composites)}; total={len(out)}")
+          f"composite={len(composites)} (dropped {dropped_comp}); "
+          f"sparsity={len(sparsity_out)} (dropped {dropped_sparsity}); "
+          f"dense_seed={len(dense_seed_out)} (dropped {dropped_dense_seed}); "
+          f"total={len(out)}")
+
+    # Tier 3.7: hard-cap idle-thread count. If MIMESYS_MIN_ACTIVE_THREADS is
+    # set, drop any candidate whose curr-action has fewer than that many threads
+    # with total stressor weight > MIMESYS_ACTIVE_THREAD_THRESH (default 0.1).
+    min_active = int(os.environ.get("MIMESYS_MIN_ACTIVE_THREADS", "0"))
+    if min_active > 0:
+        active_thresh = float(os.environ.get("MIMESYS_ACTIVE_THREAD_THRESH", "0.1"))
+        def _active_count(cand):
+            curr = cand[-1] if len(cand) > 1 else cand[0]  # curr is the LAST window
+            return sum(1 for row in curr if sum(row) > active_thresh)
+        n_before = len(out)
+        out = [c for c in out if _active_count(c) >= min_active]
+        print(f"  [propose] tier-3.7 cap: kept {len(out)}/{n_before} candidates "
+              f"(min_active_threads={min_active} at >{active_thresh})")
 
     # Per-cell noise injection (default off; env var MIMESYS_ACTION_NOISE_EPS)
     noise_eps = float(os.environ.get("MIMESYS_ACTION_NOISE_EPS", "0.0"))
@@ -1112,7 +1608,7 @@ def load_round(profiler, round_idx):
       - walks chunk_*/plans/plan_*.h5 in sorted (deterministic) order
       - for each plan, reads its matching stats-plan_*.txt file directly
       - parses with process_trace_all and computes per-group median nonzero
-      - returns the same tuple format: (actions, avg_list, med_list, std_list, wall_s)
+      - returns the same tuple format: (actions, avg_list, med_list, std_list)
     """
     from collections import defaultdict
     from mimesys.preprocessing.dataloader import parse_trace_file, process_trace_all
@@ -1142,49 +1638,59 @@ def load_round(profiler, round_idx):
             continue
         with h5py.File(h5p, "r") as f:
             actions = f["execution_plan"][:].tolist()
-        num_actions = len(actions) + 1
+        # A curr-only plan (prev profiling was skipped) has a single window.
+        # Reconstruct the 2-window [NONE_PREV, curr] action and shift the captured
+        # slots by +1 so curr lands at slot 1 (slot 0 = an all-zero prev slot),
+        # matching the layout of fully-profiled 2-window plans.
+        none_current = (len(actions) == 1)
+        num_slots = len(actions) + 1            # captured slot groups (cycle length)
+        shift = 1 if none_current else 0
+
+        # Drop the first cycle (curr_0 + sleep_0) of measurements: curr_0
+        # contains warmup-tail contamination from the kernel-init/populate
+        # phase that bleeds into the first measured slot. With MIMESYS_ITERS=4
+        # the kernel reports 4 currs and we keep curr_1..curr_3; with ITERS=3
+        # we keep curr_1..curr_2. Toggle off with MIMESYS_KEEP_FIRST_CURR=1.
+        drop_first = os.environ.get("MIMESYS_KEEP_FIRST_CURR", "0") != "1"
 
         # Per-group median of nonzero, per metric. Group i collects samples
-        # at sample_idx % num_actions == i (samples cycle through prev / curr /
+        # at sample_idx % num_slots == i (samples cycle through prev / curr /
         # noop slots in the BM_Mimesys loop).
         avg_metrics = defaultdict(dict)
         med_metrics = defaultdict(dict)
         std_metrics = defaultdict(dict)
         for tm, vals in pm.items():
+            if drop_first and len(vals) > num_slots:
+                vals = vals[num_slots:]
             groups = defaultdict(list)
             for i, v in enumerate(vals):
-                groups[i % num_actions].append(v)
+                groups[i % num_slots].append(v)
             for g, gvals in groups.items():
                 nz = [x for x in gvals if x != 0]
-                avg_metrics[g][tm] = (sum(nz) / len(nz)) if nz else 0.0
-                med_metrics[g][tm] = sorted(nz)[len(nz) // 2] if nz else 0.0
-                std_metrics[g][tm] = float(np.std(nz)) if nz else 0.0
+                avg_metrics[g + shift][tm] = (sum(nz) / len(nz)) if nz else 0.0
+                med_metrics[g + shift][tm] = sorted(nz)[len(nz) // 2] if nz else 0.0
+                std_metrics[g + shift][tm] = float(np.std(nz)) if nz else 0.0
 
         # Flatten as the old code did: outer-group then inner-metric order
         # (metric order = process_trace_all dict insertion order, deterministic).
+        # For curr-only plans the prepended slot 0 has no entries → flattens to 0.
+        out_slots = num_slots + shift
         flat_avg, flat_med, flat_std = [], [], []
         keys = list(pm.keys())
-        for g in range(num_actions):
+        for g in range(out_slots):
             for tm in keys:
                 flat_avg.append(avg_metrics[g].get(tm, 0.0))
                 flat_med.append(med_metrics[g].get(tm, 0.0))
                 flat_std.append(std_metrics[g].get(tm, 0.0))
 
-        try:
-            ts0 = float(traces[0]["timestamp"][0].split()[0])
-            ts1 = float(traces[-1]["timestamp"][0].split()[0])
-            wall_s = max(0.0, ts1 - ts0)
-        except Exception:
-            wall_s = float("nan")
-
-        pairs.append((actions, flat_avg, flat_med, flat_std, wall_s))
+        if none_current:
+            actions = as_none_current(actions[0])   # [NONE_PREV, curr]
+        pairs.append((actions, flat_avg, flat_med, flat_std))
     return pairs
 
 
 def pairs_to_AM(pairs, max_len=0):
-    """Convert plan_stat_pairs → (A list, M array, var array) with padding.
-    Tolerates pairs of length 4 (legacy) or 5 (new — wall-clock tucked at
-    index 4)."""
+    """Convert plan_stat_pairs → (A list, M array, var array) with padding."""
     valid = [p for p in pairs if p is not None]
     if not valid:
         return [], None, None
@@ -1194,46 +1700,6 @@ def pairs_to_AM(pairs, max_len=0):
     M   = np.array([p[2] + [0.0]*(max_len - len(p[2])) for p in valid], dtype=float)
     var = np.array([p[3] + [0.0]*(max_len - len(p[3])) for p in valid], dtype=float)
     return A, M, var
-
-
-# ---------------------------------------------------------------------------
-# Straggler filter: drop plans whose wall-clock blew the slot budget
-# ---------------------------------------------------------------------------
-
-# Worker side: each plan runs for MIMESYS_ITERS × (T+1) slots × slot_seconds.
-# With T=2 timesteps, do_sleep=true, MIMESYS_ITERS=3, slot=1 s ⇒ ~9 s budget.
-# Add 2 s for benchmark startup + tmp-file cleanup per plan.
-EXPECTED_PLAN_SECONDS = 18.0  # T=2 timesteps × MIMESYS_ITERS=3 × slot=2s = 18s
-PLAN_OVERHEAD_SECONDS = 2.0
-STRAGGLER_THRESHOLD   = 1.5   # drop plans > 1.5× expected
-
-
-def filter_straggler_plans(pairs, expected_s=EXPECTED_PLAN_SECONDS,
-                            overhead_s=PLAN_OVERHEAD_SECONDS,
-                            threshold=STRAGGLER_THRESHOLD):
-    """Drop plan_stat_pairs whose wall-clock (5th tuple element) exceeded
-    `(expected_s + overhead_s) × threshold`. Pairs without wall-clock (legacy
-    4-tuples) are passed through.
-    Returns (kept_pairs, dropped_count, max_seen_seconds)."""
-    if not pairs:
-        return pairs, 0, 0.0
-    budget_s = (expected_s + overhead_s) * threshold
-    kept, dropped, max_seen = [], 0, 0.0
-    for p in pairs:
-        if p is None:
-            continue
-        if len(p) < 5 or p[4] != p[4]:    # NaN check
-            kept.append(p); continue
-        wall_s = float(p[4])
-        max_seen = max(max_seen, wall_s)
-        if wall_s > budget_s:
-            dropped += 1
-        else:
-            kept.append(p)
-    print(f"  [straggler-filter] kept {len(kept)}/{len(pairs)} "
-          f"(dropped {dropped} with wall_s > {budget_s:.1f} s; "
-          f"max_seen={max_seen:.1f} s, expected~{expected_s+overhead_s:.1f} s)")
-    return kept, dropped, max_seen
 
 
 # ---------------------------------------------------------------------------
@@ -1288,7 +1754,12 @@ def run_collection(n_rounds: int, restart: bool = False):
     if 0 not in existing:
         bounds = [(0.0, 1.0)] * NUM_ACTIONS
         A_init = initial_candidates(bounds, NUM_ACTIONS, NUM_THREADS)
-        print(f"\n=== Round 0  (initial_candidates: {len(A_init)} plans) ===")
+        n0 = len(A_init)
+        A_init = [a for a in A_init if not _curr_is_empty(a)]   # drop no-op (all-zero curr) candidates
+        if len(A_init) < n0:
+            print(f"  [filter] dropped {n0 - len(A_init)} all-zero-curr candidates")
+        A_init = [as_none_current(a) for a in A_init]   # prev=None (none-current)
+        print(f"\n=== Round 0  (initial_candidates: {len(A_init)} plans, prev=None) ===")
         dest0 = os.path.join(OUTPUT_PATH, "round_0")
         write_actions_to_execution_plans(A_init, dest0, PROFILING_MACHINES)
         # Dispatch + extract zips on workers; skip the buggy in-line parse.
@@ -1319,8 +1790,8 @@ def run_collection(n_rounds: int, restart: bool = False):
     A, M, var = list(A0), M0, var0
     for r_idx in sorted(r for r in existing if r > 0):
         pairs = load_round(profiler, r_idx)
-        pairs, n_dropped, _ = filter_straggler_plans(pairs)
-        A_r, M_r, var_r = pairs_to_AM(pairs, max_len=M.shape[1])
+        none_pairs, _ = _split_none_current(pairs)   # variants are training-only
+        A_r, M_r, var_r = pairs_to_AM(none_pairs, max_len=M.shape[1])
         if M_r is None:
             continue
         # Pad width if needed
@@ -1344,23 +1815,40 @@ def run_collection(n_rounds: int, restart: bool = False):
     for r in range(start_round, n_rounds + 1):
         print(f"\n=== Round {r}  (batch={BATCH_SIZE}, strategy=hull:fps 5:5) ===")
 
-        batch = propose_convex_hull_and_novelty_mix(A, M, BATCH_SIZE)
+        proposed = propose_convex_hull_and_novelty_mix(A, M, BATCH_SIZE)
+        currs = [curr_window(a) for a in proposed]
+        n_prop = len(currs)
+        currs = [c for c in currs if not _curr_is_empty(c)]   # drop no-op (all-zero curr) candidates
+        if len(currs) < n_prop:
+            print(f"  [filter] dropped {n_prop - len(currs)} all-zero-curr candidates")
+        none_plans = [as_none_current(c) for c in currs]   # prev=None (none-current)
+
+        # K prev-variants per curr: prev = diverse none-current sample from the pool
+        # (spanning the metric space → high LLC / mem-BW prevs). Profiled as real
+        # 2-window plans alongside the none-current curr-only plans.
+        variants, prev_foot = build_prev_variants(currs, A, M, K_PREV_VARIANTS)
+        if variants:
+            llcs = [f[2] for f in prev_foot]; bws = [f[3] for f in prev_foot]
+            print(f"  + {len(variants)} prev-variants ({K_PREV_VARIANTS}/curr × {PREV_N_REP} reps, "
+                  f"high-LLC top {PREV_HIGH_LLC_FRAC:.0%}, {len(prev_foot)}-prev shortlist); "
+                  f"shortlist LLC {min(llcs):.0f}-{max(llcs):.0f} MB/s, BW {min(bws):.1f}-{max(bws):.1f} %")
+        batch = none_plans + variants
 
         dest = os.path.join(OUTPUT_PATH, f"round_{r}")
         write_actions_to_execution_plans(batch, dest, PROFILING_MACHINES)
 
         # Dispatch + extract zips on workers; skip the buggy in-line parse.
         asyncio.run(profiler.profile_actions(dest, skip_parsing=True))
-        # Clean parse from on-disk raw stats.
+        # Clean parse from on-disk raw stats. Only the none-current samples (zero
+        # prev) feed the active-learning pool; prev-variants are training-only.
         pairs = load_round(profiler, r)
-        # Drop straggler plans (wall-clock > 1.5× expected slot budget)
-        pairs, n_dropped, max_seen = filter_straggler_plans(pairs)
-        A_r, M_r, var_r = pairs_to_AM(pairs, max_len=M.shape[1])
+        none_pairs, var_pairs = _split_none_current(pairs)
+        A_r, M_r, var_r = pairs_to_AM(none_pairs, max_len=M.shape[1])
         n_valid = 0 if M_r is None else len(A_r)
-        print(f"  Valid: {n_valid}/{len(pairs) + n_dropped}  (stragglers dropped: {n_dropped})")
+        print(f"  Valid: {n_valid} none-current + {len(var_pairs)} prev-variants  (of {len(pairs)} plans)")
 
         if M_r is None:
-            print("  No valid results, skipping round")
+            print("  No valid none-current results, skipping round")
             continue
 
         # Pad width

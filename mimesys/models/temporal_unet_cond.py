@@ -96,6 +96,39 @@ class MetricsOnlyContextEncoder(nn.Module):
         return self.encoder(context_cond['metric'])
 
 
+class PerPositionFiLMEncoder(nn.Module):
+    """Encodes per-thread conditioning. Output: (B, context_dim, num_threads).
+    Each position i gets its own context vector derived from:
+      • the per-core CPU% at index i (scalar)
+      • the full global metric vector (23-d, replicated across positions)
+      • a learnable position embedding for index i
+    Inputs are assumed [-1, 1] normalized (as used throughout the pipeline).
+    """
+    def __init__(self, cfg: DictConfig, num_threads: int = 20):
+        super().__init__()
+        self.num_threads = num_threads
+        self.num_metrics = int(cfg.input_dim)
+        hidden = int(cfg.hidden_dim)
+        self.position_embed = nn.Embedding(num_threads, hidden)
+        in_dim = 1 + self.num_metrics + hidden
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.Mish(),
+            nn.Linear(hidden, hidden), nn.Mish(),
+            nn.Linear(hidden, int(cfg.context_dim)),
+        )
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']                                 # (B, M=23)
+        B = metric.shape[0]
+        per_core = metric[:, :self.num_threads].unsqueeze(-1)           # (B, T, 1)
+        global_m = metric.unsqueeze(1).expand(-1, self.num_threads, -1) # (B, T, M)
+        pos_ids  = torch.arange(self.num_threads, device=metric.device)
+        pos_emb  = self.position_embed(pos_ids).unsqueeze(0).expand(B, -1, -1)  # (B, T, H)
+        x = torch.cat([per_core, global_m, pos_emb], dim=-1)            # (B, T, 1+M+H)
+        out = self.encoder(x)                                            # (B, T, context_dim)
+        return out.transpose(1, 2)                                       # (B, context_dim, T)
+
+
 class ConcatContextEncoder(nn.Module):
     """Concat: flatten full action + metrics, project through MLP."""
     def __init__(self, cfg: DictConfig):
@@ -139,6 +172,48 @@ class ConcatSymContextEncoder(nn.Module):
         action_sym = torch.cat([sum_row, sum_col], dim=1)  # (B, H+C=33)
         x = torch.cat([action_sym, metric], dim=-1)
         return self.head(x)
+
+
+class ResidualPrevContextEncoder(nn.Module):
+    """Metrics-only backbone + an ADDITIVE prev_action residual, gated by a scalar
+    initialised to 0 so the encoder starts EXACTLY equal to MetricsOnlyContextEncoder.
+
+    Designed for warm-starting from a prev_none checkpoint: `self.encoder` has the
+    same architecture & submodule names as MetricsOnlyContextEncoder, so its weights
+    load verbatim; `prev_head` + `gate` are new (zero-init) and only move if the
+    prev_action genuinely lowers the loss. Read `gate` after training to see whether
+    prev_action carried usable signal."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(cfg.input_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+        # prev_action residual head (full 260-D flattened action → context_dim)
+        self.prev_head = nn.Sequential(
+            nn.Linear(cfg.action_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+        # Zero-init ONLY the residual's last layer so initial output == metrics_only.
+        # The gate must start NON-zero (1.0): if both gate and prev_head's last layer
+        # are zero, the gradients ∂L/∂gate ∝ prev_head_out (=0) and ∂L/∂prev_head ∝ gate
+        # (=0) are both dead and the pathway can never escape zero. With gate=1 the
+        # prev_head has a live gradient; read prev_head's weight norm + gate after
+        # training to gauge how much prev_action signal was found.
+        nn.init.zeros_(self.prev_head[-1].weight)
+        nn.init.zeros_(self.prev_head[-1].bias)
+        self.gate = nn.Parameter(torch.ones(1))
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']
+        action = context_cond['prev_action'].flatten(1)   # (B, S*T = 260)
+        base = self.encoder(metric)
+        delta = self.prev_head(action)
+        return base + self.gate * delta
 
 
 class TransformerFullContextEncoder(nn.Module):
@@ -539,10 +614,15 @@ class TemporalResnetBlockCond(nn.Module):
             nn.Mish(),
             nn.Dropout(dropout),
         )
+        # Shared FiLM head, used for BOTH broadcast (2D context) and per-position
+        # (3D context) paths so DDP never sees an unused parameter. The final
+        # rearrange to (B, C, L) is handled in _project_film() because it
+        # depends on the context shape at runtime. Existing ckpts saved with
+        # the previous Sequential(Mish, Linear, Rearrange) layout still load:
+        # Rearrange has no params so the state_dict only contained Linear.
         self.time_context_mlp = nn.Sequential(
             nn.Mish(),
             nn.Linear(time_context_dim, out_chn * 2 if use_scale_shift else out_chn),
-            Rearrange("b c -> b c 1"),
         )
         self.residual_conv = (
             nn.Conv1d(in_chn, out_chn, kernel_size=1)
@@ -550,22 +630,36 @@ class TemporalResnetBlockCond(nn.Module):
             else nn.Identity()
         )
 
+    def _project_film(self, t, context):
+        """Returns FiLM proj of shape (B, C, L). L=1 for broadcast, L=position-count for per-position."""
+        if context.dim() == 3:
+            # Per-position: context (B, context_dim, L). Apply the SAME Linear per-position.
+            B, _, L = context.shape
+            t_ext = t.unsqueeze(-1).expand(-1, -1, L)            # (B, time_dim, L)
+            tc = torch.cat((t_ext, context), dim=1)              # (B, time_dim+context_dim, L)
+            tc = tc.transpose(1, 2)                               # (B, L, time_dim+context_dim)
+            out = self.time_context_mlp(tc)                       # (B, L, 2*out_chn)
+            return out.transpose(1, 2)                            # (B, 2*out_chn, L)
+        else:
+            tc = torch.cat((t, context), dim=1)                  # (B, time_dim+context_dim)
+            return self.time_context_mlp(tc).unsqueeze(-1)        # (B, 2*out_chn, 1)
+
     def forward(self, x, t, context):
         """
         x: batch_size x state_chn x horizon
         t: batch_size x time_dim
-        context: batch_size x context_dim
+        context: batch_size x context_dim  (broadcast FiLM)
+                 or batch_size x context_dim x L  (per-position FiLM)
         """
-        t_context = torch.cat((t, context), dim=1)
-
         out = x.clone()
         for layer in self.block1:
             if isinstance(layer, nn.Mish):
+                proj = self._project_film(t, context)
                 if self.use_scale_shift:
-                    scale, shift = self.time_context_mlp(t_context).chunk(2, dim=1)
+                    scale, shift = proj.chunk(2, dim=1)
                     out = out * (1 + scale) + shift
                 else:
-                    out = out + self.time_context_mlp(t_context)
+                    out = out + proj
             out = layer(out)
 
         out = self.block2(out)
@@ -612,6 +706,8 @@ class TemporalUnetCond(nn.Module):
             self.context_encoding = TransformerFullContextEncoder(context_args)
         elif _encoder_type == 'transformer_tokens':
             self.context_encoding = TransformerTokensContextEncoder(context_args)
+        elif _encoder_type == 'residual_prev':
+            self.context_encoding = ResidualPrevContextEncoder(context_args)
         else:  # 'transformer' (default, existing behaviour)
             self.context_encoding = TransformerContextEncoder(context_args)
 
@@ -703,6 +799,64 @@ class TemporalUnetCond(nn.Module):
             nn.Conv1d(out_dim, in_dim, kernel_size=1),
         )
 
+        # Optional socket-id positional embedding (see forward for details).
+        self.use_socket_embed = bool(getattr(context_args, 'use_socket_embed', False))
+        if self.use_socket_embed:
+            self.socket_id_embed = nn.Embedding(3, input_dim)
+
+        # Optional per-thread channel conditioning. The 23-d cond vector is
+        # otherwise squashed into a global context that affects every thread
+        # position identically — destroying the positional correspondence
+        # between "core_07 is hot" and "thread 7 should be active". This flag
+        # exposes the per-core CPU values as 1 extra input channel (the value
+        # at thread i's position = per-core CPU of core i) plus 3 broadcast
+        # channels for global io / l3 / bw. The model's first conv1d then
+        # literally sees the per-core conditioning at the matching thread
+        # position. Order of conditioning entries in cond["metric"] is
+        # alphabetical (sorted by metric name): indices 0..19 = per-core CPU
+        # core_00..core_19, 20 = io, 21 = l3_cache_usage, 22 = memory_bandwidth.
+        self.use_per_thread_cond = bool(getattr(context_args, 'use_per_thread_cond', False))
+        if self.use_per_thread_cond:
+            self._per_thread_n_extra = 4    # per-core (1) + io (1) + llc (1) + bw (1)
+            # 1x1 conv to project (input_dim + extra) → input_dim so down-layer
+            # input shape stays compatible with the existing U-Net body.
+            self.input_proj = nn.Conv1d(input_dim + self._per_thread_n_extra,
+                                         input_dim, kernel_size=1)
+
+        # Optional per-thread cross-attention conditioning. Each thread position
+        # gets a learned query, attends to the 23 metric tokens (each metric
+        # treated as a token with a learned positional embedding), and the
+        # attention output (B, T_threads, D_extra) is concatenated to the input
+        # action as extra channels. Provides position-aware conditioning without
+        # the metric-channel/positional mixing of `use_per_thread_cond`.
+        # Per-position FiLM: extends (a)'s "give the model per-thread conditioning at
+        # the input" idea to ALL resnet blocks, by producing a 3D context of shape
+        # (B, context_dim, num_threads) that gets downsampled in sync with x and
+        # re-injected as scale/shift at every block. The global ContextEncoder is
+        # still built (and used for the legacy broadcast path); when this flag is
+        # on, blocks receive the per-position context tensor instead.
+        self.use_per_position_film = bool(getattr(context_args, 'use_per_position_film', False))
+        if self.use_per_position_film:
+            self.per_position_encoder = PerPositionFiLMEncoder(context_args)
+
+        self.use_cross_attn_cond = bool(getattr(context_args, 'use_cross_attn_cond', False))
+        if self.use_cross_attn_cond:
+            num_threads = int(getattr(context_args, 'cross_attn_num_threads', 20))
+            num_metrics = int(getattr(context_args, 'input_dim', 23))
+            xa_dim      = int(getattr(context_args, 'cross_attn_dim', 64))
+            xa_heads    = int(getattr(context_args, 'cross_attn_heads', 4))
+            xa_extra    = int(getattr(context_args, 'cross_attn_extra_channels', 8))
+            self._cross_attn_num_threads = num_threads
+            self._cross_attn_num_metrics = num_metrics
+            self.metric_token_proj = nn.Linear(1, xa_dim)
+            self.metric_token_pos = nn.Embedding(num_metrics, xa_dim)
+            self.thread_query = nn.Parameter(torch.randn(num_threads, xa_dim) * 0.02)
+            self.cross_attn = nn.MultiheadAttention(xa_dim, xa_heads, batch_first=True)
+            self.cross_attn_out = nn.Linear(xa_dim, xa_extra)
+            self._cross_attn_xa_extra = xa_extra
+            self.cross_attn_input_proj = nn.Conv1d(input_dim + xa_extra,
+                                                   input_dim, kernel_size=1)
+
     def forward(self, x, t, context_cond, cfg_mask):
         """
         x: batch_size x horizon x state_chn
@@ -713,33 +867,110 @@ class TemporalUnetCond(nn.Module):
         current_h = x.shape[2]
 
         next_power_of_2 = 2 ** (current_h - 1).bit_length()
+        # Build per-thread conditioning channels BEFORE padding so the per-core
+        # alignment matches thread positions. Then pad both together and
+        # project back to the U-Net's expected input_dim.
+        if self.use_per_thread_cond:
+            metric = context_cond.get("metric")     # (B, 23) — alphabetical order
+            B = metric.shape[0]
+            # Mask conditioning when cfg_mask is 0 (matches how context is dropped below).
+            cfg_mask_v = cfg_mask.view(-1, 1)
+            # Per-core CPU lines up 1:1 with thread positions.
+            per_core = metric[:, :20] * cfg_mask_v          # (B, 20)
+            io_b   = (metric[:, 20] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
+            l3_b   = (metric[:, 21] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
+            bw_b   = (metric[:, 22] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
+            # Slice per_core to the unpadded length (it's 20 already; current_h is 20).
+            extra = torch.stack([per_core[:, :current_h], io_b, l3_b, bw_b], dim=1)  # (B, 4, L)
+            x = torch.cat([x, extra], dim=1)               # (B, input_dim+4, L)
+
+        # Variant (b): per-thread cross-attention to metric tokens.
+        if self.use_cross_attn_cond:
+            metric = context_cond.get("metric")    # (B, num_metrics)
+            B = metric.shape[0]
+            cfg_mask_v = cfg_mask.view(-1, 1, 1)
+            tokens = self.metric_token_proj(metric.unsqueeze(-1))  # (B, num_metrics, xa_dim)
+            pos_ids = torch.arange(self._cross_attn_num_metrics, device=metric.device)
+            tokens = tokens + self.metric_token_pos(pos_ids).unsqueeze(0)
+            tokens = tokens * cfg_mask_v
+            q = self.thread_query.unsqueeze(0).expand(B, -1, -1)   # (B, num_threads, xa_dim)
+            attn_out, _ = self.cross_attn(q, tokens, tokens)        # (B, num_threads, xa_dim)
+            extra = self.cross_attn_out(attn_out)                   # (B, num_threads, xa_extra)
+            extra = extra.transpose(1, 2)                           # (B, xa_extra, num_threads)
+            # Match unpadded thread length (current_h == num_threads expected)
+            extra = extra[..., :current_h]
+            x = torch.cat([x, extra], dim=1)                        # (B, input_dim+xa_extra, L)
+
         if current_h != next_power_of_2:
             # Calculate the padding needed for both sides (left and right)
             pad_size = next_power_of_2 - current_h
             # Apply padding to reach the next power of 2
             x = F.pad(x, (0, pad_size))
 
+        if self.use_per_thread_cond:
+            # Project back to input_dim channels so the rest of the U-Net is unchanged.
+            x = self.input_proj(x)
+        elif self.use_cross_attn_cond:
+            x = self.cross_attn_input_proj(x)
+
+        # Inject socket-id embedding (positional) into the channel dim of x.
+        if self.use_socket_embed:
+            L = x.shape[2]
+            pos = torch.arange(L, device=x.device)
+            socket_ids = torch.where(
+                pos < 10, torch.tensor(0, device=x.device, dtype=torch.long),
+                torch.where(pos < 20, torch.tensor(1, device=x.device, dtype=torch.long),
+                                       torch.tensor(2, device=x.device, dtype=torch.long))
+            )
+            emb = self.socket_id_embed(socket_ids)         # (L, input_dim)
+            # Broadcast-add to x of shape (B, input_dim, L): transpose emb → (input_dim, L)
+            x = x + emb.T.unsqueeze(0)
+
         t = self.time_encoding(t)
 
         context = self.context_encoding(context_cond)
         context[cfg_mask == 0] = 0
 
+        # Build per-position context (B, context_dim, num_threads) once. Pad to
+        # match x's padded length, then we'll pool it in lockstep with x's spatial
+        # dim as we descend/ascend the U-Net. The global ContextEncoder output is
+        # additively merged so both encoders' parameters are exercised (otherwise
+        # DDP flags the unused global encoder).
+        if self.use_per_position_film:
+            pp_ctx = self.per_position_encoder(context_cond)               # (B, C, T_threads)
+            pp_ctx = pp_ctx + context.unsqueeze(-1)                         # +(B, C, 1) broadcast
+            pp_ctx = pp_ctx * cfg_mask.view(-1, 1, 1)                       # zero out masked
+            if pp_ctx.shape[-1] != next_power_of_2:
+                pp_ctx = F.pad(pp_ctx, (0, next_power_of_2 - pp_ctx.shape[-1]))
+        else:
+            pp_ctx = None
+
+        def _ctx(at_layer):
+            """Return the context tensor a resnet block should use at its current
+            spatial resolution: per-position when enabled, else the global vector."""
+            return pp_ctx if self.use_per_position_film else context
+
         h = []
         for block1, block2, attention, downsample in self.down_layers:
-            x = block1(x, t, context)
-            x = block2(x, t, context)
+            x = block1(x, t, _ctx(None))
+            x = block2(x, t, _ctx(None))
             x = attention(x)
             h.append(x)
             x = downsample(x)
-        x = self.middle_layers[0](x, t, context)
+            # Pool the per-position context to match the new spatial dim of x.
+            if self.use_per_position_film and not isinstance(downsample, nn.Identity):
+                pp_ctx = F.avg_pool1d(pp_ctx, kernel_size=2, stride=2)
+        x = self.middle_layers[0](x, t, _ctx(None))
         x = self.middle_layers[1](x)
-        x = self.middle_layers[2](x, t, context)
+        x = self.middle_layers[2](x, t, _ctx(None))
 
         for block1, block2, attention, upsample in self.up_layers:
-            x = block1(torch.cat((x, h.pop()), dim=1), t, context)
-            x = block2(x, t, context)
+            x = block1(torch.cat((x, h.pop()), dim=1), t, _ctx(None))
+            x = block2(x, t, _ctx(None))
             x = attention(x)
             x = upsample(x)
+            if self.use_per_position_film and not isinstance(upsample, nn.Identity):
+                pp_ctx = F.interpolate(pp_ctx, scale_factor=2.0, mode='nearest')
 
         x = self.output_layer(x)
         # If we padded earlier, remove the padding now to return to original size

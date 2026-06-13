@@ -120,12 +120,17 @@ def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> Gau
             dropout=cfg.mlp.dropout,
             context_args=cfg.context,
         )
-    return GaussianDiffusion(
+    diffusion = GaussianDiffusion(
         model=base_model,
         n_timesteps=cfg.diffusion.n_timesteps,
         clipped_denoised=cfg.diffusion.clipped_denoised,
         **cfg.diffusion.cfg_args,
     )
+    # Optional variant (c): auxiliary row-sum→CPU% supervision weight.
+    diffusion.row_sum_aux_weight = float(
+        getattr(cfg.diffusion, "row_sum_aux_weight", 0.0)
+    )
+    return diffusion
 
 
 def load_model(cfg: DictConfig, model_type: str, model_path: str, device: str):

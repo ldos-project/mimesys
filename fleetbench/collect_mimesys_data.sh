@@ -56,7 +56,7 @@ for ((batch_idx=0; batch_idx<num_batches; batch_idx++)); do
     # Run your commands for each batch here
     echo "Running commands on batch $((batch_idx + 1))..."
     HOME_PATH=${HOME_PATH:-$HOME}
-    MIMESYS_ITERS=${MIMESYS_ITERS:-1} MIMESYS_SLEEP=${MIMESYS_SLEEP:-1} ACTION_PROFILING_CACHE_DIR=${HOME_PATH}/fleetbench ACTION_LIST_PATH=${HOME_PATH}/fleetbench/fleetbench/mimesys/mimesys_actions.txt TACC_STATS_DIR=${HOME_PATH}/HPCPerfStats/monitor/src sudo bazel run --config=clang --config=opt fleetbench/mimesys:mimesys_benchmark -- --benchmark_filter="BM_Mimesys" --benchmark_min_time=1.8s
+    MIMESYS_ITERS=${MIMESYS_ITERS:-1} MIMESYS_SLEEP=${MIMESYS_SLEEP:-1} ACTION_PROFILING_CACHE_DIR=${HOME_PATH}/fleetbench ACTION_LIST_PATH=${ACTION_LIST_PATH:-${HOME_PATH}/fleetbench/fleetbench/mimesys/mimesys_actions.txt} TACC_STATS_DIR=${HOME_PATH}/HPCPerfStats/monitor/src sudo bazel run --config=clang --config=opt fleetbench/mimesys:mimesys_benchmark -- --benchmark_filter="BM_Mimesys" --benchmark_min_time=1.8s
 done
 
 echo "Batch processing complete."

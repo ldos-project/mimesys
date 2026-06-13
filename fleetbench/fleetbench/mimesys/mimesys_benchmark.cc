@@ -124,6 +124,18 @@ int CollectTACCStats(std::string tacc_stats_dir) {
   return 0;
 }
 
+// Async wrapper: kick the popen on a detached worker thread so the main slot
+// loop never blocks on it. Removes the ~100 ms/slot fork+exec+sudo overhead.
+// The actual `hpcperfstatsd collect` still runs in the background and writes
+// to the same TACC stats log file. Per-slot ordering vs the original code is
+// slightly different (the snapshot lands moments later) but per-second
+// granularity in the stats log is unchanged.
+void CollectTACCStatsAsync(const std::string& tacc_stats_dir) {
+  std::thread([tacc_stats_dir]() {
+    CollectTACCStats(tacc_stats_dir);
+  }).detach();
+}
+
 int StartTACCStats() {
   // Start the profiling process
   // This function executes a bash command to start hpcperfstatsd and returns the collect_pid.
@@ -340,6 +352,17 @@ std::tuple<std::vector<int>, double> GetNumBenchmarkItersFromExecutionPlan(
       num_iters_for_benchmark = static_cast<int>(std::round(quotient));
       if (num_iters_for_benchmark < 0) num_iters_for_benchmark = 0;
     }
+    // If this stressor is active (ratio>0) but the iteration-count round-down
+    // gave 0 — happens for direct kernels (time_per_iter=0) and for framework
+    // benchmarks profiled at >slot duration — set the number of entries
+    // proportional to the ratio with ~1% granularity. This preserves the
+    // intended weight mix in execution_order so RunMimesysExecutionOrder can
+    // give each stressor a proportional share of the slot time.
+    // (Earlier behavior was always =1, which lost the ratio for direct kernels
+    // and caused the first entry to monopolize the slot.)
+    if (ratio > 0.0 && num_iters_for_benchmark < 1) {
+      num_iters_for_benchmark = std::max(1, static_cast<int>(std::round(ratio * 100.0)));
+    }
     num_iters.push_back(num_iters_for_benchmark);
   }
   return std::make_tuple(num_iters, no_op_ratio);
@@ -384,12 +407,23 @@ struct CrcCtx {
 
 static thread_local CrcCtx g_ctx;
 
+// Cold-faithful CRC parameters (rationale below in InitCrcCtx).
+//   kColdBufferBytes : 256 MB ≫ c220g5 L3 (~25 MB) so a single pass evicts the
+//                      whole LLC at least once.
+//   kColdStrideBytes : 64 KB per CRC call — at 1000 calls per inner pass the
+//                      working set is 64 MB > LLC, forcing each call to fetch
+//                      from DRAM. This is what produces the LLC + BW signal we
+//                      saw in round_0.curr_sweep_backup (stressor 0:
+//                      ~290 MB/s LLC, ~765% BW%, ~26% CPU). The original
+//                      4 KB stride kept the entire working set inside LLC
+//                      after the first pass → ~0.7 MB/s LLC and 5% CPU.
+static constexpr size_t kColdBufferBytes = 256ull * 1024 * 1024;
+static constexpr size_t kColdStrideBytes = 64ull * 1024;
+
 static void InitCrcCtx() {
   if (g_ctx.init_done) return;
-  // 64 MB buffer comfortably exceeds L3 on c220g5 (2*~25 MB).
-  g_ctx.buffer.assign(64ull * 1024 * 1024, 'x');
+  g_ctx.buffer.assign(kColdBufferBytes, 'x');
   g_ctx.sv = absl::string_view(g_ctx.buffer);
-  // Representative size distribution (bytes per call).
   static const int sizes[] = {16, 32, 64, 128, 256, 512, 1024, 2048};
   g_ctx.str_lengths.reserve(1000);
   for (int i = 0; i < 1000; ++i) {
@@ -412,7 +446,7 @@ static void DirectExtendCrc32c(long deadline_us) {
     for (auto l : ctx.str_lengths) {
       if (start + l >= ctx.sv.length()) start = 0;
       absl::string_view buf = ctx.sv.substr(start, l);
-      start += l + 4096;
+      start += kColdStrideBytes;  // page-stride large enough to exceed LLC
       v0 = absl::ExtendCrc32c(v0, buf);
       benchmark::DoNotOptimize(v0);
     }
@@ -432,7 +466,7 @@ static void DirectComputeCrc32c(long deadline_us) {
     for (auto l : ctx.str_lengths) {
       if (start + l >= ctx.sv.length()) start = 0;
       absl::string_view buf = ctx.sv.substr(start, l);
-      start += l + 4096;
+      start += kColdStrideBytes;
       auto res = absl::ComputeCrc32c(buf);
       benchmark::DoNotOptimize(res);
     }
@@ -835,9 +869,394 @@ static void DirectHdd64KB(long deadline_us) {
   }
 }
 
+// Weight plumbed in via this thread-local; set by the dispatcher
+// (RunMimesysExecutionOrder) before invoking a weight-aware kernel.
+// Defaults to 1.0 so kernels that don't honor it still behave at full duty.
+static thread_local double g_current_duty = 1.0;
+
+// Weight-scaled HDD kernel: bytes_per_write = duty * MAX_SIZE.
+// Sleep stays fixed, so per-thread rate ≈ (duty * MAX_SIZE) / sleep_us
+// is linear in duty (weight). The dispatcher must bypass RunWithDutyCycle
+// for this kernel and pass the FULL slot deadline so size scaling — not
+// chunking — controls duty.
+template <size_t kMaxSize, int kSleepUs, char... kTag>
+static void DirectHddWeightScaledImpl(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local std::string path;
+  if (buf.empty()) {
+    buf.assign(kMaxSize, 'Z');
+    // Distinct per-thread-file key per template instantiation so concurrent
+    // kernels don't collide on the same path.
+    char tag[] = {kTag..., '\0'};
+    path = PerThreadPath((std::string("hddws_") + tag).c_str());
+  }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(512,
+      static_cast<size_t>(duty * static_cast<double>(kMaxSize)));
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { usleep(kSleepUs); continue; }
+    auto n = write(fd, buf.data(), target);
+    benchmark::DoNotOptimize(n);
+    fsync(fd);
+    close(fd);
+    unlink(path.c_str());
+    usleep(kSleepUs);
+  }
+}
+
+// Weight-scaled READ kernel. Uses a single SHARED backing file for all
+// threads (populated exactly once by the first thread to invoke this kernel
+// via std::call_once). Each thread opens the file read-only and preads at
+// rotating offsets; posix_fadvise(DONTNEED) evicts pages so subsequent reads
+// hit the device. Shared-file means setup IO is ~256 MB once total (not
+// 256 MB × 20 threads), small enough to land inside the warmup window.
+template <size_t kMaxSize, int kSleepUs, char... kTag>
+static void DirectHddReadWeightScaledImpl(long deadline_us) {
+  static thread_local int fd = -1;
+  static thread_local std::vector<char> buf;
+  static thread_local size_t thread_offset = 0;
+  // 256 MB backing file: big enough that the page cache can't retain it all
+  // while still being achievable in a single sequential populate. The
+  // populate is triggered from MAIN THREAD before the worker pool starts and
+  // before the first measured slot — see PreInitOnMainThread() below — so the
+  // ~2.5 s populate cost does NOT pollute steady-state IO measurements.
+  static constexpr size_t kFileBytes = 256 * 1024 * 1024;
+  static std::once_flag init_flag;
+  static std::string shared_path;
+  static int shared_keepalive_fd = -1;   // keeps the unlinked inode alive
+  std::call_once(init_flag, [] {
+    char tag[] = {kTag..., '\0'};
+    char p[160];
+    snprintf(p, sizeof(p), "/tmp/mimesys_hddread_shared_%s_%d",
+             tag, static_cast<int>(getpid()));
+    shared_path = p;
+    int wfd = open(shared_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (wfd < 0) return;
+    std::vector<char> initbuf(1024 * 1024, 'R');
+    for (size_t i = 0; i < kFileBytes / initbuf.size(); ++i) {
+      if (write(wfd, initbuf.data(), initbuf.size()) <= 0) break;
+    }
+    fsync(wfd);
+    // Hand the fd off to a static keepalive so the inode survives the unlink
+    // until the process exits (or this fd is explicitly closed).
+    shared_keepalive_fd = wfd;
+    unlink(shared_path.c_str());
+  });
+  if (fd < 0) {
+    // Open the same inode via /proc/self/fd/<keepalive>; the on-disk path is
+    // already unlinked but the inode is still reachable via the keepalive fd.
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", shared_keepalive_fd);
+    fd = open(proc_path, O_RDONLY);
+    if (fd < 0) return;
+    buf.assign(kMaxSize, 0);
+    // Seed per-thread starting offset so concurrent threads touch different
+    // 4 KB pages and we don't hot-share an inflight read across CPUs.
+    thread_offset = (static_cast<size_t>(pthread_self())
+                      * (4 * 1024)) % kFileBytes;
+  }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(512,
+      static_cast<size_t>(duty * static_cast<double>(kMaxSize)));
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    if (thread_offset + target > kFileBytes) thread_offset = 0;
+    posix_fadvise(fd, thread_offset, target, POSIX_FADV_DONTNEED);
+    auto n = pread(fd, buf.data(), target, thread_offset);
+    benchmark::DoNotOptimize(n);
+    thread_offset += target;
+    if (kSleepUs > 0) usleep(kSleepUs);   // 0 = no-throttle: tight read loop
+  }
+}
+
+static void DirectHddRead1MB_WeightScaled50ms(long d)   { DirectHddReadWeightScaledImpl<1024 * 1024,    50000, 'r', 'm'>(d); }
+static void DirectHddRead256KB_WeightScaled50ms(long d) { DirectHddReadWeightScaledImpl< 256 * 1024,    50000, 'r', 'q'>(d); }
+static void DirectHddRead1MB_NoSleep(long d)            { DirectHddReadWeightScaledImpl<1024 * 1024,        0, 'r', 'n'>(d); }
+static void DirectHddRead256KB_NoSleep(long d)          { DirectHddReadWeightScaledImpl< 256 * 1024,        0, 'r', 'o'>(d); }
+
+// Weight-scaled WRITE kernel WITHOUT fsync. Writes go to page cache (memory
+// speed); kernel's writeback flushes them at burst rates beyond the device's
+// sustained synchronous-write ceiling. A 1-sec window can see 300+ MB/s
+// during the flush burst. Trade-off: per-iter write is fast (memory speed),
+// so peak block-IO depends on the OS dirty-page flush cadence, not the
+// stressor's loop rate. Periodic posix_fadvise(DONTNEED) on the prior write
+// nudges the kernel to start writeback eagerly.
+template <size_t kMaxSize, int kSleepUs, char... kTag>
+static void DirectHddWriteNoFsyncWeightScaledImpl(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local std::string path;
+  static thread_local int fd = -1;
+  if (buf.empty()) {
+    buf.assign(kMaxSize, 'W');
+    char tag[] = {kTag..., '\0'};
+    path = PerThreadPath((std::string("hddwnf_") + tag).c_str());
+    fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    unlink(path.c_str());   // file lives until fd close
+  }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(512,
+      static_cast<size_t>(duty * static_cast<double>(kMaxSize)));
+  off_t offset = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    // Rewrite at offset 0 every cycle (single rolling file) so we don't
+    // fragment-allocate forever; kernel writeback still sees the dirty pages.
+    auto n = pwrite(fd, buf.data(), target, 0);
+    benchmark::DoNotOptimize(n);
+    // Hint the kernel to start writeback on this range (async, no wait).
+    sync_file_range(fd, 0, target, SYNC_FILE_RANGE_WRITE);
+    if (kSleepUs > 0) usleep(kSleepUs);   // 0 = no-throttle: tight write loop
+  }
+}
+
+static void DirectHddWriteNF_256KB_WeightScaled50ms(long d) { DirectHddWriteNoFsyncWeightScaledImpl< 256 * 1024, 50000, 'n', 's'>(d); }
+static void DirectHddWriteNF_1MB_WeightScaled50ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<1024 * 1024, 50000, 'n', 'm'>(d); }
+static void DirectHddWriteNF_2MB_WeightScaled50ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<2048 * 1024, 50000, 'n', 'p'>(d); }
+static void DirectHddWriteNF_4MB_WeightScaled50ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<4096 * 1024, 50000, 'n', 'q'>(d); }
+static void DirectHddWriteNF_1MB_WeightScaled25ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<1024 * 1024, 25000, 'n', 'a'>(d); }
+static void DirectHddWriteNF_1MB_WeightScaled10ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<1024 * 1024, 10000, 'n', 'b'>(d); }
+static void DirectHddWriteNF_1MB_NoSleep(long d)            { DirectHddWriteNoFsyncWeightScaledImpl<1024 * 1024,     0, 'n', 'z'>(d); }
+static void DirectHddWriteNF_256KB_NoSleep(long d)          { DirectHddWriteNoFsyncWeightScaledImpl< 256 * 1024,     0, 'n', 'y'>(d); }
+// BurstScaled variants: tight write loop (kSleepUs=0), but the dispatch sets
+// g_current_duty to the per-stressor weight (not 1.0). Inside the kernel,
+// target = duty × kMaxSize → smaller per-write size at lower weights, so the
+// dirty-page creation rate scales with weight. Combined with the existing
+// per_entry_sleep_us between bursts, this restores monotone dose-response for
+// WRITE stressors where the writeback ceiling otherwise saturates the signal.
+static void DirectHddWriteNF_1MB_BurstScaled(long d)        { DirectHddWriteNoFsyncWeightScaledImpl<1024 * 1024,     0, 'n', 'B'>(d); }
+static void DirectHddWriteNF_256KB_BurstScaled(long d)      { DirectHddWriteNoFsyncWeightScaledImpl< 256 * 1024,     0, 'n', 'C'>(d); }
+
+// HYBRID stressor: write 1 MB + sync_file_range, then a TIGHT CRC32 spin for
+// kSpinUs microseconds (no usleep). Per-iter CPU = 100% (no sleep), per-iter
+// IO ≈ 1 MB / (write_time + kSpinUs). At kSpinUs=30 ms: 1 MB / ~35 ms ≈ 28
+// MB/s/thread. 20 threads × 28 MB/s = 560 MB/s nominal (device-cap ~290).
+// CPU% stays near 100% during the CRC spin → covers the high-CPU + high-IO
+// regime the throttled stressors can't reach.
+template <size_t kMaxSize, int kSpinUs, char... kTag>
+static void DirectHddWriteCRCSpinImpl(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local std::vector<char> crc_buf;
+  static thread_local std::string path;
+  static thread_local int fd = -1;
+  static constexpr size_t kCrcBytes = 64 * 1024;
+  if (buf.empty()) {
+    buf.assign(kMaxSize, 'W');
+    crc_buf.assign(kCrcBytes, 'C');
+    char tag[] = {kTag..., '\0'};
+    path = PerThreadPath((std::string("hddwcrc_") + tag).c_str());
+    fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    unlink(path.c_str());
+  }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(512,
+      static_cast<size_t>(duty * static_cast<double>(kMaxSize)));
+  auto loop_start = std::chrono::steady_clock::now();
+  uint32_t crc = 0;
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    // 1 MB write to page cache + async writeback hint
+    auto n = pwrite(fd, buf.data(), target, 0);
+    benchmark::DoNotOptimize(n);
+    sync_file_range(fd, 0, target, SYNC_FILE_RANGE_WRITE);
+    // Tight CRC32 spin for kSpinUs microseconds — keeps CPU at 100%.
+    auto spin_start = std::chrono::steady_clock::now();
+    while (true) {
+      auto spin_el = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - spin_start).count();
+      if (spin_el >= kSpinUs) break;
+      crc = __builtin_ia32_crc32di(crc, *reinterpret_cast<uint64_t*>(crc_buf.data() + (crc & 0xFFF8)));
+      benchmark::DoNotOptimize(crc);
+    }
+  }
+}
+
+static void DirectHddWriteCRC_1MB_30ms(long d) { DirectHddWriteCRCSpinImpl<1024 * 1024, 30000, 'h', 'c'>(d); }
+static void DirectHddWriteCRC_1MB_15ms(long d) { DirectHddWriteCRCSpinImpl<1024 * 1024, 15000, 'h', 'd'>(d); }
+static void DirectHddWriteCRC_1MB_50ms(long d) { DirectHddWriteCRCSpinImpl<1024 * 1024, 50000, 'h', 'e'>(d); }
+
+// O_DIRECT writes: bypass page cache, go straight to device. Each pwrite
+// blocks until device ack — synchronous-like but no journal commit (unlike
+// fsync). Per-thread throughput = device write latency * size. Many threads
+// can keep multiple queued requests in flight at the device layer.
+template <size_t kMaxSize, int kSleepUs, char... kTag>
+static void DirectHddWriteDirectWeightScaledImpl(long deadline_us) {
+  static thread_local char* buf = nullptr;
+  static thread_local std::string path;
+  static thread_local int fd = -1;
+  static constexpr size_t kAlign = 4096;
+  if (!buf) {
+    char tag[] = {kTag..., '\0'};
+    path = PerThreadPath((std::string("hddwd_") + tag).c_str());
+    fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    if (fd < 0) return;
+    unlink(path.c_str());
+    if (posix_memalign(reinterpret_cast<void**>(&buf), kAlign, kMaxSize) != 0) {
+      buf = nullptr;
+      return;
+    }
+    memset(buf, 'D', kMaxSize);
+  }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(kAlign,
+      static_cast<size_t>(duty * static_cast<double>(kMaxSize)));
+  target = (target / kAlign) * kAlign;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    auto n = pwrite(fd, buf, target, 0);
+    benchmark::DoNotOptimize(n);
+    if (kSleepUs > 0) usleep(kSleepUs);
+  }
+}
+
+static void DirectHddWriteD_1MB_WeightScaled50ms(long d) { DirectHddWriteDirectWeightScaledImpl<1024 * 1024, 50000, 'd', 'm'>(d); }
+static void DirectHddWriteD_1MB_WeightScaled25ms(long d) { DirectHddWriteDirectWeightScaledImpl<1024 * 1024, 25000, 'd', 'a'>(d); }
+static void DirectHddWriteD_1MB_WeightScaled0ms(long d)  { DirectHddWriteDirectWeightScaledImpl<1024 * 1024,     0, 'd', '0'>(d); }
+
+// Four candidates spanning the IO bandwidth space (max size × sleep_us):
+//   4KB   / 10 ms : LIGHT       — peak ~  8 MB/s @ 20 threads
+//  16KB   /  5 ms : LIGHT-MID   — peak ~ 50 MB/s
+// 256KB   / 50 ms : MID         — peak ~ 75 MB/s
+//   1MB   / 50 ms : HEAVY       — peak ~ 85 MB/s (device-capped)
+static void DirectHdd4KB_WeightScaled10ms(long d)   { DirectHddWeightScaledImpl<     4 * 1024,  10000, '4', 'k'>(d); }
+static void DirectHdd16KB_WeightScaled5ms(long d)   { DirectHddWeightScaledImpl<    16 * 1024,   5000, '1', '6'>(d); }
+static void DirectHdd256KB_WeightScaled50ms(long d) { DirectHddWeightScaledImpl<   256 * 1024,  50000, '2', '5'>(d); }
+static void DirectHdd1MB_WeightScaled50ms(long d)   { DirectHddWeightScaledImpl<1024 * 1024,   50000, '1', 'm'>(d); }
+
+// ~16 MB/s per thread saturated: 1 MB write + 50 ms sleep + fsync.
+// Per-iter time ≈ 10 ms write/fsync + 50 ms sleep = ~60 ms.
+// Goal: linear-in-weight IO with NO 1-MB minimum spike at low weights.
+static void DirectHdd1MB_Throttled50ms(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local std::string path;
+  static constexpr size_t kSize = 1024 * 1024;
+  static constexpr int kSleepUs = 50000;
+  if (buf.empty()) {
+    buf.assign(kSize, 'Z');
+    path = PerThreadPath("hdd1m_t50");
+  }
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { usleep(kSleepUs); continue; }
+    auto n = write(fd, buf.data(), buf.size());
+    benchmark::DoNotOptimize(n);
+    fsync(fd);
+    close(fd);
+    unlink(path.c_str());
+    usleep(kSleepUs);
+  }
+}
+
+// ── Low-IO throttled kernels (fill the [1000, 10000) sectors/s gap) ─────────
+//
+// Stable, near-linear-in-weight IO bandwidth — each iteration is a fixed-size
+// write followed by a fixed sleep, so IO rate per thread is roughly
+//   bytes/iter / (write_latency + sleep_us).
+// Aggregated across N threads, total IO scales linearly with N.
+
+// ~3.2 MB/s per thread: 16 KB write + 5 ms sleep + fsync.
+// Sectors/s per thread ≈ 6.4k → in the missing [1000, 10000) bucket.
+static void DirectHdd16KB_Throttled5ms(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local std::string path;
+  static constexpr size_t kSize = 16 * 1024;
+  static constexpr int kSleepUs = 5000;
+  if (buf.empty()) {
+    buf.assign(kSize, 'Z');
+    path = PerThreadPath("hdd16k_t5");
+  }
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { usleep(kSleepUs); continue; }
+    auto n = write(fd, buf.data(), buf.size());
+    benchmark::DoNotOptimize(n);
+    fsync(fd);
+    close(fd);
+    unlink(path.c_str());
+    usleep(kSleepUs);
+  }
+}
+
+// ~400 KB/s per thread: 4 KB write + 10 ms sleep + fsync.
+// Sectors/s per thread ≈ 800 → fills the [100, 1000) bucket.
+static void DirectHdd4KB_Throttled10ms(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local std::string path;
+  static constexpr size_t kSize = 4 * 1024;
+  static constexpr int kSleepUs = 10000;
+  if (buf.empty()) {
+    buf.assign(kSize, 'Z');
+    path = PerThreadPath("hdd4k_t10");
+  }
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { usleep(kSleepUs); continue; }
+    auto n = write(fd, buf.data(), buf.size());
+    benchmark::DoNotOptimize(n);
+    fsync(fd);
+    close(fd);
+    unlink(path.c_str());
+    usleep(kSleepUs);
+  }
+}
+
 using KernelFn = std::function<void(long)>;
 static const std::unordered_map<std::string, KernelFn>& Kernels() {
   static const std::unordered_map<std::string, KernelFn> m = {
+    // BM_HASHING_*_cold direct kernels — see InitCrcCtx() for the cold-faithful
+    // rewrite (256 MB buffer + 64 KB stride). Framework fallback is not viable
+    // here because GetNumBenchmarkItersFromExecutionPlan returns num_iters=0
+    // (kDefaultActions->second is left at 0 by ProfileActions), so the
+    // framework path runs zero iterations.
     {"BM_HASHING_Extendcrc32cinternal_Fleet_cold", DirectExtendCrc32c},
     {"BM_HASHING_Computecrc32c_Fleet_cold",        DirectComputeCrc32c},
     {"BM_LIBC_Memcpy_Fleet_L1",                    DirectMemcpy},
@@ -862,11 +1281,38 @@ static const std::unordered_map<std::string, KernelFn>& Kernels() {
     // IO stressors — replicate stress-ng patterns via direct syscalls.
     // Per-thread temp file under /tmp keyed by pthread_self() to avoid
     // contention between concurrent worker threads.
-    {"BM_STRESS_NG_Readahead",       DirectReadahead},
-    {"BM_STRESS_NG_Fallocate_4MB",   DirectFallocate4MB},
-    {"BM_STRESS_NG_Fallocate_256KB", DirectFallocate256KB},
-    {"BM_STRESS_NG_Hdd_1MB",         DirectHdd1MB},
-    {"BM_STRESS_NG_Hdd_64KB",        DirectHdd64KB},
+    {"BM_STRESS_NG_Readahead",                 DirectReadahead},
+    {"BM_STRESS_NG_Fallocate_4MB",             DirectFallocate4MB},
+    {"BM_STRESS_NG_Fallocate_256KB",           DirectFallocate256KB},
+    {"BM_STRESS_NG_Hdd_1MB",                   DirectHdd1MB},
+    {"BM_STRESS_NG_Hdd_1MB_Throttled_50ms",    DirectHdd1MB_Throttled50ms},
+    {"BM_STRESS_NG_Hdd_4KB_WeightScaled_10ms",   DirectHdd4KB_WeightScaled10ms},
+    {"BM_STRESS_NG_Hdd_16KB_WeightScaled_5ms",   DirectHdd16KB_WeightScaled5ms},
+    {"BM_STRESS_NG_Hdd_256KB_WeightScaled_50ms", DirectHdd256KB_WeightScaled50ms},
+    {"BM_STRESS_NG_Hdd_1MB_WeightScaled_50ms",   DirectHdd1MB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddRead_1MB_WeightScaled_50ms",   DirectHddRead1MB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddRead_256KB_WeightScaled_50ms", DirectHddRead256KB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddRead_1MB_NoSleep",             DirectHddRead1MB_NoSleep},
+    {"BM_STRESS_NG_HddRead_256KB_NoSleep",           DirectHddRead256KB_NoSleep},
+    {"BM_STRESS_NG_HddWriteNF_256KB_NoSleep",        DirectHddWriteNF_256KB_NoSleep},
+    {"BM_STRESS_NG_HddWriteNF_256KB_WeightScaled_50ms", DirectHddWriteNF_256KB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_50ms", DirectHddWriteNF_1MB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddWriteNF_2MB_WeightScaled_50ms", DirectHddWriteNF_2MB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddWriteNF_4MB_WeightScaled_50ms", DirectHddWriteNF_4MB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_25ms", DirectHddWriteNF_1MB_WeightScaled25ms},
+    {"BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_10ms", DirectHddWriteNF_1MB_WeightScaled10ms},
+    {"BM_STRESS_NG_HddWriteNF_1MB_NoSleep",           DirectHddWriteNF_1MB_NoSleep},
+    {"BM_STRESS_NG_HddWriteNF_1MB_BurstScaled",       DirectHddWriteNF_1MB_BurstScaled},
+    {"BM_STRESS_NG_HddWriteNF_256KB_BurstScaled",     DirectHddWriteNF_256KB_BurstScaled},
+    {"BM_STRESS_NG_HddWriteCRC_1MB_30ms",             DirectHddWriteCRC_1MB_30ms},
+    {"BM_STRESS_NG_HddWriteCRC_1MB_15ms",             DirectHddWriteCRC_1MB_15ms},
+    {"BM_STRESS_NG_HddWriteCRC_1MB_50ms",             DirectHddWriteCRC_1MB_50ms},
+    {"BM_STRESS_NG_HddWriteD_1MB_WeightScaled_50ms",  DirectHddWriteD_1MB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddWriteD_1MB_WeightScaled_25ms",  DirectHddWriteD_1MB_WeightScaled25ms},
+    {"BM_STRESS_NG_HddWriteD_1MB_WeightScaled_0ms",   DirectHddWriteD_1MB_WeightScaled0ms},
+    {"BM_STRESS_NG_Hdd_64KB",                  DirectHdd64KB},
+    {"BM_STRESS_NG_Hdd_16KB_Throttled_5ms",    DirectHdd16KB_Throttled5ms},
+    {"BM_STRESS_NG_Hdd_4KB_Throttled_10ms",    DirectHdd4KB_Throttled10ms},
   };
   return m;
 }
@@ -940,8 +1386,92 @@ void RunMimesysExecutionOrder(
     auto loop_start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
       loop_start_time.time_since_epoch()).count();
 
+    // ── Fair per-entry time slicing ────────────────────────────────────────
+    // Each entry in execution_order gets a proportional slice of slot time
+    // instead of consuming the full remaining deadline (the prior behavior
+    // let the FIRST entry eat the whole slot). The slice is sized so that
+    // ONE pass through execution_order fills the slot exactly:
+    //   per_entry_active_us = duration_us * duty / n_entries
+    //   per_entry_sleep_us  = duration_us * (1 - duty) / n_entries
+    // This makes mixed-stressor actions actually run all the stressors with
+    // shares matching their weights (which num_iters now encodes via the
+    // ratio*100 scaling for direct kernels).
     auto time_diff_us = 0LL;
     auto prev_time_diff_us = 0LL;
+    {
+      const size_t n_entries = execution_order.size();
+      if (n_entries == 0) return;
+      const double duty = std::max(0.0, std::min(1.0, 1.0 - no_op_ratio));
+      const long per_entry_active_us = static_cast<long>(std::round(
+          static_cast<double>(duration_us) * duty / static_cast<double>(n_entries)));
+      const long per_entry_sleep_us = static_cast<long>(std::round(
+          static_cast<double>(duration_us) * (1.0 - duty) / static_cast<double>(n_entries)));
+
+      // Per-stressor weight = count(spec_idx in execution_order) / 100. Used by
+      // *_BurstScaled kernels which scale target = weight × kMaxSize so that
+      // dirty-page / read-throughput rate scales with weight (option 2 — fixes
+      // the write-saturation problem where NoSleep variants peg at the
+      // writeback ceiling regardless of weight).
+      std::unordered_map<int, double> per_spec_weight;
+      for (int idx : execution_order) per_spec_weight[idx] += 1.0;
+      for (auto& kv : per_spec_weight) kv.second /= 100.0;
+
+      for (int spec_idx : execution_order) {
+        auto now = std::chrono::steady_clock::now();
+        long long elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            now - loop_start_time).count();
+        long remaining = static_cast<long>(duration_us) - static_cast<long>(elapsed);
+        if (remaining <= 0) break;
+
+        auto it = kDefaultActions->begin();
+        std::advance(it, spec_idx);
+        const std::string& spec = it->first;
+        auto& kernels = direct_kernels::Kernels();
+        auto kit = kernels.find(spec);
+        long this_active = std::min<long>(per_entry_active_us, remaining);
+
+        auto kstart = std::chrono::steady_clock::now();
+        if (kit != kernels.end()) {
+          if (spec.find("BurstScaled") != std::string::npos) {
+            // Per-stressor weight controls request size (target = w × kMaxSize)
+            // so dirty-page / read rate scales with weight even with no in-kernel
+            // sleep. The dispatch-level per_entry_sleep_us still throttles bursts.
+            auto wit = per_spec_weight.find(spec_idx);
+            direct_kernels::g_current_duty = (wit != per_spec_weight.end())
+                ? wit->second : 1.0;
+            kit->second(this_active);
+          } else if (spec.find("WeightScaled") != std::string::npos) {
+            // We already gave the kernel its exact per-entry time share.
+            // Set g_current_duty = 1.0 so the kernel uses its FULL configured
+            // write size during that share.
+            direct_kernels::g_current_duty = 1.0;
+            kit->second(this_active);
+          } else {
+            // Direct kernel: run for the per-entry share. Bypass the inner
+            // RunWithDutyCycle since we've already computed the exact active
+            // time; idle time is folded into the per_entry_sleep_us below.
+            kit->second(this_active);
+          }
+        } else {
+          benchmark::RunSpecifiedBenchmarks(&display_reporter, spec);
+        }
+        long long kelapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - kstart).count();
+        index_invocation_count[spec_idx] += kelapsed;
+
+        // Distribute idle time evenly between entries so the duty cycle
+        // pattern stays smooth (no end-of-slot burst sleep).
+        long long now_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - loop_start_time).count();
+        long remaining_after_busy = static_cast<long>(duration_us) - static_cast<long>(now_elapsed);
+        long this_sleep = std::min<long>(per_entry_sleep_us, remaining_after_busy);
+        if (this_sleep > 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(this_sleep));
+        }
+      }
+      return;   // exit the function (the legacy while loop below is bypassed)
+    }
+    // ── Legacy path (unreachable; kept temporarily as a guard) ─────────────
     while (time_diff_us < duration_us) {
       for (int spec_idx : execution_order) {
         // Increment the invocation count for this index
@@ -954,17 +1484,18 @@ void RunMimesysExecutionOrder(
           auto& kernels = direct_kernels::Kernels();
           auto kit = kernels.find(spec);
           if (kit != kernels.end()) {
-            // Direct invocation: run until remaining slot deadline, but with
-            // sub-iteration duty cycling so per-thread CPU% follows the
-            // per-thread total weight (1 - no_op_ratio) instead of saturating
-            // for any non-zero weight.
             auto start_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 start.time_since_epoch()).count();
             long remaining_us = static_cast<long>(duration_us)
                               - (start_us - loop_start_time_us);
             if (remaining_us > 0) {
               double duty = std::max(0.0, std::min(1.0, 1.0 - no_op_ratio));
-              direct_kernels::RunWithDutyCycle(kit->second, remaining_us, duty);
+              if (spec.find("WeightScaled") != std::string::npos) {
+                direct_kernels::g_current_duty = duty;
+                kit->second(remaining_us);
+              } else {
+                direct_kernels::RunWithDutyCycle(kit->second, remaining_us, duty);
+              }
               used_duty_cycle = true;
             }
           } else {
@@ -973,10 +1504,7 @@ void RunMimesysExecutionOrder(
         }
         auto end = std::chrono::steady_clock::now();
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-        // std::cerr << "[BM_Mimesys] Finished benchmark:" << spec << ">" << elapsed_us << std::endl;
         index_invocation_count[spec_idx] += elapsed_us;
-        // Outer sleep is only needed when the kernel ran as a tight loop (i.e.
-        // we did NOT do sub-iteration duty cycling above).
         long long current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count();
         if (!used_duty_cycle) {
@@ -1108,6 +1636,23 @@ void ProfileActions(const std::vector<std::string>& action_names) {
       std::advance(it, spec_idx);
       const std::string& spec = it->first;
 
+      // For direct kernels (the common case in our setup), skip framework
+      // profiling — RunSpecifiedBenchmarks measures the slow framework path
+      // (e.g., ~4 s for cold CRC), which produces a num_iters value out of
+      // proportion with the per-iter time of OTHER direct kernels. The result
+      // is that mixed-stressor actions get a distorted weight ratio in
+      // execution_order. Assign a uniform short time_per_iter so num_iters
+      // (computed in GetNumBenchmarkItersFromExecutionPlan as round(target_time
+      // / time_per_iter)) scales cleanly with the requested weight.
+      auto& dk = direct_kernels::Kernels();
+      if (dk.count(spec)) {
+        it->second = 5000;   // 5 ms — close to the slowest direct kernel's
+                              // single-iter time (HddWrite_1MB ≈ 5 ms), so a
+                              // per-entry budget of 5 ms cleanly fits ONE iter
+                              // of any direct kernel.
+        continue;
+      }
+
       long long total_elapsed_us = 0;
       int num_trials = 5;
       for (int i = 0; i < num_trials; ++i) {
@@ -1162,6 +1707,7 @@ struct WorkerTask {
 
 class WorkerPool {
  public:
+  size_t num_workers() const { return n_; }
   void Init(size_t n) {
     if (workers_.size() == n) return;
     Shutdown();
@@ -1256,7 +1802,12 @@ class WorkerPool {
         cv_complete_.notify_one();
         return;
       }
-      long long remaining = local.deadline_us - NowUs();
+      long long _wake_us = NowUs();
+      long long remaining = local.deadline_us - _wake_us;
+      long long _wake_latency = local.deadline_us - static_cast<long long>(local.deadline_us); // 0 baseline
+      // Worker reads deadline; how much time elapsed from main setting deadline (deadline_us - duration_us) to now (_wake_us)?
+      // We can't know duration without it being stored, so just report remaining.
+      long long _kernel_start = _wake_us;
       if (local.sleep_only) {
         if (remaining > 0) {
           std::this_thread::sleep_for(std::chrono::microseconds(remaining));
@@ -1269,6 +1820,15 @@ class WorkerPool {
             *local.execution_order, local.no_op_ratio,
             dummy_count, dummy_reporter,
             static_cast<unsigned int>(remaining));
+      }
+      long long _kernel_end = NowUs();
+      if (j == 0 && !local.sleep_only) {
+        std::cerr << "WORKER0 wake_us=" << _wake_us
+                  << " deadline=" << local.deadline_us
+                  << " remaining_given=" << remaining << "us"
+                  << " kernel_ran=" << (_kernel_end - _kernel_start) << "us"
+                  << " late_vs_deadline=" << (_kernel_end - local.deadline_us) << "us"
+                  << std::endl;
       }
       {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1388,14 +1948,107 @@ static void BM_Mimesys(benchmark::State& state) {
           ? iteration * (static_cast<unsigned int>(execution_orders.size()) + 1)
           : iteration * static_cast<unsigned int>(execution_orders.size());
 
+      // ── Main-thread pre-init: trigger lazy setup (file populate, big buf
+      //    alloc) for IO-resident direct kernels BEFORE the worker pool
+      //    spins up. Running it from the main thread sequentializes the
+      //    expensive populates (e.g. 256 MB shared-file write for the
+      //    HddRead kernels) into a single block before any timed work
+      //    begins; we then trigger a TACC stats sample at warmup-end so the
+      //    first measured delta starts AFTER the populate is done.
+      //    We invoke each registered IO kernel with duty=0 and a 1 ms
+      //    deadline so it just runs its call_once init and returns.
+      {
+        double saved = direct_kernels::g_current_duty;
+        direct_kernels::g_current_duty = 0.0;
+        for (const auto& kv : direct_kernels::Kernels()) {
+          const std::string& name = kv.first;
+          if (name.find("HddRead") == std::string::npos &&
+              name.find("HddWriteNF") == std::string::npos &&
+              name.find("WeightScaled") == std::string::npos) continue;
+          kv.second(1000);  // 1 ms; triggers std::call_once if present
+        }
+        direct_kernels::g_current_duty = saved;
+      }
+
       // ── Initialize persistent worker pool to max thread width seen ───────
       size_t pool_n = 0;
       for (const auto& eo : execution_orders) pool_n = std::max(pool_n, eo.size());
       if (pool_n == 0) pool_n = std::thread::hardware_concurrency();
       persistent_pool::g_pool.Init(pool_n);
 
+      // ── Pin main thread away from worker CPUs (last logical core).
+      //    Without this, main thread + worker 0 contend for CPU 0 and the
+      //    measured per-core utilization caps around 89% even at long slots.
+      {
+        cpu_set_t main_set;
+        CPU_ZERO(&main_set);
+        unsigned int main_cpu = std::thread::hardware_concurrency() - 1;
+        CPU_SET(main_cpu, &main_set);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &main_set);
+      }
+
+      // ── Kernel pre-init pass: trigger each IO-resident direct kernel's
+      //    first-call setup (file allocation, shared-file populate, big buf
+      //    alloc) BEFORE the timed steady-state loop. Without this, the first
+      //    slot that hits a previously-unused weight-scaled IO kernel pays a
+      //    ~hundred-MB write tax for setup that pollutes the IO measurement.
+      //    We dispatch one slot per kernel-name with all 20 worker positions
+      //    at duty=1.0 and a 20 ms deadline — each kernel returns quickly
+      //    once its lazy-init is done; threads that don't need any setup
+      //    just spin briefly.
+      {
+        // Save current duty so we can restore (we set 1.0 here)
+        double saved = direct_kernels::g_current_duty;
+        direct_kernels::g_current_duty = 1.0;
+        auto& kernels = direct_kernels::Kernels();
+        for (int spec_idx = 0; spec_idx < static_cast<int>(kDefaultActions->size()); ++spec_idx) {
+          auto it = kDefaultActions->begin();
+          std::advance(it, spec_idx);
+          const std::string& spec = it->first;
+          // Pre-init only the kernels that allocate disk-backed state.
+          if (spec.find("HddRead") == std::string::npos &&
+              spec.find("HddWriteNF") == std::string::npos &&
+              spec.find("WeightScaled") == std::string::npos) continue;
+          if (kernels.find(spec) == kernels.end()) continue;
+          // Per-worker execution_order = [spec_idx]; no-op ratio 0.
+          const size_t nw = persistent_pool::g_pool.num_workers();
+          std::vector<std::vector<int>> init_orders(nw, std::vector<int>{spec_idx});
+          std::vector<double> init_noop(nw, 0.0);
+          long long init_deadline = std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count() + 50000;  // 50 ms
+          persistent_pool::g_pool.DispatchSlot(init_orders, init_noop, init_deadline);
+        }
+        direct_kernels::g_current_duty = saved;
+      }
+
+      // ── Warmup dispatch: triggers worker-pool first-dispatch cv chain,
+      //    forces each worker's CPU pinning + set_mempolicy syscalls to run,
+      //    and warms per-worker thread_local kernel state by running the
+      //    first window's execution plan.
+      //    HPCPerfStats sampler captures its first %begin row ~1.4s after
+      //    binary launch (one full sample interval). Holding the warmup for
+      //    at least that long ensures the first REAL slot (i=0) begins right
+      //    after that first sample boundary, so /proc/stat deltas measure
+      //    busy time exclusively from the steady-state slot loop. Result:
+      //    no startup-window artifact dragging the first per-core %CPU below
+      //    the steady-state 99.8%.
+      if (!execution_orders.empty()) {
+        // Extended 5 s warmup gives a wide buffer for the main-thread populate
+        // tail and writeback flushes to settle before the timed loop.
+        // (Earlier we also called CollectTACCStatsAsync at warmup-end to
+        // create a clean baseline paragraph, but that shifted the trace by
+        // one delta and broke the dataloader's `_prepend_zero_metric_slot`
+        // cycle-2 alignment — curr/sleep got swapped. Reverted.)
+        long long warmup_deadline = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() + 5000000;  // 5s
+        persistent_pool::g_pool.DispatchSlot(
+            execution_orders[0], no_op_ratios[0], warmup_deadline);
+      }
+
       while (count < loop_limit) {
         for (size_t i = 0; i < execution_orders.size(); ++i) {
+          auto _t_pre_dispatch = std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
           if (duration_us > 0) {
             auto thread_start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1405,8 +2058,18 @@ static void BM_Mimesys(benchmark::State& state) {
             persistent_pool::g_pool.DispatchSlot(
                 execution_orders[i], no_op_ratios[i], slot_deadline_us);
           }
+          auto _t_post_dispatch = std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
 
-          CollectTACCStats(tacc_stats_dir);
+          CollectTACCStatsAsync(tacc_stats_dir);
+          auto _t_post_collect = std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+          std::cerr << "SLOT_PROF i=" << i
+                    << " dispatch=" << (_t_post_dispatch - _t_pre_dispatch) << "us"
+                    << " collect=" << (_t_post_collect - _t_post_dispatch) << "us"
+                    << " duration_us=" << duration_us
+                    << " over=" << (long long)(_t_post_dispatch - _t_pre_dispatch) - (long long)duration_us << "us"
+                    << std::endl;
 
           auto current_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1433,7 +2096,7 @@ static void BM_Mimesys(benchmark::State& state) {
         if (do_sleep) {
           std::this_thread::sleep_for(std::chrono::microseconds(duration_us));
           count++;
-          CollectTACCStats(tacc_stats_dir);
+          CollectTACCStatsAsync(tacc_stats_dir);
         }
 
         duration_us = expected_duration_us;

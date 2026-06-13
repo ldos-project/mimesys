@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torch.distributions import Normal
 
@@ -283,6 +284,33 @@ class GaussianDiffusion(nn.Module):
         assert noise.shape == noise_pred.shape
 
         loss = self.loss_fn(noise_pred, noise)
+
+        # Optional variant (c): auxiliary row-sum supervision. The trainer sets
+        # `self.row_sum_aux_weight > 0` to enable. Decodes the noise prediction
+        # back to a predicted x0, sums each thread row's stressor weights, and
+        # compares against the per-core CPU% target (alphabetical metric layout:
+        # indices [0:20] = per-core CPU 0..19). Encourages the simple algebraic
+        # relationship `row_sum ∝ CPU%` that the U-Net's spatial mixing makes
+        # hard to learn directly.
+        if getattr(self, "row_sum_aux_weight", 0.0) > 0.0:
+            x0_pred = (
+                xt - extract(self.sqrt_one_minus_alpha_hat, t, x0.shape) * noise_pred
+            ) / extract(self.sqrt_alpha_hat, t, x0.shape)
+            # x0_pred shape conventions: the model returns "b h c" (h=threads,
+            # c=stressors) per TemporalUnetCond.forward. So row sums are along c.
+            if x0_pred.dim() == 3 and x0_pred.shape[-1] == 13 and x0_pred.shape[1] == 20:
+                # Map raw model output [-1, 1] to action weights [0, 1].
+                row_sums = ((x0_pred + 1.0) * 0.5).sum(dim=-1)        # (B, 20)
+                # Per-core CPU% target in metric: alphabetical → first 20 are cores.
+                # Metric is normalized to [-1, 1]; map back to [0, 1] for scale match.
+                metric = context_cond["metric"]
+                if metric.dim() == 2 and metric.shape[1] >= 20:
+                    cpu_target = (metric[:, :20] + 1.0) * 0.5         # (B, 20)
+                    # Only supervise the unmasked (cfg-enabled) samples.
+                    sample_mask = cfg_mask.view(-1, 1)                  # (B, 1)
+                    aux = F.l1_loss(row_sums * sample_mask,
+                                    cpu_target * sample_mask)
+                    loss = loss + self.row_sum_aux_weight * aux
 
         return loss
 

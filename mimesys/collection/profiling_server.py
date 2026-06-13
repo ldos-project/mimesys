@@ -41,6 +41,19 @@ class ProfileRequest(BaseModel):
     low_resource_penalty_weight: float = 0.0  # blend in relative L1 to penalize low-target errors more
     membw_reward_weight: float = 1.0  # multiplier on memory_bandwidth L1 reward term (socket-aggregated)
     llc_reward_weight: float = 1.0    # multiplier on l3_cache_usage L1 reward term (socket-aggregated)
+    io_reward_weight: float = 1.0     # multiplier on io L1 reward term (applied in _parse_local_stats)
+    cpu_reward_weight: float = 1.0    # multiplier on avg_cpu_utilizations* L1 reward terms
+    # Per-metric measurement slice: keep entries where (m_idx % period == offset).
+    # Defaults (3, 1) match the historical 2-window deploy ([prev_state, curr, sleep] cycle).
+    # For 1-window deploys produced when train.ddpo.skip_prev_state=True, use (2, 0)
+    # so the slice picks the `curr` entries of the [curr, sleep, curr, sleep, ...] trace.
+    reward_slice_period: int = 3
+    reward_slice_offset: int = 1
+    # If True, the reward signal (`avg_emd_results_by_batch`) per sample is the
+    # flat mean across all 23 metric keys (20 per-core CPU + io + llc + membw).
+    # Per-core CPU dominates at 20/23 ≈ 87% of the reward. Default False uses
+    # the 4-family-balanced weighted mean (cpu collapses to 1 family, ~25%).
+    use_raw_mean_reward: bool = False
 
     class Config:
         arbitrary_types_allowed = True
@@ -170,6 +183,15 @@ class Profiler:
         # the script sees only a handful of plans, silently runs them, and ships back
         # whatever stale stats files happen to be in ~/results from a previous run.
         command = (
+            # Kill any leftover worker from a previous run and clear its stale
+            # stats — otherwise a detached benchmark/collect process (e.g. after the
+            # orchestrator was killed) races the new plans and stalls this chunk.
+            # [x]-bracket regex so pkill doesn't match this dispatch shell's own
+            # command line (which contains these patterns) and kill itself.
+            f"sudo pkill -9 -f '[m]imesys_benchmark' 2>/dev/null; "
+            f"pkill -9 -f '[c]ollect_mimesys_data' 2>/dev/null; "
+            f"sudo pkill -9 -f '[b]azel.*mimesys' 2>/dev/null; "
+            f"rm -rf /users/{self.user_name}/results/* 2>/dev/null; "
             f"cd {remote_execution_plan_path} && "
             f"rm -f *.h5 && "
             f"unzip -o {os.path.basename(file_path)} && "
@@ -185,10 +207,21 @@ class Profiler:
         )
 
         print("Start collection command")
-        mimesys_iters = os.environ.get("MIMESYS_ITERS", "3")
+        mimesys_iters = os.environ.get("MIMESYS_ITERS", "4")
+        # Forward MIMESYS_SLOT_US / MIMESYS_SLEEP from the controller env to the
+        # worker. Worker's collect_mimesys_data.sh defaults SLOT_US=2000000 (2 s)
+        # — set MIMESYS_SLOT_US=1000000 here for 1-s slots matching the windowed-
+        # DTW deploy contract. Omitted vars fall back to worker defaults.
+        env_prefix = f"MIMESYS_ITERS={mimesys_iters}"
+        slot_us = os.environ.get("MIMESYS_SLOT_US")
+        if slot_us:
+            env_prefix += f" MIMESYS_SLOT_US={slot_us}"
+        sleep_env = os.environ.get("MIMESYS_SLEEP")
+        if sleep_env is not None:
+            env_prefix += f" MIMESYS_SLEEP={sleep_env}"
         machine.run_command_background(
             client=client,
-            command=f"cd /users/{self.user_name} && MIMESYS_ITERS={mimesys_iters} bash collect_mimesys_metrics.sh {self.user_name} {self.my_hostname} {destination_path} {host_idx} > collect_mimesys_metrics.log 2>&1"
+            command=f"cd /users/{self.user_name} && {env_prefix} bash collect_mimesys_metrics.sh {self.user_name} {self.my_hostname} {destination_path} {host_idx} > collect_mimesys_metrics.log 2>&1"
         )
 
         print("Sent collection command")
@@ -366,18 +399,8 @@ class Profiler:
                     med_metrics_list = [value for metrics in med_metrics.values() for value in metrics.values()]
                     std_metrics_list = [value for metrics in std_metrics.values() for value in metrics.values()]
 
-                    # Per-plan wall-clock = first → last snapshot timestamp.
-                    # Used downstream to filter out straggler plans whose total
-                    # runtime exceeded the slot budget by some factor.
-                    try:
-                        ts_first = float(parsed_traces[0]["timestamp"][0].split()[0])
-                        ts_last  = float(parsed_traces[-1]["timestamp"][0].split()[0])
-                        wall_s   = max(0.0, ts_last - ts_first)
-                    except Exception:
-                        wall_s = float("nan")
-
                     plan_stat_pairs.append(
-                        (actions, avg_metrics_list, med_metrics_list, std_metrics_list, wall_s)
+                        (actions, avg_metrics_list, med_metrics_list, std_metrics_list)
                     )
 
             return plan_stat_pairs
@@ -461,7 +484,13 @@ class Profiler:
                             # emd = wasserstein_distance(metrics, ground_truth[target_metric])
                             m_min, m_max = trace_range.get(target_metric, (0, 0))
 
-                            normalized_metrics = [(m - m_min) / (m_max - m_min + 1e-5) for m_idx, m in enumerate(metrics) if m_idx % 3 == 1]
+                            normalized_metrics = [(m - m_min) / (m_max - m_min + 1e-5) for m_idx, m in enumerate(metrics) if m_idx % req.reward_slice_period == req.reward_slice_offset]
+                            # Drop curr_0 (warmup-contaminated first measured slot).
+                            # Mirror the _parse_local_stats path; override with
+                            # MIMESYS_KEEP_FIRST_CURR=1 for legacy compat.
+                            if (os.environ.get("MIMESYS_KEEP_FIRST_CURR", "0") != "1"
+                                    and len(normalized_metrics) > 1):
+                                normalized_metrics = normalized_metrics[1:]
                             # normalized_metrics = [m for m in normalized_metrics if m > 0]
                             normalized_ground_truth = [(m - m_min) / (m_max - m_min + 1e-5) for m in ground_truth[target_metric]]
 
@@ -596,11 +625,22 @@ class Profiler:
                         m_min, m_max = trace_range.get(target_metric, (0, 0))
                         denom = (m_max - m_min) + 1e-5
 
-                        # idx % 3 == 1 corresponds to the "current action" segment
+                        # Keep entries at (m_idx % period == offset) — defaults
+                        # (3, 1) match the legacy 2-window (prev, curr, sleep)×ITERS
+                        # deploy. Override via ProfileRequest.reward_slice_period
+                        # / .reward_slice_offset — e.g. (2, 0) for the 1-window
+                        # (curr, sleep)×ITERS deploy emitted when skip_prev_state=True.
                         norm_pred = [
                             (m - m_min) / denom
-                            for m_idx, m in enumerate(metrics) if m_idx % 3 == 1
+                            for m_idx, m in enumerate(metrics)
+                            if m_idx % req.reward_slice_period == req.reward_slice_offset
                         ]
+                        # Drop curr_0 (warmup-contaminated first measured slot).
+                        # Same default as preprocessing/dataloader.py — override
+                        # with MIMESYS_KEEP_FIRST_CURR=1 for legacy compat.
+                        if (os.environ.get("MIMESYS_KEEP_FIRST_CURR", "0") != "1"
+                                and len(norm_pred) > 1):
+                            norm_pred = norm_pred[1:]
                         norm_gt = [(m - m_min) / denom for m in ground_truth[target_metric]]
 
                         if aggregate_time_series:
@@ -643,13 +683,47 @@ class Profiler:
                 except Exception as e:
                     print(f"Error parsing chunk={chunk_idx} batch={batch_idx}: {e}")
 
-        # Aggregate across batches
-        merged_emd: dict = defaultdict(list)
+        # Aggregate across batches; apply per-family reward weights from ProfileRequest
+        # to the reward signal (avg_emd_results_by_batch). Keep merged_emd RAW so
+        # callers (e.g. dynamic-λ logic in the trainer) can read unweighted per-metric
+        # errors for adaptive weight updates.
+        #
+        # IMPORTANT: avg_cpu_utilizations is split into 4 sub-keys; if we treated each
+        # as its own metric in the reward mean, cpu would silently get 4× weight vs
+        # io/llc/bw. We aggregate cpu sub-keys to a single "cpu" family BEFORE applying
+        # the weight, so the reward is a balanced mean of 4 resource families.
+        def _family(name: str) -> str:
+            if name.startswith("avg_cpu_utilizations"): return "cpu"
+            return name
+        def _family_weight(fam: str) -> float:
+            if fam == "memory_bandwidth": return float(req.membw_reward_weight)
+            if fam == "l3_cache_usage":   return float(req.llc_reward_weight)
+            if fam == "io":                return float(req.io_reward_weight)
+            if fam == "cpu":               return float(req.cpu_reward_weight)
+            return 1.0
+        merged_emd: dict = defaultdict(list)   # raw per-key (still includes cpu sub-keys)
         avg_emd_results_by_batch = []
         for emd_dict in emd_results:
             for k, v in emd_dict.items():
                 merged_emd[k].append(v)
-            avg_emd_results_by_batch.append(float(np.mean(list(emd_dict.values()))) if emd_dict else 0.0)
+            if emd_dict:
+                if req.use_raw_mean_reward:
+                    # Per-sample RAW mean across all 23 metric keys (cpu sub-keys
+                    # NOT collapsed). CPU dominates 20/23 ≈ 87% of the reward.
+                    avg_emd_results_by_batch.append(
+                        float(np.mean(list(emd_dict.values())))
+                    )
+                else:
+                    # 1) collapse to per-family error (cpu sub-keys -> mean cpu)
+                    fam_errs = defaultdict(list)
+                    for m, err in emd_dict.items():
+                        fam_errs[_family(m)].append(err)
+                    fam_means = {f: float(np.mean(v)) for f, v in fam_errs.items()}
+                    # 2) per-family weighted mean (now exactly 4 terms: io,llc,bw,cpu)
+                    weighted = [_family_weight(f) * err for f, err in fam_means.items()]
+                    avg_emd_results_by_batch.append(float(np.mean(weighted)))
+            else:
+                avg_emd_results_by_batch.append(0.0)
 
         avg_emd_by_metrics = dict(merged_emd)
         return avg_emd_by_metrics, avg_emd_results_by_batch, metrics_std_by_batch

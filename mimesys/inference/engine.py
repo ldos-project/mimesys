@@ -142,14 +142,22 @@ class InferenceEngine:
         """
         Convert ``{metric_name: raw_value}`` → normalised (trace_dim,) float32 in [−1, 1].
         Missing keys default to 0; values outside the training range are clipped to ±1.
+        Mode is read from ``MIMESYS_NORM_MODE`` (linear|log) to match training.
         """
+        import math, os
+        mode = os.environ.get("MIMESYS_NORM_MODE", "linear").lower()
         vec = []
         for key in METRIC_KEYS:
             raw_val = raw.get(key, 0.0)
             lo, hi  = (float(self.trace_range[key][0]),
                        float(self.trace_range[key][1])) if key in self.trace_range else (0.0, 1.0)
             if hi > lo:
-                norm = max(-1.0, min(1.0, (raw_val - lo) / (hi - lo) * 2 - 1))
+                if mode == "log":
+                    log_max = math.log1p(hi - lo)
+                    s = max(0.0, raw_val - lo)
+                    norm = max(-1.0, min(1.0, math.log1p(s) / log_max * 2 - 1))
+                else:
+                    norm = max(-1.0, min(1.0, (raw_val - lo) / (hi - lo) * 2 - 1))
             else:
                 norm = 0.0
             vec.append(norm)
