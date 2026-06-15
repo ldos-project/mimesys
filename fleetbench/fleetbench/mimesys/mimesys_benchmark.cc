@@ -313,7 +313,8 @@ void StopProfilingBackground(int background_profiler_pid) {
 }
 
 // Maps the default benchmarks to their minimum iteration counts.
-absl::NoDestructor<std::vector<std::pair<std::string, int>>> kDefaultActions({});
+absl::NoDestructor<std::vector<std::pair<std::string, int>>> kDefaultActions(
+    std::vector<std::pair<std::string, int>>{});
 
 std::tuple<std::vector<int>, double> GetNumBenchmarkItersFromExecutionPlan(
   std::vector<double> execution_plan, long long time_budget_us) {
@@ -1880,13 +1881,7 @@ static void BM_Mimesys(benchmark::State& state) {
     for (auto _ : state) {
       MimesysExecutionPlan plan = ReadExecutionPlanFile(file);
 
-      if (!memstrata_command_file.empty()) {
-        std::cerr << "Running memstrata command from file: " << memstrata_command_file << std::endl;
-        std::filesystem::path lock_file = memstrata_command_file;
-        lock_file += ".lock";
-        RunMemstrataAndWait(memstrata_command_file, lock_file);
-      }
-
+      // Sync moved to right before StartProfiling (post-warmup). See below.
 
       std::vector<std::vector<int>> all_num_iters;
       std::vector<std::vector<std::vector<int>>> execution_orders;
@@ -1933,11 +1928,9 @@ static void BM_Mimesys(benchmark::State& state) {
       auto count = 0;
 
 
-      int profiler_pid = mimesys::StartProfiling();
-      if (profiler_pid < 0) {
-        std::cerr << "Failed to start profiling." << std::endl;
-        return;
-      }
+      // Profiling start moved to AFTER warmup (below) so sample 0 lands at
+      // the workload start (first plan step), not 5s earlier during warmup.
+      int profiler_pid = -1;
 
       const char* iters_env = std::getenv("MIMESYS_ITERS");
       unsigned int iteration = iters_env ? static_cast<unsigned int>(std::atoi(iters_env)) : 1;
@@ -2044,6 +2037,29 @@ static void BM_Mimesys(benchmark::State& state) {
         persistent_pool::g_pool.DispatchSlot(
             execution_orders[0], no_op_ratios[0], warmup_deadline);
       }
+
+      // (sync-fix) Barrier with the target side, AFTER our calibration + worker
+      // pool init + warmup but BEFORE StartProfiling.  Writes "1" to <file>.lock
+      // ("synth post-warmup, ready") and polls for "2" ("target ready, go").
+      // No-op when memstrata_commands/ has no file.
+      if (!memstrata_command_file.empty()) {
+        std::cerr << "[sync] post-warmup barrier: " << memstrata_command_file << std::endl;
+        std::filesystem::path lock_file = memstrata_command_file;
+        lock_file += ".lock";
+        RunMemstrataAndWait(memstrata_command_file, lock_file);
+      }
+
+      // Start profiler NOW (sample 0 lands at workload start, not at warmup).
+      profiler_pid = mimesys::StartProfiling();
+      if (profiler_pid < 0) {
+        std::cerr << "Failed to start profiling." << std::endl;
+        return;
+      }
+
+      // Reset slot-loop clock AFTER warmup so the drift-compensation below
+      // doesn't see "+10s behind" and clamp the next ~20 slots to half-duration.
+      start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
 
       while (count < loop_limit) {
         for (size_t i = 0; i < execution_orders.size(); ++i) {
@@ -2179,10 +2195,12 @@ class BenchmarkRegisterer {
     DynamicRegistrar::Get()->AddCallback(fleetbench::proto::RegisterBenchmarks);
     DynamicRegistrar::Get()->AddDefaultFilter("BM_PROTO_Arena");
 
-    // SIMD Benchmarks
-    DynamicRegistrar::Get()->AddCallback(fleetbench::simd::RegisterBenchmarks);
-    DynamicRegistrar::Get()->AddDefaultFilter(
-        ".*num_blocks:256/enable_avx512:false/flush_cache:false");
+    // SIMD Benchmarks (disabled: simd_library is clang-only and not needed for
+    // the fleetbench mimesys action list — skip to avoid an undefined-symbol
+    // link error when building with gcc).
+    // DynamicRegistrar::Get()->AddCallback(fleetbench::simd::RegisterBenchmarks);
+    // DynamicRegistrar::Get()->AddDefaultFilter(
+    //     ".*num_blocks:256/enable_avx512:false/flush_cache:false");
 
     // STL Benchmarks
     DynamicRegistrar::Get()->AddCallback(fleetbench::stl::RegisterBenchmarks);

@@ -359,10 +359,10 @@ static const stress_help_t help[] = {
 
 const stressor_info_t stress_readahead_info = {
 	.stressor = stress_readahead,
-	.cls = CLASS_IO | CLASS_OS,
 	.opts = opts,
-	.verify = VERIFY_OPTIONAL,
-	.help = help
+	.help = help,
+	.cls = CLASS_IO | CLASS_OS,
+	.verify = VERIFY_OPTIONAL
 };
 
 void BM_STRESS_NG_Readahead(benchmark::State& state) {
@@ -998,14 +998,14 @@ err_free_cpus:
 
 const stressor_info_t stress_tlb_shootdown_info = {
 	.stressor = stress_tlb_shootdown,
-	.cls = CLASS_OS | CLASS_MEMORY,
-	.help = help
+	.help = help,
+	.cls = CLASS_OS | CLASS_MEMORY
 };
 #else
 const stressor_info_t stress_tlb_shootdown_info = {
 	.stressor = stress_unimplemented,
-	.cls = CLASS_OS | CLASS_MEMORY,
 	.help = help,
+	.cls = CLASS_OS | CLASS_MEMORY,
 	.unimplemented_reason = "built without sched_getaffinity() or mprotect() system calls"
 };
 #endif
@@ -1351,10 +1351,10 @@ tidy:
 
 const stressor_info_t stress_radixsort_info = {
 	.stressor = stress_radixsort,
-	.cls = CLASS_CPU_CACHE | CLASS_CPU | CLASS_MEMORY | CLASS_SORT,
 	.opts = opts,
-	.verify = VERIFY_OPTIONAL,
-	.help = help
+	.help = help,
+	.cls = CLASS_CPU_CACHE | CLASS_CPU | CLASS_MEMORY | CLASS_SORT,
+	.verify = VERIFY_OPTIONAL
 };
 
 void BM_STRESS_NG_Radixsort(benchmark::State& state) {
@@ -1666,18 +1666,18 @@ static int stress_fallocate(stress_args_t *args)
 
 const stressor_info_t stress_fallocate_info = {
 	.stressor = stress_fallocate,
-	.cls = CLASS_FILESYSTEM | CLASS_OS,
 	.opts = opts,
-	.verify = VERIFY_OPTIONAL,
-	.help = help
+	.help = help,
+	.cls = CLASS_FILESYSTEM | CLASS_OS,
+	.verify = VERIFY_OPTIONAL
 };
 #else
 const stressor_info_t stress_fallocate_info = {
 	.stressor = stress_unimplemented,
-	.cls = CLASS_FILESYSTEM | CLASS_OS,
 	.opts = opts,
-	.verify = VERIFY_OPTIONAL,
 	.help = help,
+	.cls = CLASS_FILESYSTEM | CLASS_OS,
+	.verify = VERIFY_OPTIONAL,
 	.unimplemented_reason = "built without fallocate() system call"
 };
 #endif
@@ -2220,18 +2220,18 @@ dir_out:
 
 const stressor_info_t stress_sendfile_info = {
 	.stressor = stress_sendfile,
-	.cls = CLASS_PIPE_IO | CLASS_OS,
 	.opts = opts,
-	.verify = VERIFY_ALWAYS,
-	.help = help
+	.help = help,
+	.cls = CLASS_PIPE_IO | CLASS_OS,
+	.verify = VERIFY_ALWAYS
 };
 #else
 const stressor_info_t stress_sendfile_info = {
 	.stressor = stress_unimplemented,
-	.cls = CLASS_PIPE_IO | CLASS_OS,
 	.opts = opts,
-	.verify = VERIFY_ALWAYS,
 	.help = help,
+	.cls = CLASS_PIPE_IO | CLASS_OS,
+	.verify = VERIFY_ALWAYS,
 	.unimplemented_reason = "built without sys/sendfile.h or sendfile() system call support"
 };
 #endif
@@ -2781,20 +2781,20 @@ static int stress_mmaphuge(stress_args_t *args)
 
 const stressor_info_t stress_mmaphuge_info = {
 	.stressor = stress_mmaphuge,
-	.cls = CLASS_VM | CLASS_OS,
 	.opts = opts,
-	.verify = VERIFY_ALWAYS,
-	.help = help
+	.help = help,
+	.cls = CLASS_VM | CLASS_OS,
+	.verify = VERIFY_ALWAYS
 };
 
 #else
 
 const stressor_info_t stress_mmaphuge_info = {
 	.stressor = stress_unimplemented,
-	.cls = CLASS_VM | CLASS_OS,
 	.opts = opts,
-	.verify = VERIFY_ALWAYS,
 	.help = help,
+	.cls = CLASS_VM | CLASS_OS,
+	.verify = VERIFY_ALWAYS,
 	.unimplemented_reason = "built without mmap() MAP_HUGETLB support"
 };
 
@@ -4147,9 +4147,9 @@ tidy_cpus:
 
 const stressor_info_t stress_cache_info = {
 	.stressor = stress_cache,
-	.cls = CLASS_CPU_CACHE,
 	.opts = opts,
-	.help = help
+	.help = help,
+	.cls = CLASS_CPU_CACHE
 };
 
 void BM_STRESS_NG_Cache(benchmark::State& state) {
@@ -5192,10 +5192,10 @@ static const stress_opt_t opts[] = {
 
 const stressor_info_t stress_stream_info = {
 	.stressor = stress_stream,
-	.cls = CLASS_CPU | CLASS_FP | CLASS_CPU_CACHE | CLASS_MEMORY,
 	.opts = opts,
-	.verify = VERIFY_OPTIONAL,
-	.help = help
+	.help = help,
+	.cls = CLASS_CPU | CLASS_FP | CLASS_CPU_CACHE | CLASS_MEMORY,
+	.verify = VERIFY_OPTIONAL
 };
 
 void BM_STRESS_NG_Stream(benchmark::State& state) {
