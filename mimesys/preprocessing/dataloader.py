@@ -21,7 +21,7 @@ from tqdm import tqdm
 # (matching fully-profiled 2-window plans). Kept in sync with NONE_PREV in
 # mimesys/collection/collect_training_data.py (duplicated to avoid a circular
 # import: that module imports parsers from this one).
-_NUM_THREADS, _NUM_STRESSORS = 20, 13
+_NUM_THREADS, _NUM_STRESSORS = 20, 19
 _NONE_PREV_T = [[0.0] * _NUM_THREADS for _ in range(_NUM_STRESSORS)]   # [stressor][thread]
 
 def _prepend_zero_metric_slot(vals, cycle):
@@ -194,6 +194,7 @@ def augment_dataset(data: list, aug_factor: int, intra_only: bool = False,
 
 from mimesys.schema.stressor_action import FleetBenchAction
 from mimesys.preprocessing.system_trace import get_min_max, normalize_trace
+from mimesys.preprocessing.pqos_parser import pqos_metrics_dict, PQOS_METRIC_KEYS
 from mimesys.preprocessing.parsers import (
     get_tacc_stats_and_energy_from_benchmark_name,
     parse_trace_file,
@@ -235,10 +236,42 @@ def read_metric_file_from_real_app(file_path: str) -> list[dict]:
             window.extend([defaultdict(int)] * (end_idx - len(parsed_traces)))
         trace_windows.append(window)
 
+    # Real-app pqos collected as a paired pqos-N_X-mix_Y.log file alongside
+    # stats-N_X-mix_Y.txt. Load the full per-second pqos series once for the
+    # whole file, then slice it into the same 30-sec windows used for stats.
+    pqos_path = file_path.replace("/stats", "/pqos").replace("stats-", "pqos-").replace(".txt", ".log")
+    try:
+        full_pq = pqos_metrics_dict(pqos_path) if Path(pqos_path).exists() else {}
+    except Exception:
+        full_pq = {}
+
     metrics_list = []
-    for window in trace_windows:
+    for win_idx, window in enumerate(trace_windows):
         output = process_trace_fine_grained(window, period=2, duration=29)
         if output is not None:
+            # Drop redundant combined keys to mirror training-side process_row.
+            output.pop("io", None)
+            output.pop("memory_bandwidth", None)
+            n_steps = len(next(iter(output.values()))) if output else 0
+            # Aggregate per-second pqos over each 30-sec window into period-2 buckets so
+            # length matches the stats-side n_steps. Falls back to zero-fill if missing.
+            win_start = win_idx * step_size
+            win_end = min(win_start + window_size, len(full_pq.get(PQOS_METRIC_KEYS[0], [])))
+            for k in PQOS_METRIC_KEYS:
+                series = full_pq.get(k, [])
+                if win_end > win_start and series:
+                    chunk = series[win_start:win_end]
+                    # bucket-mean over period=2 to match process_trace_fine_grained's stride
+                    if len(chunk) >= 2 * n_steps:
+                        bucketed = [
+                            float(np.mean(chunk[i*2:(i+1)*2])) for i in range(n_steps)
+                        ]
+                    else:
+                        # short tail — pad with zeros to n_steps
+                        bucketed = (chunk + [0.0] * n_steps)[:n_steps]
+                    output[k] = bucketed
+                else:
+                    output[k] = [0.0] * n_steps
             metrics_list.append(output)
     return metrics_list
 
@@ -259,6 +292,22 @@ def read_metric_file_per_second(file_path: str) -> list[dict]:
     metrics_output = process_trace_granular(parsed_traces, period=1, duration=N)
     if metrics_output is None:
         return []
+    # Mirror training-side processing: drop redundant combined keys + pair pqos.
+    metrics_output.pop("io", None)
+    metrics_output.pop("memory_bandwidth", None)
+    metrics_output.pop("avg_cpu_utilizations_total", None)
+    pqos_path = file_path.replace("/stats", "/pqos").replace("stats-", "pqos-").replace(".txt", ".log")
+    try:
+        pq = pqos_metrics_dict(pqos_path) if Path(pqos_path).exists() else {}
+    except Exception:
+        pq = {}
+    n_steps = len(next(iter(metrics_output.values()))) if metrics_output else 0
+    for k in PQOS_METRIC_KEYS:
+        v = pq.get(k, [])
+        if len(v) == n_steps:
+            metrics_output[k] = list(v)
+        else:
+            metrics_output[k] = [0.0] * n_steps
     return [metrics_output]
 
 
@@ -282,6 +331,23 @@ def read_metric_action_datasets_fleetbench(
         metrics_output = process_trace_all(parsed_traces)
         if metrics_output is None:
             return None
+        # Drop redundant combined keys — r/w split versions carry the same info
+        # without double-counting at training time.
+        metrics_output.pop("io", None)
+        metrics_output.pop("memory_bandwidth", None)
+        # Merge pqos (LLC occupancy KB, IPC, L3 misses/sec). libpqos in-process
+        # polling produces 1 sample per slot, sample-aligned with hpc, so the
+        # arrays slot into the same time-series structure as the hpc keys.
+        # Missing pqos.log → empty arrays, which get padded to zeros downstream.
+        pqos_file = metric_file.replace("/stats-plan_", "/pqos-plan_").replace(".txt", ".log")
+        try:
+            pqos_d = pqos_metrics_dict(pqos_file) if Path(pqos_file).exists() else {}
+        except Exception:
+            pqos_d = {}
+        hpc_len = len(next(iter(metrics_output.values())))
+        for k in PQOS_METRIC_KEYS:
+            v = pqos_d.get(k, [])
+            metrics_output[k] = list(v) if len(v) == hpc_len else [0.0] * hpc_len
         action = FleetBenchAction.from_action_file(action_file)
         weights = action.to_2d_list(transpose=True)   # [window][stressor][thread]
         if len(action.weights) == 1:
@@ -374,10 +440,18 @@ def get_datasets_from_metric_action_pairs(
         norm_mat  = _metrics_matrix(normalized, i)
         raw_mat   = _metrics_matrix(target_metrics, i)
         for t in range(len(labels_list[i])):
+            # Skip the NONE_PREV padding slot inserted by process_row for 1-window
+            # plans. Filter is by *identity* (this is literally the module-level
+            # _NONE_PREV_T singleton placed at slot 0), so we don't false-positive
+            # on real plans whose curr happens to be all-idle.
+            if labels_list[i][t] is _NONE_PREV_T:
+                continue
             datasets.append({
                 "clean_trace": norm_mat[:, t].tolist(),
                 "label":       _scale_label(labels_list[i][t]),
-                "prev_label":  (_scale_label(labels_list[i][t - 1]) if t > 0 else None),
+                "prev_label":  (_scale_label(labels_list[i][t - 1])
+                                if t > 0 and labels_list[i][t - 1] is not _NONE_PREV_T
+                                else None),
                 "info": {
                     "collated_trace": raw_mat[:, t].tolist(),
                     "collated_label": labels_list[i][t],
@@ -484,7 +558,7 @@ class StressNgTestDataset(Dataset):
 class CustomDataLoader(pl.LightningDataModule):
     _NUM_CHUNKS = 14
     _NUM_ROUNDS = 70
-    _SAMPLES_PER_CHUNK = 128
+    _SAMPLES_PER_CHUNK = 256  # round_0 has 190 plans/chunk (after 19-stressor refresh); Config C variants 112/chunk
 
     def __init__(
         self,
@@ -595,7 +669,12 @@ class CustomDataLoader(pl.LightningDataModule):
             high_llc_train = [d for d in train_data if _raw(d)[LLC_IDX] > llc_max_threshold]
             high_bw_train  = [d for d in train_data if _raw(d)[BW_IDX]  > bw_max_threshold]
 
-            n_total_train = int(len(test_data) * rl_train_ratio)
+            # Supplement budget = rl_train_ratio × max(len(test_data), rl_kmean_k).
+            # Falling back to rl_kmean_k lets us run RL with NO test conds at all
+            # (point test_data_path at an empty dir) — useful for algorithm sanity
+            # tests where you want pure-train conds.
+            _budget_base = max(len(test_data), rl_kmean_k)
+            n_total_train = int(_budget_base * rl_train_ratio)
             n_high_io  = min(len(high_io_train),  int(n_total_train * rl_high_io_fraction))
             n_high_cpu = min(len(high_cpu_train), int(n_total_train * rl_high_cpu_fraction))
             n_high_llc = min(len(high_llc_train), int(n_total_train * rl_high_llc_fraction))
@@ -726,10 +805,13 @@ class CustomDataLoader(pl.LightningDataModule):
         """
         test_data = []
         for file in Path(test_data_path).iterdir():
-            if file.is_file():
-                print("Processing test file (per-second):", file)
-                test_metrics_list = read_metric_file_per_second(str(file))
-                test_data.extend(get_val_datasets_from_metric_data(test_metrics_list, metrics_range_dict))
+            # Only stats-*.txt files are real test traces; pqos-*.log siblings are
+            # loaded via the paired-path logic inside read_metric_file_per_second.
+            if not (file.is_file() and file.name.startswith("stats-") and file.suffix == ".txt"):
+                continue
+            print("Processing test file (per-second):", file)
+            test_metrics_list = read_metric_file_per_second(str(file))
+            test_data.extend(get_val_datasets_from_metric_data(test_metrics_list, metrics_range_dict))
         return test_data
 
     def _load_test_data_per_second_indexed(self, test_data_path: str, metrics_range_dict: dict) -> list:
@@ -739,7 +821,9 @@ class CustomDataLoader(pl.LightningDataModule):
         windows around K-means medoids."""
         all_data = []
         for file in Path(test_data_path).iterdir():
-            if not file.is_file():
+            # Same stats-only filter as _load_test_data_per_second — pqos-*.log are
+            # paired via path replacement, not iterated as a top-level file.
+            if not (file.is_file() and file.name.startswith("stats-") and file.suffix == ".txt"):
                 continue
             print("Processing test file (per-second indexed):", file)
             test_metrics_list = read_metric_file_per_second(str(file))

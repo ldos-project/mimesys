@@ -15,11 +15,14 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 #include <utility>
 #include <vector>
 #include <thread>
 #include <papi.h>
+#include <pqos.h>
+#include <ctime>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -39,8 +42,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <sys/syscall.h>
+#include <iostream>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <fstream>
+#include <glob.h>
 
 
 #include "absl/container/flat_hash_set.h"
@@ -271,10 +277,209 @@ std::string StopProfilingPCM(int collect_pid) {
   return log_env_dir ? log_env_dir : "/users/dhkim/pcm_results/output.csv"; // fallback if env not set
 }
 
+// =====================================================================
+// pqos CMT/MBM (LLC occupancy + memory BW + IPC) profiler — in-process libpqos.
+//
+// Previous implementation popen()'d the `pqos` CLI as a background 1Hz sampler.
+// That had several production issues:
+//   (a) sample timing was wall-clock + uncontrolled, producing 9 samples per
+//       6-sec workload that didn't align with hpcperfstatsd's 6 samples;
+//   (b) start-up race conditions when RMIDs were stuck from a prior session
+//       (cascaded failures: every plan on c220g5-110931 wrote 162-byte log);
+//   (c) resctrl filesystem auto-mount conflicting with --iface=msr;
+//   (d) lock file (/run/lock/libpqos) needed manual cleanup.
+//
+// libpqos calls (pqos_init / pqos_mon_start / pqos_mon_poll / pqos_mon_stop)
+// give us synchronous in-process control: one snapshot per call, taken at
+// exactly the moment we choose (called per-slot alongside CollectTACCStatsAsync
+// so the resulting series is timestamp-aligned to hpc, no warmup/teardown
+// samples). pqos_mon_poll auto-tracks deltas so MBL/MBR readings are
+// "cachelines since last poll".
+//
+// We still write the legacy pqos.log file (TIME-blocked text rows) at stop
+// so the python parser (mimesys.preprocessing.pqos_parser) doesn't need any
+// change. The merged-group label is "0-19" by default; PQOS_CPUS env can
+// override (e.g. "0-9" / "0-19" / "0,2,4-7").
+// =====================================================================
+static struct pqos_mon_data g_pqos_grp;
+static bool g_pqos_initialized = false;
+static bool g_pqos_started = false;
+static std::string g_pqos_cpu_label = "0-19";   // CORE column text for log
+struct PqosSnapshot {
+  double timestamp_unix;
+  double llc_kb;
+  double mbm_local_mb_per_s;
+  double mbm_remote_mb_per_s;
+  double ipc;
+  uint64_t llc_misses_delta;
+};
+static std::vector<PqosSnapshot> g_pqos_samples;
+
+static std::vector<unsigned> ParsePqosCpus(const std::string& s) {
+  // "0-19" / "0-9,10-19" / "0,1,2"
+  std::vector<unsigned> out;
+  size_t pos = 0;
+  while (pos < s.size()) {
+    size_t comma = s.find(',', pos);
+    std::string tok = s.substr(pos,
+        comma == std::string::npos ? std::string::npos : comma - pos);
+    size_t dash = tok.find('-');
+    if (dash == std::string::npos) {
+      int v = std::atoi(tok.c_str());
+      if (v >= 0) out.push_back(static_cast<unsigned>(v));
+    } else {
+      int lo = std::atoi(tok.substr(0, dash).c_str());
+      int hi = std::atoi(tok.substr(dash + 1).c_str());
+      for (int i = lo; i <= hi; ++i)
+        if (i >= 0) out.push_back(static_cast<unsigned>(i));
+    }
+    pos = (comma == std::string::npos) ? s.size() : comma + 1;
+  }
+  return out;
+}
+
+int StartProfilingPqos() {
+  const char* cpus_env = std::getenv("PQOS_CPUS");
+  g_pqos_cpu_label = cpus_env ? cpus_env : "0-19";
+  std::vector<unsigned> cores = ParsePqosCpus(g_pqos_cpu_label);
+  if (cores.empty()) {
+    std::cerr << "PQOS_CPUS parsed to empty CPU list" << std::endl;
+    return -1;
+  }
+
+  if (!g_pqos_initialized) {
+    struct pqos_config cfg = {};
+    cfg.fd_log = STDOUT_FILENO;
+    cfg.verbose = 0;
+    int ret = pqos_init(&cfg);
+    if (ret != PQOS_RETVAL_OK) {
+      std::cerr << "pqos_init failed: " << ret << std::endl;
+      return -1;
+    }
+    g_pqos_initialized = true;
+  }
+
+  // Reset all per-core RMID assignments to 0 before allocating new ones.
+  // RMID state lives in CPU MSRs and survives across binary invocations, so if
+  // a prior session crashed mid-monitoring (or just left RMIDs stuck), every
+  // subsequent pqos_mon_start fails with status 3 (PQOS_RETVAL_RESOURCE).
+  // c220g5-110931 reliably exhibits this: 100% of its chunk_3 pqos files were
+  // empty across 31 rounds without this reset.
+  int reset_rc = pqos_mon_reset();
+  if (reset_rc != PQOS_RETVAL_OK) {
+    std::cerr << "pqos_mon_reset returned " << reset_rc << " (continuing)" << std::endl;
+  }
+
+  const enum pqos_mon_event events = static_cast<enum pqos_mon_event>(
+      PQOS_MON_EVENT_L3_OCCUP | PQOS_MON_EVENT_LMEM_BW |
+      PQOS_MON_EVENT_RMEM_BW | PQOS_PERF_EVENT_IPC | PQOS_PERF_EVENT_LLC_MISS);
+
+  std::memset(&g_pqos_grp, 0, sizeof(g_pqos_grp));
+  int ret = pqos_mon_start(static_cast<unsigned>(cores.size()), cores.data(),
+                            events, nullptr, &g_pqos_grp);
+  if (ret != PQOS_RETVAL_OK) {
+    std::cerr << "pqos_mon_start failed: " << ret << std::endl;
+    return -1;
+  }
+  g_pqos_started = true;
+  g_pqos_samples.clear();
+  g_pqos_samples.reserve(64);
+  return 0;
+}
+
+// Take one pqos snapshot at the current moment. Call alongside
+// CollectTACCStatsAsync in the slot loop to get one snapshot per slot,
+// perfectly aligned with hpcperfstatsd.
+void CollectPqosSnapshot() {
+  if (!g_pqos_started) return;
+  struct pqos_mon_data* groups[1] = { &g_pqos_grp };
+  int ret = pqos_mon_poll(groups, 1);
+  if (ret != PQOS_RETVAL_OK) {
+    std::cerr << "pqos_mon_poll failed: " << ret << std::endl;
+    return;
+  }
+  PqosSnapshot s;
+  s.timestamp_unix = std::chrono::duration<double>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  // values.llc is bytes; convert to KB to match pqos CLI's LLC[KB] column.
+  s.llc_kb = static_cast<double>(g_pqos_grp.values.llc) / 1024.0;
+  // mbm_local_delta is BYTES since last poll (libpqos already applies the
+  // CPUID-discovered cacheline scale factor). Divide by 1 MB → MB per poll
+  // interval ≈ MB/s when polls are ~1 sec apart.
+  s.mbm_local_mb_per_s =
+      static_cast<double>(g_pqos_grp.values.mbm_local_delta) /
+      (1024.0 * 1024.0);
+  s.mbm_remote_mb_per_s =
+      static_cast<double>(g_pqos_grp.values.mbm_remote_delta) /
+      (1024.0 * 1024.0);
+  s.ipc = g_pqos_grp.values.ipc;
+  s.llc_misses_delta = g_pqos_grp.values.llc_misses_delta;
+  g_pqos_samples.push_back(s);
+}
+
+static void WritePqosLog(const std::string& path) {
+  std::ofstream f(path);
+  if (!f.is_open()) {
+    std::cerr << "Failed to open " << path << " for write" << std::endl;
+    return;
+  }
+  for (const auto& s : g_pqos_samples) {
+    std::time_t tt = static_cast<std::time_t>(s.timestamp_unix);
+    struct tm tm_utc;
+    gmtime_r(&tt, &tm_utc);
+    char tsbuf[64];
+    std::strftime(tsbuf, sizeof(tsbuf), "%Y-%m-%d %H:%M:%S", &tm_utc);
+    f << "TIME " << tsbuf << "\n";
+    f << "    CORE         IPC      MISSES     LLC[KB]   MBL[MB/s]   MBR[MB/s]\n";
+    // misses suffix to match CLI: "33k" / "1.2M"
+    char miss[32];
+    if (s.llc_misses_delta >= 1000000)
+      snprintf(miss, sizeof(miss), "%.0fM",
+               static_cast<double>(s.llc_misses_delta) / 1.0e6);
+    else if (s.llc_misses_delta >= 1000)
+      snprintf(miss, sizeof(miss), "%.0fk",
+               static_cast<double>(s.llc_misses_delta) / 1.0e3);
+    else
+      snprintf(miss, sizeof(miss), "%llu",
+               static_cast<unsigned long long>(s.llc_misses_delta));
+    char row[256];
+    snprintf(row, sizeof(row),
+             "%9s  %10.2f  %10s  %10.1f  %10.1f  %10.1f\n",
+             g_pqos_cpu_label.c_str(),
+             s.ipc, miss, s.llc_kb,
+             s.mbm_local_mb_per_s, s.mbm_remote_mb_per_s);
+    f << row;
+  }
+}
+
+void StopProfilingPqos(int /*ignored*/) {
+  if (g_pqos_started) {
+    pqos_mon_stop(&g_pqos_grp);
+    g_pqos_started = false;
+  }
+  // Write the legacy CLI-compatible log so the parser doesn't change.
+  const char* log_env_dir = std::getenv("TACC_STATS_LOG_DIR");
+  std::string log_dir = log_env_dir ? log_env_dir : "/var/log/hpcperfstats";
+  WritePqosLog(log_dir + "/pqos.log");
+  // Keep g_pqos_initialized=true across plans within the same binary
+  // invocation — pqos_init is idempotent for re-start, but pqos_fini fully
+  // tears down. We fini only at process exit (atexit handler not needed for
+  // bazel-run lifecycle: each plan is a fresh binary).
+  if (g_pqos_initialized) {
+    pqos_fini();
+    g_pqos_initialized = false;
+  }
+}
+
+// Legacy compat — StopProfiling still references this symbol but the value
+// is now ignored.
+static int g_pqos_profiler_pid = -1;
+
 int StartProfiling() {
   int period = 1;
   // return StartProfilingPCM();
   // return StartProfilingTACCStats(period);
+  g_pqos_profiler_pid = StartProfilingPqos();
   return StartTACCStats();
 }
 
@@ -304,6 +509,24 @@ void StopProfiling(int collect_pid, std::string filename) {
   int ret = system(cmd.c_str());
   if (ret != 0) {
     std::cerr << "Failed to truncate PCM log file: " << src_path << std::endl;
+  }
+
+  // Stop pqos and archive its log alongside the stats file as pqos-<filename>.log.
+  StopProfilingPqos(g_pqos_profiler_pid);
+  g_pqos_profiler_pid = -1;
+  std::string pqos_src = tacc_stats_dir + "/pqos.log";
+  std::filesystem::path pqos_dst =
+      std::filesystem::path(target_dir) / ("pqos-" + filename + ".log");
+  std::error_code ec;
+  if (std::filesystem::exists(pqos_src)) {
+    std::filesystem::copy_file(pqos_src, pqos_dst,
+        std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+      std::cerr << "Failed to copy pqos.log: " << ec.message() << std::endl;
+    }
+    std::string trunc_cmd = "sudo truncate -s 0 " + pqos_src;
+    int rc = system(trunc_cmd.c_str());
+    (void)rc;
   }
 }
 
@@ -404,38 +627,48 @@ struct CrcCtx {
   absl::string_view sv;
   std::vector<int> str_lengths;
   bool init_done = false;
+  size_t buffer_bytes = 0;
 };
 
-static thread_local CrcCtx g_ctx;
+// Parameterized contexts so we can have multiple buffer sizes coexisting:
+//   - 256 MB: original LLC-saturating version (high LLC + BW, ~25 % CPU)
+//   - 16  MB: fits in LLC (25 MB), gives high CPU at low LLC occupancy
+//   -  1  MB: fits in L2/L1, pure compute (highest CPU, ~zero LLC traffic)
+// Each is thread_local — total memory = sum(sizes) per thread × 20 threads.
+// Old default 256MB × 20 = 5 GB was a likely contributor to OS-scheduler
+// starvation post-init.
+static thread_local CrcCtx g_ctx_256mb;
+static thread_local CrcCtx g_ctx_16mb;
+static thread_local CrcCtx g_ctx_1mb;
 
-// Cold-faithful CRC parameters (rationale below in InitCrcCtx).
-//   kColdBufferBytes : 256 MB ≫ c220g5 L3 (~25 MB) so a single pass evicts the
-//                      whole LLC at least once.
-//   kColdStrideBytes : 64 KB per CRC call — at 1000 calls per inner pass the
-//                      working set is 64 MB > LLC, forcing each call to fetch
-//                      from DRAM. This is what produces the LLC + BW signal we
-//                      saw in round_0.curr_sweep_backup (stressor 0:
-//                      ~290 MB/s LLC, ~765% BW%, ~26% CPU). The original
-//                      4 KB stride kept the entire working set inside LLC
-//                      after the first pass → ~0.7 MB/s LLC and 5% CPU.
-static constexpr size_t kColdBufferBytes = 256ull * 1024 * 1024;
+// Cold-faithful CRC parameters (rationale).
+//   - 256 MB ≫ c220g5 L3 (~25 MB): single pass evicts whole LLC at least once.
+//   -  16 MB fits inside L3:        no DRAM traffic after first pass — high CPU,
+//                                   ~zero LLC occupancy signal.
+//   -   1 MB fits inside L2:        purest compute test, smallest memory footprint.
+//   kColdStrideBytes : 64 KB per CRC call — for 256 MB version, 1000 calls
+//                      span 64 MB > LLC, forcing per-call DRAM fetch.
 static constexpr size_t kColdStrideBytes = 64ull * 1024;
 
-static void InitCrcCtx() {
-  if (g_ctx.init_done) return;
-  g_ctx.buffer.assign(kColdBufferBytes, 'x');
-  g_ctx.sv = absl::string_view(g_ctx.buffer);
+static void InitCrcCtx(CrcCtx& ctx, size_t buffer_bytes) {
+  if (ctx.init_done) return;
+  ctx.buffer.assign(buffer_bytes, 'x');
+  ctx.sv = absl::string_view(ctx.buffer);
+  ctx.buffer_bytes = buffer_bytes;
   static const int sizes[] = {16, 32, 64, 128, 256, 512, 1024, 2048};
-  g_ctx.str_lengths.reserve(1000);
+  ctx.str_lengths.reserve(1000);
   for (int i = 0; i < 1000; ++i) {
-    g_ctx.str_lengths.push_back(sizes[i % 8]);
+    ctx.str_lengths.push_back(sizes[i % 8]);
   }
-  g_ctx.init_done = true;
+  ctx.init_done = true;
 }
+
+// Wrapper to preserve the original symbol used by the registry.
+static void InitCrcCtx() { InitCrcCtx(g_ctx_256mb, 256ull * 1024 * 1024); }
 
 static void DirectExtendCrc32c(long deadline_us) {
   InitCrcCtx();
-  auto& ctx = g_ctx;
+  auto& ctx = g_ctx_256mb;
   absl::crc32c_t v0{0};
   size_t start = 0;
   auto loop_start = std::chrono::steady_clock::now();
@@ -456,7 +689,7 @@ static void DirectExtendCrc32c(long deadline_us) {
 
 static void DirectComputeCrc32c(long deadline_us) {
   InitCrcCtx();
-  auto& ctx = g_ctx;
+  auto& ctx = g_ctx_256mb;
   size_t start = 0;
   auto loop_start = std::chrono::steady_clock::now();
   while (true) {
@@ -473,6 +706,38 @@ static void DirectComputeCrc32c(long deadline_us) {
     }
   }
 }
+
+// Smaller-buffer Crc variants — fit entirely in L3 (16 MB) or L1/L2 (1 MB).
+// Per-call stride matches buffer size to avoid stride > buffer (which would
+// always restart at offset 0 and degrade to one cache-line of work).
+// Goal: give AL a path to the high-CPU + low-LLC corner that the 256MB
+// variant never produces.
+template <size_t BufferBytes>
+static void DirectExtendCrc32c_Sized(long deadline_us) {
+  // Pick the right thread_local context for this buffer size.
+  CrcCtx& ctx = (BufferBytes == 16 * 1024 * 1024) ? g_ctx_16mb : g_ctx_1mb;
+  InitCrcCtx(ctx, BufferBytes);
+  constexpr size_t stride = (BufferBytes <= 1 * 1024 * 1024) ? 4 * 1024 : 32 * 1024;
+  absl::crc32c_t v0{0};
+  size_t start = 0;
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        now - loop_start).count();
+    if (elapsed_us >= deadline_us) break;
+    for (auto l : ctx.str_lengths) {
+      if (start + l >= ctx.sv.length()) start = 0;
+      absl::string_view buf = ctx.sv.substr(start, l);
+      start += stride;
+      v0 = absl::ExtendCrc32c(v0, buf);
+      benchmark::DoNotOptimize(v0);
+    }
+  }
+}
+
+static void DirectExtendCrc32c_16MB(long d) { DirectExtendCrc32c_Sized<16ull * 1024 * 1024>(d); }
+static void DirectExtendCrc32c_1MB(long d)  { DirectExtendCrc32c_Sized<1ull  * 1024 * 1024>(d); }
 
 struct MemcpyCtx {
   char* src = nullptr;
@@ -987,6 +1252,13 @@ static void DirectHddReadWeightScaledImpl(long deadline_us) {
 }
 
 static void DirectHddRead1MB_WeightScaled50ms(long d)   { DirectHddReadWeightScaledImpl<1024 * 1024,    50000, 'r', 'm'>(d); }
+static void DirectHddRead1MB_WeightScaled200ms(long d)  { DirectHddReadWeightScaledImpl<1024 * 1024,   200000, 'r', 'X'>(d); }
+// Sub-10 MB/s coverage: smaller blocks + 500 ms sleep give long enough between
+// reads that the kernel can actually action posix_fadvise(DONTNEED) before the
+// next pread, so reads hit disk rather than being absorbed by the 187 GB page
+// cache that masked the earlier 256KB_NoSleep variant.
+static void DirectHddRead256KB_WeightScaled500ms(long d) { DirectHddReadWeightScaledImpl< 256 * 1024,   500000, 'r', 'Y'>(d); }
+static void DirectHddRead64KB_WeightScaled500ms(long d)  { DirectHddReadWeightScaledImpl<  64 * 1024,   500000, 'r', 'Z'>(d); }
 static void DirectHddRead256KB_WeightScaled50ms(long d) { DirectHddReadWeightScaledImpl< 256 * 1024,    50000, 'r', 'q'>(d); }
 static void DirectHddRead1MB_NoSleep(long d)            { DirectHddReadWeightScaledImpl<1024 * 1024,        0, 'r', 'n'>(d); }
 static void DirectHddRead256KB_NoSleep(long d)          { DirectHddReadWeightScaledImpl< 256 * 1024,        0, 'r', 'o'>(d); }
@@ -1036,6 +1308,12 @@ static void DirectHddWriteNoFsyncWeightScaledImpl(long deadline_us) {
 
 static void DirectHddWriteNF_256KB_WeightScaled50ms(long d) { DirectHddWriteNoFsyncWeightScaledImpl< 256 * 1024, 50000, 'n', 's'>(d); }
 static void DirectHddWriteNF_1MB_WeightScaled50ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<1024 * 1024, 50000, 'n', 'm'>(d); }
+static void DirectHddWriteNF_1MB_WeightScaled100ms(long d)  { DirectHddWriteNoFsyncWeightScaledImpl<1024 * 1024, 100000, 'n', 'Y'>(d); }
+// Sub-10 MB/s write coverage. Writes go through page cache; 500 ms between
+// each per-thread write ensures kernel writeback flushes them to disk during
+// the sleep, producing measurable sustained io_write at ~2-10 MB/s.
+static void DirectHddWriteNF_256KB_WeightScaled500ms(long d) { DirectHddWriteNoFsyncWeightScaledImpl< 256 * 1024, 500000, 'n', 'Z'>(d); }
+static void DirectHddWriteNF_64KB_WeightScaled500ms(long d)  { DirectHddWriteNoFsyncWeightScaledImpl<  64 * 1024, 500000, 'n', 'W'>(d); }
 static void DirectHddWriteNF_2MB_WeightScaled50ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<2048 * 1024, 50000, 'n', 'p'>(d); }
 static void DirectHddWriteNF_4MB_WeightScaled50ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<4096 * 1024, 50000, 'n', 'q'>(d); }
 static void DirectHddWriteNF_1MB_WeightScaled25ms(long d)   { DirectHddWriteNoFsyncWeightScaledImpl<1024 * 1024, 25000, 'n', 'a'>(d); }
@@ -1151,6 +1429,82 @@ static void DirectHddWriteD_1MB_WeightScaled50ms(long d) { DirectHddWriteDirectW
 static void DirectHddWriteD_1MB_WeightScaled25ms(long d) { DirectHddWriteDirectWeightScaledImpl<1024 * 1024, 25000, 'd', 'a'>(d); }
 static void DirectHddWriteD_1MB_WeightScaled0ms(long d)  { DirectHddWriteDirectWeightScaledImpl<1024 * 1024,     0, 'd', '0'>(d); }
 
+// MEMSET-STREAM kernel: repeatedly memset a per-thread buffer too large to fit
+// in L3 (32 MB vs ~14 MB LLC). Each memset evicts L3 and writes back to DRAM,
+// generating measurable memory_bandwidth_write traffic. Round-0 v2 coverage
+// showed only SwissMap_Insert produces >5% bw_write; this kernel fills that
+// gap without depending on the allocator. Per-thread buffer = no cross-thread
+// cache contention. 20 threads × 32 MB = 640 MB total memory footprint.
+template <size_t kBufSize, int kSleepUs, char... kTag>
+static void DirectMemsetStreamImpl(long deadline_us) {
+  static thread_local std::vector<char> buf;
+  static thread_local int tick = 0;
+  if (buf.empty()) buf.assign(kBufSize, 0);
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(64,
+      static_cast<size_t>(duty * static_cast<double>(kBufSize)));
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    std::memset(buf.data(), static_cast<int>(tick++ & 0xFF), target);
+    benchmark::DoNotOptimize(buf.data());
+    if (kSleepUs > 0) usleep(kSleepUs);
+  }
+}
+
+static void DirectMemset_32MB_NoSleep(long d)          { DirectMemsetStreamImpl<32 * 1024 * 1024,     0, 'm', 'z'>(d); }
+static void DirectMemset_32MB_WeightScaled50ms(long d) { DirectMemsetStreamImpl<32 * 1024 * 1024, 50000, 'm', 'a'>(d); }
+
+// STREAM-SIMD kernel: tight FMA-style loop over a per-thread aligned double
+// buffer. Compiler with -O3 -mavx512f vectorizes the loop; each iteration
+// loads 8 doubles, performs y = a*x + b (FMA), stores back. This achieves
+// HIGH IPC (≈2-3, the only stressor in our panel doing this) WHILE driving
+// real memory bandwidth (buffer >> L3 → DRAM-bound). Coverage gap: the
+// previous panel had no workload in the (high IPC × high mem BW) quadrant
+// because vectorized + memory-bound is rare.
+//   32 MB buffer (4M doubles) >> 14 MB LLC → DRAM streaming
+//    8 MB buffer (1M doubles) ≈ LLC-resident → mid mem BW, high L3 traffic
+template <size_t kBufBytes, int kSleepUs, char... kTag>
+static void DirectStreamSIMDImpl(long deadline_us) {
+  static thread_local std::vector<double> buf;
+  static constexpr size_t kN = kBufBytes / sizeof(double);
+  if (buf.empty()) {
+    buf.assign(kN, 1.0);
+  }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(8, static_cast<size_t>(duty * static_cast<double>(kN)));
+  // Round target down to multiple of 8 so vectorized inner loop is full-width.
+  target = (target / 8) * 8;
+  double a = 1.000001;  // not exactly 1 so the compiler can't optimize away
+  double b = 0.0000001;
+  auto loop_start = std::chrono::steady_clock::now();
+  double* __restrict__ p = buf.data();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    // y = a*x + b — vectorized by the compiler to vfmadd231pd over zmm regs.
+    for (size_t i = 0; i < target; ++i) {
+      p[i] = a * p[i] + b;
+    }
+    benchmark::DoNotOptimize(p);
+    if (kSleepUs > 0) usleep(kSleepUs);
+  }
+}
+
+static void DirectStreamSIMD_32MB_NoSleep(long d) { DirectStreamSIMDImpl<32 * 1024 * 1024, 0, 's', 'z'>(d); }
+static void DirectStreamSIMD_8MB_NoSleep(long d)  { DirectStreamSIMDImpl< 8 * 1024 * 1024, 0, 's', 'a'>(d); }
+
 // Four candidates spanning the IO bandwidth space (max size × sleep_us):
 //   4KB   / 10 ms : LIGHT       — peak ~  8 MB/s @ 20 threads
 //  16KB   /  5 ms : LIGHT-MID   — peak ~ 50 MB/s
@@ -1250,6 +1604,7 @@ static void DirectHdd4KB_Throttled10ms(long deadline_us) {
   }
 }
 
+
 using KernelFn = std::function<void(long)>;
 static const std::unordered_map<std::string, KernelFn>& Kernels() {
   static const std::unordered_map<std::string, KernelFn> m = {
@@ -1260,6 +1615,10 @@ static const std::unordered_map<std::string, KernelFn>& Kernels() {
     // framework path runs zero iterations.
     {"BM_HASHING_Extendcrc32cinternal_Fleet_cold", DirectExtendCrc32c},
     {"BM_HASHING_Computecrc32c_Fleet_cold",        DirectComputeCrc32c},
+    // High-CPU / low-LLC variants: 16 MB fits in L3, 1 MB in L2.
+    // Same hashing op as the 256 MB version, no DRAM traffic after warmup.
+    {"BM_HASHING_Extendcrc32c_Fleet_L3_16MB",      DirectExtendCrc32c_16MB},
+    {"BM_HASHING_Extendcrc32c_Fleet_L2_1MB",       DirectExtendCrc32c_1MB},
     {"BM_LIBC_Memcpy_Fleet_L1",                    DirectMemcpy},
     {"BM_LIBC_Memcmp_Fleet_LLC",                   DirectMemcmpLLC},
     {"BM_LIBC_Memmove_Fleet_LLC",                  DirectMemmoveLLC},
@@ -1292,12 +1651,18 @@ static const std::unordered_map<std::string, KernelFn>& Kernels() {
     {"BM_STRESS_NG_Hdd_256KB_WeightScaled_50ms", DirectHdd256KB_WeightScaled50ms},
     {"BM_STRESS_NG_Hdd_1MB_WeightScaled_50ms",   DirectHdd1MB_WeightScaled50ms},
     {"BM_STRESS_NG_HddRead_1MB_WeightScaled_50ms",   DirectHddRead1MB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddRead_1MB_WeightScaled_200ms",  DirectHddRead1MB_WeightScaled200ms},
+    {"BM_STRESS_NG_HddRead_256KB_WeightScaled_500ms", DirectHddRead256KB_WeightScaled500ms},
+    {"BM_STRESS_NG_HddRead_64KB_WeightScaled_500ms",  DirectHddRead64KB_WeightScaled500ms},
     {"BM_STRESS_NG_HddRead_256KB_WeightScaled_50ms", DirectHddRead256KB_WeightScaled50ms},
     {"BM_STRESS_NG_HddRead_1MB_NoSleep",             DirectHddRead1MB_NoSleep},
     {"BM_STRESS_NG_HddRead_256KB_NoSleep",           DirectHddRead256KB_NoSleep},
     {"BM_STRESS_NG_HddWriteNF_256KB_NoSleep",        DirectHddWriteNF_256KB_NoSleep},
     {"BM_STRESS_NG_HddWriteNF_256KB_WeightScaled_50ms", DirectHddWriteNF_256KB_WeightScaled50ms},
     {"BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_50ms", DirectHddWriteNF_1MB_WeightScaled50ms},
+    {"BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_100ms", DirectHddWriteNF_1MB_WeightScaled100ms},
+    {"BM_STRESS_NG_HddWriteNF_256KB_WeightScaled_500ms", DirectHddWriteNF_256KB_WeightScaled500ms},
+    {"BM_STRESS_NG_HddWriteNF_64KB_WeightScaled_500ms",  DirectHddWriteNF_64KB_WeightScaled500ms},
     {"BM_STRESS_NG_HddWriteNF_2MB_WeightScaled_50ms", DirectHddWriteNF_2MB_WeightScaled50ms},
     {"BM_STRESS_NG_HddWriteNF_4MB_WeightScaled_50ms", DirectHddWriteNF_4MB_WeightScaled50ms},
     {"BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_25ms", DirectHddWriteNF_1MB_WeightScaled25ms},
@@ -1311,6 +1676,10 @@ static const std::unordered_map<std::string, KernelFn>& Kernels() {
     {"BM_STRESS_NG_HddWriteD_1MB_WeightScaled_50ms",  DirectHddWriteD_1MB_WeightScaled50ms},
     {"BM_STRESS_NG_HddWriteD_1MB_WeightScaled_25ms",  DirectHddWriteD_1MB_WeightScaled25ms},
     {"BM_STRESS_NG_HddWriteD_1MB_WeightScaled_0ms",   DirectHddWriteD_1MB_WeightScaled0ms},
+    {"BM_DIRECTMEMSET_32MB_NoSleep",                 DirectMemset_32MB_NoSleep},
+    {"BM_DIRECTSTREAMSIMD_32MB_NoSleep",             DirectStreamSIMD_32MB_NoSleep},
+    {"BM_DIRECTSTREAMSIMD_8MB_NoSleep",              DirectStreamSIMD_8MB_NoSleep},
+    {"BM_DIRECTMEMSET_32MB_WeightScaled_50ms",       DirectMemset_32MB_WeightScaled50ms},
     {"BM_STRESS_NG_Hdd_64KB",                  DirectHdd64KB},
     {"BM_STRESS_NG_Hdd_16KB_Throttled_5ms",    DirectHdd16KB_Throttled5ms},
     {"BM_STRESS_NG_Hdd_4KB_Throttled_10ms",    DirectHdd4KB_Throttled10ms},
@@ -2049,11 +2418,23 @@ static void BM_Mimesys(benchmark::State& state) {
         RunMemstrataAndWait(memstrata_command_file, lock_file);
       }
 
-      // Start profiler NOW (sample 0 lands at workload start, not at warmup).
-      profiler_pid = mimesys::StartProfiling();
-      if (profiler_pid < 0) {
-        std::cerr << "Failed to start profiling." << std::endl;
-        return;
+      // Gate the binary's own hpcperfstatsd usage behind MIMESYS_INTERNAL_PROFILING.
+      // When this var is unset or "0", we skip StartProfiling / CollectTACCStatsAsync
+      // / StopProfiling so they don't fight with mimebench's host-side samplers over
+      // /var/log/hpcperfstats/current (which they were doing — see the conflict
+      // documented in the run-time docs).  Default off; old behavior is opt-in via
+      // MIMESYS_INTERNAL_PROFILING=1.
+      const char* prof_env = std::getenv("MIMESYS_INTERNAL_PROFILING");
+      bool do_internal_profiling = prof_env && std::atoi(prof_env) != 0;
+      if (do_internal_profiling) {
+        profiler_pid = mimesys::StartProfiling();
+        if (profiler_pid < 0) {
+          std::cerr << "Failed to start profiling." << std::endl;
+          return;
+        }
+      } else {
+        std::cerr << "[mimesys] internal profiling disabled "
+                  << "(set MIMESYS_INTERNAL_PROFILING=1 to re-enable)." << std::endl;
       }
 
       // Reset slot-loop clock AFTER warmup so the drift-compensation below
@@ -2077,7 +2458,13 @@ static void BM_Mimesys(benchmark::State& state) {
           auto _t_post_dispatch = std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now().time_since_epoch()).count();
 
-          CollectTACCStatsAsync(tacc_stats_dir);
+          // Gated on MIMESYS_INTERNAL_PROFILING.  See block above.
+          // hpc + pqos snapshots taken at the SAME moment so the two series
+          // align 1:1 (no timestamp games downstream).
+          if (do_internal_profiling) {
+            CollectTACCStatsAsync(tacc_stats_dir);
+            mimesys::CollectPqosSnapshot();
+          }
           auto _t_post_collect = std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now().time_since_epoch()).count();
           std::cerr << "SLOT_PROF i=" << i
@@ -2112,7 +2499,10 @@ static void BM_Mimesys(benchmark::State& state) {
         if (do_sleep) {
           std::this_thread::sleep_for(std::chrono::microseconds(duration_us));
           count++;
-          CollectTACCStatsAsync(tacc_stats_dir);
+          if (do_internal_profiling) {
+            CollectTACCStatsAsync(tacc_stats_dir);
+            mimesys::CollectPqosSnapshot();
+          }
         }
 
         duration_us = expected_duration_us;
@@ -2121,11 +2511,13 @@ static void BM_Mimesys(benchmark::State& state) {
           std::chrono::steady_clock::now().time_since_epoch()).count();
       }
 
-      // Stop the profiling process
-      std::this_thread::sleep_for(std::chrono::microseconds(1000000));
-      auto filename = file.filename().string();
-      filename.erase(filename.find(".h5"));
-      mimesys::StopProfiling(profiler_pid, filename);
+      // Stop the profiling process — gated to match the gate above.
+      if (do_internal_profiling) {
+        std::this_thread::sleep_for(std::chrono::microseconds(1000000));
+        auto filename = file.filename().string();
+        filename.erase(filename.find(".h5"));
+        mimesys::StopProfiling(profiler_pid, filename);
+      }
 
       auto end_time = std::chrono::steady_clock::now();
       auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
@@ -2229,6 +2621,79 @@ class BenchmarkRegisterer {
 };
 
 BenchmarkRegisterer br;
+
+// ── /tmp temp-file leak prevention ─────────────────────────────────────────
+// Direct IO kernels create /tmp/mimesys_*_<id> backing files. They unlink the
+// path immediately after open so the inode is freed on fd close — but if the
+// process is SIGKILL'd between open() and unlink(), the file is orphaned.
+// Repeated kills accumulate ~256 MB per leak and fill the worker disk
+// (observed: 6/8 workers hit 100 % full after a debugging session).
+//
+// Two-layer defense:
+//   (1) Startup sweep: at static init, remove any /tmp/mimesys_*_<pid>
+//       file whose owning <pid> is no longer alive.
+//   (2) Exit handlers (atexit + SIGTERM/SIGINT): unlink anything still
+//       matching /tmp/mimesys_*_<my_pid> on the way out.
+namespace {
+
+static void UnlinkMyTempFiles() {
+  glob_t g;
+  // Patterns covering all temp file conventions in this binary:
+  //   /tmp/mimesys_hddread_shared_<tag>_<pid>
+  //   /tmp/mimesys_direct_<tag>_<tid>       (per-thread, no pid)
+  //   /tmp/mimesys_hddread_*_<tid>          (per-thread, no pid)
+  // Match by glob and unlink everything we can — file is per-process, but
+  // pthread_self() is reused only inside this proc, so cleaning unconditionally
+  // at our exit is safe (we own all the open fds).
+  const char* patterns[] = {
+    "/tmp/mimesys_*",
+  };
+  for (const char* pat : patterns) {
+    if (glob(pat, 0, NULL, &g) == 0) {
+      for (size_t i = 0; i < g.gl_pathc; ++i) {
+        unlink(g.gl_pathv[i]);
+      }
+      globfree(&g);
+    }
+  }
+}
+
+static void StartupOrphanCleanup() {
+  int my_pid = getpid();
+  glob_t g;
+  if (glob("/tmp/mimesys_hddread_shared_*", 0, NULL, &g) != 0) return;
+  int unlinked = 0;
+  for (size_t i = 0; i < g.gl_pathc; ++i) {
+    const char* path = g.gl_pathv[i];
+    const char* uscore = strrchr(path, '_');
+    if (!uscore) continue;
+    int owner_pid = atoi(uscore + 1);
+    if (owner_pid <= 0 || owner_pid == my_pid) continue;
+    // kill(pid, 0) returns 0 if alive, -1/ESRCH if dead.
+    if (kill(owner_pid, 0) != 0 && errno == ESRCH) {
+      if (unlink(path) == 0) unlinked++;
+    }
+  }
+  globfree(&g);
+  if (unlinked > 0) {
+    std::cerr << "[cleanup] removed " << unlinked
+              << " orphaned /tmp/mimesys_hddread_shared_* files" << std::endl;
+  }
+}
+
+struct TempFileCleaner {
+  TempFileCleaner() {
+    StartupOrphanCleanup();
+    std::atexit(UnlinkMyTempFiles);
+    // No SIGTERM/SIGINT handlers — they were interfering with Google
+    // Benchmark's internal signal management and breaking multi-threaded
+    // slot dispatch. SIGKILL leaks are caught by the startup sweep above
+    // on the next run.
+  }
+};
+static TempFileCleaner _temp_file_cleaner_;
+
+}  // anonymous namespace
 
 }  // namespace mimesys
 }  // namespace fleetbench

@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,9 +31,16 @@ def make_timesteps(t, batch_size, device):
 
 class GaussianDiffusion(nn.Module):
     def __init__(
-        self, model, n_timesteps, clipped_denoised=False, cfg_drop_prob=0, cfg_guide_w=0
+        self, model, n_timesteps, clipped_denoised=False, cfg_drop_prob=0, cfg_guide_w=0,
+        sdd_enabled=False,
     ):
         super().__init__()
+        # SDD (Sparse Data Diffusion, Ostheimer 2025): doubles the stressor
+        # (channel) dim — top half is the action value, bottom half is a binary
+        # sparsity indicator. At sample time, threshold the bottom half and
+        # multiply by the top to enforce hard zeros where the model predicts
+        # "inactive". Underlying `model` must have input/output channel = 2*S.
+        self.sdd_enabled = sdd_enabled
         """
         this gaussian diffusion model will condition on observation cond and hard condition for trajectories
         """
@@ -98,17 +106,57 @@ class GaussianDiffusion(nn.Module):
         self.model = model
         self.cfg_drop_prob = cfg_drop_prob
         self.cfg_guide_w = cfg_guide_w
+        # Mode-collapse penalty: encourage per-feature variance of model output
+        # across the batch to match the variance of the noise targets. Mitigates
+        # the failure mode where the diffusion model collapses to the conditional
+        # mean (averaging over multi-modal action distributions per cond).
+        # Enable via env var MIMESYS_DIVERSITY_WEIGHT=<float>.
+        self.diversity_weight = float(os.environ.get("MIMESYS_DIVERSITY_WEIGHT", "0"))
 
         if self.cfg_drop_prob > 0:
             print(f"Training with CFG with dropout probability of {self.cfg_drop_prob}")
         if self.cfg_guide_w > 0:
             print(f"Evaluating with CFG with guidance weight of {self.cfg_guide_w}")
+        if self.diversity_weight > 0:
+            print(f"Training with variance-matching aux loss (weight={self.diversity_weight})")
 
     def update_threshold(self, new_threshold):
         """
         Dynamically update the threshold value.
         """
         self.threshold = new_threshold
+
+    # ─── SDD helpers ─────────────────────────────────────────────────────────
+    # x is in [-1, 1] model space; the raw weight is (x + 1) * 0.5 ∈ [0, 1].
+    # A position is "active" iff raw weight > 0 ⇔ x > -1 (with eps slack).
+    _SDD_ACTIVE_THRESH = -0.95     # train-time bit derivation threshold
+
+    def _sdd_encode(self, x):
+        """Concat sparsity bits on the *thread* axis (last dim, which becomes
+        the conv-channel axis after the model's `rearrange("b h c -> b c h")`).
+        Input (B, S, T) → output (B, S, 2T). First T = action values, second
+        T = ±1 sparsity bits for each (stressor, thread) cell."""
+        active = (x > self._SDD_ACTIVE_THRESH).float() * 2.0 - 1.0
+        return torch.cat([x, active], dim=-1)
+
+    def _sdd_decode(self, x_hat):
+        """Split last axis → threshold bits → mask values. Input (B, S, 2T)
+        → output (B, S, T) in [-1, 1] model space; inactive cells go to -1."""
+        T = x_hat.shape[-1] // 2
+        values = x_hat[..., :T]
+        bits   = x_hat[..., T:]
+        bit_mask = (bits > 0.0).float()
+        return values * bit_mask + (-1.0) * (1.0 - bit_mask)
+
+    def _sdd_encode_context(self, context_cond):
+        """If prev_action is in context, double its channels too so the encoder
+        sees consistent 2S input."""
+        if context_cond is None or "prev_action" not in context_cond:
+            return context_cond
+        new_cond = dict(context_cond)
+        new_cond["prev_action"] = self._sdd_encode(context_cond["prev_action"])
+        return new_cond
+    # ─────────────────────────────────────────────────────────────────────────
 
     def predict_start_from_noise(self, xt, t, noise):
         """
@@ -165,17 +213,24 @@ class GaussianDiffusion(nn.Module):
 
     def p_sample_loop(self, shape, context_cond=None):
         """
-        [for inference] sample x0 from random noise
-        => initialize xt
-        => for t=T to 0
-        =>   convert t to tensor
-        =>   xt = sample_fn(self, xt, t, context_cond) [can be either ddpm sample, ddim sample, or guided ddpm]
-        =>   apply hard condition on xt [optional]
+        [for inference] sample x0 from random noise.
+
+        Callers pass the EXTERNAL shape (B, S, T). With SDD enabled, the
+        denoiser internally operates on (B, 2S, T) and the post-process
+        thresholds the sparsity bits to mask values. Returned chain is in
+        the external (B, S, T) shape so downstream code is unchanged.
         """
         device = self.alpha.device
         batch_size = shape[0]
 
-        xt = torch.randn(*shape, device=device)
+        if self.sdd_enabled:
+            B, S, T = shape
+            internal_shape = (B, S, 2 * T)
+            context_cond = self._sdd_encode_context(context_cond)
+        else:
+            internal_shape = shape
+
+        xt = torch.randn(*internal_shape, device=device)
         chain = [xt]
 
         for t in reversed(range(self.n_timesteps)):
@@ -185,6 +240,8 @@ class GaussianDiffusion(nn.Module):
             )  # simple ddpm sample function
             chain.append(xt)
 
+        if self.sdd_enabled:
+            chain = [self._sdd_decode(c) for c in chain]
         return chain
 
     def p_sample_loop_with_logprobs(self, shape, context_cond=None):
@@ -274,6 +331,12 @@ class GaussianDiffusion(nn.Module):
         => noise_pred = model(xt, t, cond)
         => loss = loss_fn(noise, noise_pred)
         """
+        # SDD: extend channel dim with sparsity bits (also for prev_action so
+        # the encoder sees a consistent 2S input).
+        if self.sdd_enabled:
+            x0 = self._sdd_encode(x0)
+            context_cond = self._sdd_encode_context(context_cond)
+
         noise = torch.randn_like(x0)
         xt = self.q_sample(x0, t, noise)
 
@@ -292,25 +355,62 @@ class GaussianDiffusion(nn.Module):
         # indices [0:20] = per-core CPU 0..19). Encourages the simple algebraic
         # relationship `row_sum ∝ CPU%` that the U-Net's spatial mixing makes
         # hard to learn directly.
-        if getattr(self, "row_sum_aux_weight", 0.0) > 0.0:
+        # Variance-matching auxiliary loss: penalize when per-feature variance
+        # of model predictions across the batch differs from variance of the
+        # noise targets. The diffusion model otherwise collapses to predicting
+        # the conditional mean (averaging multi-modal actions per cond), so
+        # forcing variance parity preserves output diversity.
+        if self.diversity_weight > 0.0 and noise_pred.shape[0] > 1:
+            pred_var = noise_pred.flatten(1).var(dim=0)
+            target_var = noise.flatten(1).var(dim=0)
+            diversity_aux = F.mse_loss(pred_var, target_var)
+            loss = loss + self.diversity_weight * diversity_aux
+
+        row_sum_w = getattr(self, "row_sum_aux_weight", 0.0)
+        sparsity_w = getattr(self, "sparsity_aux_weight", 0.0)
+        if row_sum_w > 0.0 or sparsity_w > 0.0:
             x0_pred = (
                 xt - extract(self.sqrt_one_minus_alpha_hat, t, x0.shape) * noise_pred
             ) / extract(self.sqrt_alpha_hat, t, x0.shape)
-            # x0_pred shape conventions: the model returns "b h c" (h=threads,
-            # c=stressors) per TemporalUnetCond.forward. So row sums are along c.
-            if x0_pred.dim() == 3 and x0_pred.shape[-1] == 13 and x0_pred.shape[1] == 20:
-                # Map raw model output [-1, 1] to action weights [0, 1].
-                row_sums = ((x0_pred + 1.0) * 0.5).sum(dim=-1)        # (B, 20)
-                # Per-core CPU% target in metric: alphabetical → first 20 are cores.
-                # Metric is normalized to [-1, 1]; map back to [0, 1] for scale match.
+            # SDD: only the first T columns are action values; bits are second half.
+            if self.sdd_enabled:
+                T_top = x0_pred.shape[-1] // 2
+                x0_pred = x0_pred[..., :T_top]
+            # x0_pred conventions: label is stored as (B, S=stressors, T=threads),
+            # i.e. axis 1 = stressors (13 legacy / 19 v2 / 20 v3) and axis -1 = threads (20).
+            if x0_pred.dim() == 3 and x0_pred.shape[1] in (13, 19, 20) and x0_pred.shape[-1] == 20:
+                # Clamp to the [0,1] weight space the action_pred is *supposed* to
+                # live in. Without an upper clamp, large noise-prediction errors at
+                # high diffusion timesteps explode row_sums (≥ 19·max_pred) and
+                # make this aux dominate the base MSE.
+                action_pred = ((x0_pred + 1.0) * 0.5).clamp(0.0, 1.0)
+                row_sums = action_pred.sum(dim=1)                        # sum over stressors -> (B, T=20)
+                # Conditioning is normalized to [-1, 1] in our v2 dataloader; map
+                # back to [0, 1] for scale match with row_sums (also in [0, 1] for
+                # active rows since one or two dominant stressors carry the weight).
                 metric = context_cond["metric"]
                 if metric.dim() == 2 and metric.shape[1] >= 20:
-                    cpu_target = (metric[:, :20] + 1.0) * 0.5         # (B, 20)
-                    # Only supervise the unmasked (cfg-enabled) samples.
-                    sample_mask = cfg_mask.view(-1, 1)                  # (B, 1)
-                    aux = F.l1_loss(row_sums * sample_mask,
-                                    cpu_target * sample_mask)
-                    loss = loss + self.row_sum_aux_weight * aux
+                    cpu_target = ((metric[:, :20] + 1.0) * 0.5).clamp(0, 1)  # (B, 20)
+                    sample_mask = cfg_mask.view(-1, 1)                       # (B, 1)
+
+                    # row_sum aux: L1 match between row_sum and target CPU.
+                    # Symmetric — pulls row_sum toward the cond-implied magnitude.
+                    if row_sum_w > 0.0:
+                        aux = F.l1_loss(row_sums * sample_mask,
+                                        cpu_target * sample_mask)
+                        loss = loss + row_sum_w * aux
+
+                    # NEW: sparsity aux. Asymmetric — penalize ALL stressor weight
+                    # (per-thread sum) where cond shows the core is idle.
+                    # idle_weight = (1 - cpu_target) → high when cond says core idle.
+                    # This explicitly drives the model to zero out positions the
+                    # conditioning implies are inactive, addressing the K-overshoot
+                    # observed when the model puts non-trivial intensity on every
+                    # row regardless of cond.
+                    if sparsity_w > 0.0:
+                        idle_weight = (1.0 - cpu_target)                     # (B, 20)
+                        sparsity_aux = ((row_sums * idle_weight) * sample_mask).mean()
+                        loss = loss + sparsity_w * sparsity_aux
 
         return loss
 

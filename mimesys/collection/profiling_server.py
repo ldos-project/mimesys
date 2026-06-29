@@ -18,6 +18,31 @@ import re
 import numpy as np
 
 from mimesys.preprocessing.parsers import parse_trace_file, process_trace_all
+from mimesys.preprocessing.pqos_parser import pqos_metrics_dict, PQOS_METRIC_KEYS
+
+
+def _merge_pqos_into_metrics(profiled_metrics, stats_path):
+    """Load paired pqos.log next to stats and merge its 3 keys into profiled_metrics.
+    Caller may pass any file_path; we replace 'stats' with 'pqos' and '.txt' with '.log'."""
+    import os
+    pqos_path = stats_path.replace("/stats-", "/pqos-").replace(".txt", ".log")
+    if not os.path.exists(pqos_path):
+        return profiled_metrics
+    try:
+        pq = pqos_metrics_dict(pqos_path)
+    except Exception:
+        return profiled_metrics
+    n = len(next(iter(profiled_metrics.values()))) if profiled_metrics else 0
+    for k in PQOS_METRIC_KEYS:
+        v = pq.get(k, [])
+        # Match the length of HPC metrics so EMD sees comparable arrays.
+        if len(v) == n:
+            profiled_metrics[k] = list(v)
+        elif len(v) > 0:
+            # Length mismatch: pad/truncate to n. Better than dropping.
+            arr = list(v)[:n] + [0.0] * max(0, n - len(v))
+            profiled_metrics[k] = arr
+    return profiled_metrics
 
 import json
 from collections import defaultdict
@@ -123,11 +148,14 @@ class Profiler:
             ))
             print(f"Chunk {host_idx}: benchmark done on {machine.hostname}")
 
-            # Pull stats files via SFTP
+            # Pull stats AND pqos files via SFTP. _merge_pqos_into_metrics
+            # downstream needs the paired pqos-plan_*.log to inject the 3 libpqos
+            # keys; without it, pqos EMD silently drops out of the reward signal.
             chunk_stats_dir = os.path.join(local_stats_dir, f"chunk_{host_idx}")
             os.makedirs(chunk_stats_dir, exist_ok=True)
             _, stdout, _ = client.exec_command(
-                f"ls /users/{self.user_name}/results/stats-plan_*.txt 2>/dev/null"
+                f"ls /users/{self.user_name}/results/stats-plan_*.txt "
+                f"/users/{self.user_name}/results/pqos-plan_*.log 2>/dev/null"
             )
             remote_files = stdout.read().decode().strip().splitlines()
             count = 0
@@ -138,7 +166,7 @@ class Profiler:
                 local_path = os.path.join(chunk_stats_dir, os.path.basename(remote_path))
                 sftp.get(remote_path, local_path)
                 count += 1
-            print(f"Chunk {host_idx}: pulled {count} stats files from {machine.hostname}")
+            print(f"Chunk {host_idx}: pulled {count} stats+pqos files from {machine.hostname}")
             return count
         finally:
             machine.close_connection(scp=sftp, client=client)
@@ -213,6 +241,11 @@ class Profiler:
         # — set MIMESYS_SLOT_US=1000000 here for 1-s slots matching the windowed-
         # DTW deploy contract. Omitted vars fall back to worker defaults.
         env_prefix = f"MIMESYS_ITERS={mimesys_iters}"
+        # MIMESYS_INTERNAL_PROFILING=1 enables the binary's hpcperfstatsd + pqos
+        # collection. Default ON for training data collection so per-plan
+        # stats-plan_NNN.txt AND pqos-plan_NNN.log are both produced.
+        internal_prof = os.environ.get("MIMESYS_INTERNAL_PROFILING", "1")
+        env_prefix += f" MIMESYS_INTERNAL_PROFILING={internal_prof}"
         slot_us = os.environ.get("MIMESYS_SLOT_US")
         if slot_us:
             env_prefix += f" MIMESYS_SLOT_US={slot_us}"
@@ -359,7 +392,7 @@ class Profiler:
 
                     header, parsed_traces = parse_trace_file(stat_fpath)
                     # profiled_metrics = process_trace_fine_grained(parsed_traces, period, duration, include_aggregated_cpu=True)
-                    profiled_metrics = process_trace_all(parsed_traces, include_aggregated_cpu=True)
+                    profiled_metrics = process_trace_all(parsed_traces, include_aggregated_cpu=True); profiled_metrics = _merge_pqos_into_metrics(profiled_metrics, file_path)
                     if not profiled_metrics:
                         continue
 
@@ -459,7 +492,7 @@ class Profiler:
                 metrics_std_list = []
                 for batch_idx, trial_idx, file_path, ground_truth_path in metrics_file_pair:
                     header, parsed_traces = parse_trace_file(file_path)
-                    profiled_metrics = process_trace_all(parsed_traces)
+                    profiled_metrics = process_trace_all(parsed_traces); profiled_metrics = _merge_pqos_into_metrics(profiled_metrics, file_path)
 
                     with open(ground_truth_path, "r") as f:
                         ground_truth = json.load(f)
@@ -604,7 +637,7 @@ class Profiler:
             for batch_idx, trial_idx, file_path, ground_truth_path in metrics_file_pair:
                 try:
                     header, parsed_traces = parse_trace_file(file_path)
-                    profiled_metrics = process_trace_all(parsed_traces)
+                    profiled_metrics = process_trace_all(parsed_traces); profiled_metrics = _merge_pqos_into_metrics(profiled_metrics, file_path)
 
                     with open(ground_truth_path) as f:
                         ground_truth = json.load(f)

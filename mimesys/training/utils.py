@@ -130,6 +130,10 @@ def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> Gau
     diffusion.row_sum_aux_weight = float(
         getattr(cfg.diffusion, "row_sum_aux_weight", 0.0)
     )
+    # NEW: asymmetric sparsity penalty that zeros out idle positions.
+    diffusion.sparsity_aux_weight = float(
+        getattr(cfg.diffusion, "sparsity_aux_weight", 0.0)
+    )
     return diffusion
 
 

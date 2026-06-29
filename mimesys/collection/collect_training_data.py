@@ -74,7 +74,7 @@ SSH_USER           = worker_config.USERNAME
 SSH_KEY_PATH       = os.path.expanduser(worker_config.PRIVATE_KEY_PATH)
 MY_HOSTNAME        = worker_config.MY_HOSTNAME
 
-NUM_ACTIONS    = 13
+NUM_ACTIONS    = 19
 NUM_THREADS    = 20
 BATCH_SIZE     = int(os.environ.get("MIMESYS_BATCH_SIZE",
                      worker_config.PER_MACHINE_BATCH * len(PROFILING_MACHINES)))   # active-learning round size (env-overridable)
@@ -89,6 +89,10 @@ PREV_SHORTLIST_MULT = int(os.environ.get("MIMESYS_PREV_SHORTLIST_MULT", "10"))
 # there; low-LLC prevs only add noise) and emit each (prev,curr) as N independent
 # replicate plans so the carry-over Δ beats the per-plan measurement noise.
 PREV_N_REP = int(os.environ.get("MIMESYS_PREV_N_REP", "3"))
+# Replication count for none-current plans (pure AL, no prev-variant). Each
+# unique curr is profiled N_REP times so noise averaging can beat per-plan
+# measurement variance. Default 1 (legacy: each curr profiled once).
+N_REP = int(os.environ.get("MIMESYS_N_REP", "1"))
 PREV_HIGH_LLC_FRAC = float(os.environ.get("MIMESYS_PREV_HIGH_LLC_FRAC", "0.5"))  # top fraction of pool by LLC
 # Selection mode for prev_action candidate filter:
 #   "llc"           — top PREV_HIGH_LLC_FRAC of pool by LLC only (legacy default)
@@ -97,8 +101,24 @@ PREV_HIGH_LLC_FRAC = float(os.environ.get("MIMESYS_PREV_HIGH_LLC_FRAC", "0.5")) 
 #                      effect for the new HddRead/HddWriteNF stressors)
 PREV_FILTER_MODE = os.environ.get("MIMESYS_PREV_FILTER_MODE", "llc")
 PREV_RANDOM_FRAC = float(os.environ.get("MIMESYS_PREV_RANDOM_FRAC", "0.15"))   # fraction of pool to add as random
-# 24 = 20 per-core CPU% + 1 avg_cpu_utilizations_total + 1 io + 1 l3_cache_usage + 1 memory_bandwidth
-NUM_METRICS    = 24
+# 31 = 28 hpcperfstatsd + 3 pqos (single merged group)
+# Layout per group (offsets within a 31-block), alphabetical from process_trace_all
+# then pqos appended in PQOS_METRIC_KEYS order:
+#   0-19   per-core CPU% (avg_cpu_utilizations_core_00..19)
+#   20     avg_cpu_utilizations_total
+#   21     io                       (read + write, summary for bucketing)
+#   22     io_read
+#   23     io_write
+#   24     l3_cache_usage           (CHA aggregate)
+#   25     memory_bandwidth         (read + write, summary for bucketing)
+#   26     memory_bandwidth_read
+#   27     memory_bandwidth_write
+#   28     pqos_llc_kb              (LLC occupancy, unique vs hpc)
+#   29     pqos_ipc                 (unique vs hpc)
+#   30     pqos_misses              (pairs with ipc for MPKI)
+NUM_METRICS    = 31
+# How many hpc-side metrics (pre-pqos). Used to size hpc loop in load_round.
+NUM_HPC_METRICS = 28
 
 # 5:5 ratio — equal stratified split between hull-cell-fill and fps-novelty.
 # The hull_fps_ratio passed into propose_by_hull_mixed_fps_hybrid both (a) sizes
@@ -148,7 +168,9 @@ def sample_scaling_weight():
     probabilities = weights / weights.sum()
     return np.random.choice(weights, p=probabilities)
 
-def propose_candidates_by_random(timestamp=2, num_actions=13, num_threads=20, n_candidates=1000):
+def propose_candidates_by_random(timestamp=2, num_actions=None, num_threads=20, n_candidates=1000):
+    if num_actions is None:
+        num_actions = NUM_ACTIONS   # defined at top of module — currently 15
     """Random candidates.
 
     Two modes selectable via env var ``MIMESYS_DENSE_PROPOSALS`` (Tier 3.6):
@@ -204,7 +226,7 @@ def propose_candidates_by_random(timestamp=2, num_actions=13, num_threads=20, n_
     return candidates
 
 
-def propose_candidates_by_dense_seeds(timestamp=2, num_actions=13,
+def propose_candidates_by_dense_seeds(timestamp=2, num_actions=None,
                                        num_threads=20, n_candidates=1000):
     """Dense-seed proposals mirroring the OLD surrogate_based_search.py
     ``initial_candidates``: every thread is active (no idle threads, no scaling
@@ -221,6 +243,8 @@ def propose_candidates_by_dense_seeds(timestamp=2, num_actions=13,
     matches the per-core CPU distribution of the test traces (mean ~42% on
     c220g5 instead of 22% for the standard random/hull proposals).
     """
+    if num_actions is None:
+        num_actions = NUM_ACTIONS
     candidates = []
     for _ in range(n_candidates):
         candidate = []
@@ -248,7 +272,7 @@ def propose_candidates_by_dense_seeds(timestamp=2, num_actions=13,
     return candidates
 
 
-def propose_candidates_by_thread_sparsity(timestamp=2, num_actions=13,
+def propose_candidates_by_thread_sparsity(timestamp=2, num_actions=None,
                                            num_threads=20, n_candidates=1000):
     """Structured thread-sparse candidates: K threads at high utilization, rest idle.
 
@@ -262,6 +286,8 @@ def propose_candidates_by_thread_sparsity(timestamp=2, num_actions=13,
     Returns the same nested-list shape as ``propose_candidates_by_random``:
     list[n_candidates] of list[timestamp][num_threads][num_actions].
     """
+    if num_actions is None:
+        num_actions = NUM_ACTIONS
     K_choices = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12]
     K_probs   = [0.10, 0.15, 0.15, 0.15, 0.10, 0.10, 0.08, 0.07, 0.05, 0.05]
     layouts   = ["first_K", "last_K", "random_K", "socket0_K", "socket1_K"]
@@ -526,18 +552,17 @@ def propose_candidates_by_pool_mutation(A, n_candidates=1000, noise_std=0.03):
 
 # M layout: [prev_metrics(NUM_METRICS), curr_metrics(NUM_METRICS), noop_metrics(NUM_METRICS)] = NUM_METRICS * 3 dims total.
 # M ordering verified: group 0 = prev_action, group 1 = curr_action, group 2 = no-op.
-# Within each 24-dim group the last 4 are the key metrics in this order:
+# Within each NUM_METRICS-dim group, hpc metrics are at offsets 0..NUM_HPC_METRICS-1
+# (the "first 28 cols"), and the 4 *key* hpc metrics for bucketing/FPS are:
 #   idx+20  avg_cpu_utilizations_total
-#   idx+21  io
-#   idx+22  l3_cache_usage    (aggregate; per-socket dropped to avoid CHA artifact)
-#   idx+23  memory_bandwidth  (aggregate)
-# For curr_action (group 1, offset 24): flat indices 44–47.
-_KEY_METRIC_INDICES = [
-        NUM_METRICS * 2 - 4,
-        NUM_METRICS * 2 - 3,
-        NUM_METRICS * 2 - 2,
-        NUM_METRICS * 2 - 1
-    ]
+#   idx+21  io                  (summary sum: io_read + io_write)
+#   idx+24  l3_cache_usage      (CHA aggregate)
+#   idx+25  memory_bandwidth    (summary sum: bw_read + bw_write)
+# pqos metrics live at offsets NUM_HPC_METRICS..NUM_METRICS-1 (offsets 28..30).
+# For curr_action (group 1, base = NUM_METRICS): key metrics at base+{20,21,24,25}.
+# The 4 indices map to [CPU%, IO KB/s, L3 MB/s, BW %] as labeled in report_metrics.
+_HPC_KEY_OFFSETS = [20, 21, 24, 25]   # within a NUM_METRICS-block, the 4 summary indices
+_KEY_METRIC_INDICES = [NUM_METRICS + off for off in _HPC_KEY_OFFSETS]
 
 
 # ---------------------------------------------------------------------------
@@ -687,7 +712,7 @@ def _augment_pool_for_hull(A, M, aug_factor: int = AUG_FACTOR):
     def _metric_apply(m, perm_s0, perm_s1, do_swap):
         new = np.asarray(m, dtype=float).copy()
         for K in range(3):                              # prev, curr, noop
-            base = K * NUM_METRICS                      # 0, 24, 48
+            base = K * NUM_METRICS                      # 0, 31, 62  (NUM_METRICS=31)
             if perm_s0 is not None:
                 new[base:base+10]    = np.asarray(m[base:base+10])[perm_s0]
                 new[base+10:base+20] = np.asarray(m[base+10:base+20])[perm_s1]
@@ -736,11 +761,27 @@ def propose_by_hull_mixed_fps_hybrid(A, M, n_candidates, grid_bins=10, k_neighbo
     hull_fps_ratio=1  → equal pools (1:1); hull_fps_ratio=9 → 9:1 hull:fps.
     mutation_ratio=0.5 → half the fps oversample pool comes from pool mutations,
                          half from fresh random candidates.
-    Metric indices (new 23-D layout with socket-aggregated LLC/BW):
-                    0=CPU%  1=IO  2=LLC  3=BW  (key metrics from curr_action group)
-                    4=CPU-S0  5=CPU-S1  (per-socket CPU util, cols 24-33 / 34-43)
-                    6=CPU-STD  7=CPU-MID-FRAC  (per-core shape — std across 20 cores
-                    and fraction of cores at 20-80% mid-range)
+
+    Hull dims (built from curr_action group of NUM_METRICS=31 layout):
+                    0=CPU%      (avg_cpu_utilizations_total)
+                    1=IO        (io summary = io_read + io_write)
+                    2=L3        (l3_cache_usage — traffic to L3, MB/s)
+                    3=BW        (memory_bandwidth summary = bw_read + bw_write)
+                    4=CPU-S0    (per-socket CPU util, mean of cols base+0..9)
+                    5=CPU-S1    (per-socket CPU util, mean of cols base+10..19)
+                    6=PQOS-LLC  (LLC occupancy in KB — orthogonal to L3 traffic;
+                                  added with new merged-group pqos panel)
+                    7=PQOS-IPC  (instructions per cycle — compute-efficiency
+                                  axis distinct from CPU% which is util only)
+                    8=PQOS-MPKI (LLC misses per kilo-instruction — derived from
+                                  pqos_misses and pqos_ipc; cache-miss rate
+                                  normalized for workload intensity)
+                    9=IO_READ   (disk read traffic, KB/s — split from summary IO)
+                   10=IO_WRITE  (disk write traffic, KB/s — split from summary IO)
+                   11=BW_READ   (memory read bandwidth %, split from summary BW)
+                   12=BW_WRITE  (memory write bandwidth %, split from summary BW)
+    Index legend supersedes the prior "23-D" stub since the metric panel grew
+    to 31 with hpc r/w splits and 3 pqos fields.
     """
     from collections import Counter
 
@@ -752,28 +793,53 @@ def propose_by_hull_mixed_fps_hybrid(A, M, n_candidates, grid_bins=10, k_neighbo
           f"({AUG_FACTOR}× via intra-perm + socket-swap variants)")
 
     M_key4 = M[:, _KEY_METRIC_INDICES].astype(float)
-    # Per-core CPU% live in group 1 (curr_action), cols 24..43 (alphabetical
-    # core_00..core_19). Socket 0 = cores 0..9, socket 1 = cores 10..19.
-    G1_CPU_LO = NUM_METRICS               # 24
-    G1_CPU_HI = NUM_METRICS + 20          # 44
-    per_core_curr = M[:, G1_CPU_LO:G1_CPU_HI].astype(float)
+    # Per-core CPU% live in group 1 (curr_action), cols base+0..base+19
+    # (alphabetical core_00..core_19). Socket 0 = cores 0..9, socket 1 = 10..19.
+    G1_BASE = NUM_METRICS                 # 31 — start of curr_action block
+    per_core_curr = M[:, G1_BASE:G1_BASE + 20].astype(float)
     cpu_s0 = per_core_curr[:, :10].mean(axis=1, keepdims=True)
     cpu_s1 = per_core_curr[:, 10:].mean(axis=1, keepdims=True)
-    M_key = np.hstack([M_key4, cpu_s0, cpu_s1])  # (N, 8)
+    # pqos columns within the curr block (NUM_HPC_METRICS=28 hpc, then pqos):
+    #   offset 28 = pqos_llc_kb, 29 = pqos_ipc, 30 = pqos_misses
+    pqos_llc    = M[:, G1_BASE + 28:G1_BASE + 29].astype(float)
+    pqos_ipc    = M[:, G1_BASE + 29:G1_BASE + 30].astype(float)
+    pqos_misses = M[:, G1_BASE + 30:G1_BASE + 31].astype(float)
+    # MPKI = LLC misses × 1000 / instructions_retired.
+    # instructions ≈ ipc × cycles ≈ ipc × cpu_freq × elapsed × num_cores.
+    # For our 1-sec sample window on c220g5 (Xeon Silver 4114, base 2.2 GHz, 20 cores):
+    #   instructions ≈ ipc × 2.2e9 × 1.0 × 20 = ipc × 44e9
+    #   MPKI ≈ misses × 1000 / (ipc × 44e9) = misses / (ipc × 44e6)
+    # Clamp ipc denominator so divisions by ~0 (idle slots) don't blow up.
+    ipc_safe = np.maximum(pqos_ipc, 0.05)
+    pqos_mpki = (pqos_misses / (ipc_safe * 4.4e7)).astype(float)
+    # r/w split dims for IO and memory_bandwidth (curr-block offsets 22,23,26,27).
+    # Hull groups using these explore the read-heavy ↔ write-heavy axis which the
+    # summary IO/BW dims (1, 3) flatten by summing.
+    io_read  = M[:, G1_BASE + 22:G1_BASE + 23].astype(float)
+    io_write = M[:, G1_BASE + 23:G1_BASE + 24].astype(float)
+    bw_read  = M[:, G1_BASE + 26:G1_BASE + 27].astype(float)
+    bw_write = M[:, G1_BASE + 27:G1_BASE + 28].astype(float)
+    M_key = np.hstack([M_key4, cpu_s0, cpu_s1, pqos_llc, pqos_ipc, pqos_mpki,
+                       io_read, io_write, bw_read, bw_write])  # (N, 13)
 
     # ── 1. Build hull pool ────────────────────────────────────────────────────
-    # Index legend: 0=CPU%, 1=IO, 2=LLC, 3=BW, 4=CPU-S0, 5=CPU-S1,
-    #
-    # Previous v5 GROUPS had 4/7 dimensions involving IO (over-weighted vs
-    # LLC/BW). Rebalanced for v6: 2/9 involve IO (one 3-D, one 2-D), 5/9 emphasize
-    # CPU×LLC, CPU×BW, LLC×BW for better diversity in those metrics, plus 1 socket
-    # asymmetry and 1 CPU-shape dim.
+    # 7 groups span the metric space:
+    #   (a) IO×L3×BW             — memory-system saturation (summary)
+    #   (b) CPU×L3×PQOS-LLC      — cache traffic vs occupancy diversity
+    #   (c) CPU×IPC×MPKI         — compute efficiency vs miss-rate joint
+    #   (d) BW×MPKI              — BW vs cache thrashing
+    #   (e) CPU-S0×CPU-S1        — socket asymmetry
+    #   (f) IO_READ×IO_WRITE     — disk r/w mix exploration
+    #   (g) BW_READ×BW_WRITE     — memory r/w mix exploration
+    # Kept ≤3-D per group so Delaunay is feasible.
     GROUPS = [
-        # (0, 2, 3),    # CPU% × LLC × BW   (compute-heavy hull)
-        # (1, 2, 3),    # IO   × LLC × BW   (single io-heavy 3-D)
-        # (0, 1),       # CPU% × IO         (more CPU×IO diversity)
-        # (4, 5),       # cpu-s0 vs cpu-s1  (socket CPU asymmetry)
-        (1, 2, 3, 4, 5)
+        (1, 2, 3),       # IO × L3 × BW             (memory-system saturation)
+        (0, 2, 6),       # CPU × L3 × PQOS-LLC      (cache traffic vs occupancy)
+        (0, 7, 8),       # CPU × IPC × MPKI         (compute efficiency vs miss rate)
+        (3, 8),          # BW × MPKI                (BW vs cache thrashing)
+        (4, 5),          # CPU-S0 × CPU-S1          (socket asymmetry)
+        (9, 10),         # IO_READ × IO_WRITE       (NEW: disk r/w mix)
+        (11, 12),        # BW_READ × BW_WRITE       (NEW: memory r/w mix)
     ]
 
     n_str   = len(A[0][0][0])
@@ -1452,26 +1518,93 @@ def _apply_action_noise(actions, eps=0.1, renormalize=True, active_thresh=1e-6):
     return actions
 
 
+def _apply_thread_count(candidate, K):
+    """Force `candidate` (timestamp × threads × stressors) to have EXACTLY K
+    active threads in every window, with the active-thread budget split
+    between the two sockets via a uniform-random socket assignment:
+
+      N_s0 ~ Uniform({max(0, K-10), ..., min(10, K)})    inclusive
+      N_s1 = K - N_s0
+
+    `N_s0` random positions are then chosen on socket 0 (cores 0..9) and
+    `N_s1` random positions on socket 1 (cores 10..19). This covers every
+    valid (N_s0, N_s1) socket split with equal probability — for K=10 that
+    includes the balanced 5/5, the 4/6 / 6/4, ..., and the extreme 0/10 /
+    10/0 — instead of only the two endpoints a binary socket-flip would
+    produce. Aggregated socket load is balanced by symmetry.
+
+    The active rows themselves are sampled from the candidate's own nonzero
+    rows (the stressor mix chosen by the upstream proposer) and cycled to
+    fill K positions exactly — works whether upstream had fewer or more
+    active rows than K. If a window has no active rows, K positions are
+    synthesized as pure single-stressor threads at the standard scaling
+    weight.
+
+    `N_s0` and the position choice are sampled ONCE per candidate (same for
+    both prev and curr windows) so the active-position set is coherent
+    across the timestep.
+
+    Returns a NEW candidate (does not mutate the input)."""
+    n_thrd_total = NUM_THREADS
+    socket_size  = n_thrd_total // 2
+    n_s0_min = max(0, K - socket_size)
+    n_s0_max = min(socket_size, K)
+    N_s0 = random.randint(n_s0_min, n_s0_max)
+    N_s1 = K - N_s0
+    pos_s0 = random.sample(range(0, socket_size), N_s0) if N_s0 > 0 else []
+    pos_s1 = random.sample(range(socket_size, n_thrd_total), N_s1) if N_s1 > 0 else []
+    active_positions = sorted(pos_s0 + pos_s1)
+
+    new_candidate = []
+    for win in candidate:
+        arr = np.asarray(win, dtype=float)
+        n_thrd, n_stress = arr.shape
+        active_mask = arr.sum(axis=1) > 0
+        active_rows = arr[active_mask]
+        new_win = np.zeros((n_thrd, n_stress), dtype=float)
+        if len(active_rows) > 0:
+            idx = np.random.permutation(len(active_rows))
+            for k, pos in enumerate(active_positions):
+                new_win[pos] = active_rows[idx[k % len(active_rows)]]
+        else:
+            for k, pos in enumerate(active_positions):
+                sidx = random.randrange(n_stress)
+                new_win[pos, sidx] = sample_scaling_weight() / 100.0
+        new_candidate.append(new_win.tolist())
+    return new_candidate
+
+
+def _stratify_thread_count(candidates, num_threads=None):
+    """Globally stratify a batch by active thread count. Cycles K=[1..num_threads]
+    across the batch so every K gets ~equal representation. Applied as a
+    post-processing step on whatever the upstream proposers produced — each
+    candidate's stressor mix (which stressors at what weights) is preserved
+    via reuse of its own active rows; only the active-thread count is enforced.
+
+    Disable by setting MIMESYS_STRATIFY_THREADS=0."""
+    if num_threads is None:
+        num_threads = NUM_THREADS
+    out = []
+    for i, cand in enumerate(candidates):
+        K = (i % num_threads) + 1
+        out.append(_apply_thread_count(cand, K))
+    return out
+
+
 def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
     """via hull_mixed_fps_hybrid, optionally mixed with disjoint composites.
 
     Env vars:
       MIMESYS_COMPOSITE_FRACTION (default 0.0)  fraction of batch from composites
+      MIMESYS_EXPLICIT_THREAD_FRACTION (default 0.0) fraction from
+                                                   propose_candidates_explicit_threads
+                                                   (deterministic K=1..N stratification)
       MIMESYS_DEDUP              (default "1")  set to "0" to disable dedup
     """
     composite_frac = float(os.environ.get("MIMESYS_COMPOSITE_FRACTION", "0.0"))
-    sparsity_frac  = float(os.environ.get("MIMESYS_THREAD_SPARSE_FRACTION", "0.0"))
-    dense_seed_frac = float(os.environ.get("MIMESYS_DENSE_SEED_FRACTION", "0.0"))
-    composite_frac  = max(0.0, min(1.0, composite_frac))
-    sparsity_frac   = max(0.0, min(1.0, sparsity_frac))
-    dense_seed_frac = max(0.0, min(1.0, dense_seed_frac))
-    # Carve out thread-sparse and dense-seed budgets first, then split the
-    # remainder composite/hull-FPS using the existing fraction.
-    n_sparsity   = int(round(n_candidates * sparsity_frac))
-    n_dense_seed = int(round(n_candidates * dense_seed_frac))
-    n_remaining = n_candidates - n_sparsity - n_dense_seed
-    n_composite = int(round(n_remaining * composite_frac))
-    n_hull_fps  = n_remaining - n_composite
+    composite_frac = max(0.0, min(1.0, composite_frac))
+    n_composite = int(round(n_candidates * composite_frac))
+    n_hull_fps  = n_candidates - n_composite
     do_dedup    = os.environ.get("MIMESYS_DEDUP", "1") != "0"
 
     # Build pool-A dedup set (existing actions we already collected)
@@ -1490,10 +1623,6 @@ def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
                 if n_hull_fps > 0 else [])
     raw_comp = (propose_disjoint_composites(A, n_composite)
                 if n_composite > 0 else [])
-    raw_sparsity = (propose_candidates_by_thread_sparsity(n_candidates=int(n_sparsity * OVERSHOOT))
-                    if n_sparsity > 0 else [])
-    raw_dense_seed = (propose_candidates_by_dense_seeds(n_candidates=int(n_dense_seed * OVERSHOOT))
-                      if n_dense_seed > 0 else [])
 
     def _dedup_filter(cands, seen):
         """Drop entries whose key is in `seen` or pool_keys; update `seen` with kept keys."""
@@ -1507,23 +1636,17 @@ def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
 
     used = set()
     if do_dedup:
-        kept_hull       = _dedup_filter(raw_hull, used)
-        kept_comp       = _dedup_filter(raw_comp, used)
-        kept_sparsity   = _dedup_filter(raw_sparsity, used)
-        kept_dense_seed = _dedup_filter(raw_dense_seed, used)
+        kept_hull = _dedup_filter(raw_hull, used)
+        kept_comp = _dedup_filter(raw_comp, used)
     else:
-        kept_hull       = list(raw_hull)
-        kept_comp       = list(raw_comp)
-        kept_sparsity   = list(raw_sparsity)
-        kept_dense_seed = list(raw_dense_seed)
+        kept_hull = list(raw_hull)
+        kept_comp = list(raw_comp)
 
     # Truncate to target
-    hull_fps       = kept_hull[:n_hull_fps]
-    composites     = kept_comp[:n_composite]
-    sparsity_out   = kept_sparsity[:n_sparsity]
-    dense_seed_out = kept_dense_seed[:n_dense_seed]
+    hull_fps   = kept_hull[:n_hull_fps]
+    composites = kept_comp[:n_composite]
 
-    short = n_candidates - len(hull_fps) - len(composites) - len(sparsity_out) - len(dense_seed_out)
+    short = n_candidates - len(hull_fps) - len(composites)
     if short > 0:
         # Top-up with extra random proposals if dedup left us short
         extra = propose_candidates_by_random(n_candidates=int(short * 1.5))
@@ -1531,20 +1654,25 @@ def propose_convex_hull_and_novelty_mix(A, M, n_candidates):
             extra = _dedup_filter(extra, used)
         composites += extra[:short]
 
-    out = hull_fps + composites + sparsity_out + dense_seed_out
+    out = hull_fps + composites
     random.shuffle(out)
-    dropped_hull       = len(raw_hull) - len(hull_fps)
-    dropped_comp       = max(0, len(raw_comp) - len(composites))
-    dropped_sparsity   = len(raw_sparsity) - len(sparsity_out)
-    dropped_dense_seed = len(raw_dense_seed) - len(dense_seed_out)
+
+    # Global thread-count stratification: cycle K=[1..NUM_THREADS] across the
+    # batch so every K gets equal representation. Augmentation later permutes
+    # which K positions are active. Set MIMESYS_STRATIFY_THREADS=0 to disable.
+    stratify_threads = os.environ.get("MIMESYS_STRATIFY_THREADS", "1") != "0"
+    if stratify_threads:
+        out = _stratify_thread_count(out, num_threads=NUM_THREADS)
+        # Re-shuffle so K-position isn't correlated with worker dispatch order
+        random.shuffle(out)
+
+    dropped_hull = len(raw_hull) - len(hull_fps)
+    dropped_comp = max(0, len(raw_comp) - len(composites))
     print(f"  [propose] n_hull_fps={n_hull_fps}  n_composite={n_composite}  "
-          f"n_sparsity={n_sparsity}  n_dense_seed={n_dense_seed}  "
-          f"(composite_frac={composite_frac:.2f}, sparsity_frac={sparsity_frac:.2f}, "
-          f"dense_seed_frac={dense_seed_frac:.2f}, dedup={do_dedup})")
+          f"(composite_frac={composite_frac:.2f}, "
+          f"stratify_threads={stratify_threads}, dedup={do_dedup})")
     print(f"  [propose] kept hull/fps={len(hull_fps)} (dropped {dropped_hull}); "
           f"composite={len(composites)} (dropped {dropped_comp}); "
-          f"sparsity={len(sparsity_out)} (dropped {dropped_sparsity}); "
-          f"dense_seed={len(dense_seed_out)} (dropped {dropped_dense_seed}); "
           f"total={len(out)}")
 
     # Tier 3.7: hard-cap idle-thread count. If MIMESYS_MIN_ACTIVE_THREADS is
@@ -1612,6 +1740,7 @@ def load_round(profiler, round_idx):
     """
     from collections import defaultdict
     from mimesys.preprocessing.dataloader import parse_trace_file, process_trace_all
+    from mimesys.preprocessing.pqos_parser import pqos_metrics_dict, PQOS_METRIC_KEYS
 
     dest = os.path.join(OUTPUT_PATH, f"round_{round_idx}")
     if not os.path.isdir(dest):
@@ -1636,6 +1765,30 @@ def load_round(profiler, round_idx):
             continue
         if not pm:
             continue
+        # Merge pqos.log (per-socket LLC occupancy + memory BW + IPC + Misses)
+        # into the same per-metric dict; binning happens later on (metric → list).
+        # The pqos file is emitted by mimesys_benchmark's StopProfiling next to
+        # stats-plan_NNN.txt as pqos-plan_NNN.log.
+        pqos_path = sp.replace("/stats-plan_", "/pqos-plan_").replace(".txt", ".log")
+        try:
+            # libpqos in-process polling (binary v5+) produces one pqos sample
+            # per slot, natively aligned with hpc — no timestamp alignment needed.
+            pqos_metrics = pqos_metrics_dict(pqos_path)
+        except Exception:
+            pqos_metrics = {k: [] for k in PQOS_METRIC_KEYS}
+        # Only attach if at least socket 0 LLC is non-empty (otherwise leave
+        # zeros so downstream code doesn't crash on missing keys).
+        for k in PQOS_METRIC_KEYS:
+            vals = pqos_metrics.get(k, [])
+            # Inject into pm with matching length to other metrics (truncate / pad to
+            # the length of an existing metric so binning logic below sees same N).
+            if pm:
+                ref_len = max((len(v) for v in pm.values() if isinstance(v, list)), default=0)
+                if len(vals) >= ref_len:
+                    vals = vals[:ref_len]
+                else:
+                    vals = list(vals) + [0.0] * (ref_len - len(vals))
+            pm[k] = vals
         with h5py.File(h5p, "r") as f:
             actions = f["execution_plan"][:].tolist()
         # A curr-only plan (prev profiling was skipped) has a single window.
@@ -1821,7 +1974,11 @@ def run_collection(n_rounds: int, restart: bool = False):
         currs = [c for c in currs if not _curr_is_empty(c)]   # drop no-op (all-zero curr) candidates
         if len(currs) < n_prop:
             print(f"  [filter] dropped {n_prop - len(currs)} all-zero-curr candidates")
-        none_plans = [as_none_current(c) for c in currs]   # prev=None (none-current)
+        # N_REP independent replicate plans per unique curr (noise-averaging
+        # for pure AL; no effect when N_REP=1, which is the legacy default).
+        none_plans = [as_none_current(c) for c in currs for _ in range(N_REP)]
+        if N_REP > 1:
+            print(f"  [N_REP] each curr replicated {N_REP}× → {len(currs)} unique → {len(none_plans)} plans")
 
         # K prev-variants per curr: prev = diverse none-current sample from the pool
         # (spanning the metric space → high LLC / mem-BW prevs). Profiled as real
@@ -1832,7 +1989,19 @@ def run_collection(n_rounds: int, restart: bool = False):
             print(f"  + {len(variants)} prev-variants ({K_PREV_VARIANTS}/curr × {PREV_N_REP} reps, "
                   f"high-LLC top {PREV_HIGH_LLC_FRAC:.0%}, {len(prev_foot)}-prev shortlist); "
                   f"shortlist LLC {min(llcs):.0f}-{max(llcs):.0f} MB/s, BW {min(bws):.1f}-{max(bws):.1f} %")
-        batch = none_plans + variants
+        # Interleave so each curr's (NONE × N_REP) + (K_PREV × N_REP) plans are
+        # contiguous in the batch. write_actions_to_execution_plans then slices
+        # the batch sequentially across machines, so all plans for a given curr
+        # land on the same host — kills the host-id confound in prev-impact
+        # measurement.
+        per_curr_variants = K_PREV_VARIANTS * PREV_N_REP
+        batch = []
+        for i in range(len(currs)):
+            for j in range(N_REP):
+                batch.append(none_plans[i * N_REP + j])
+            batch.extend(variants[i * per_curr_variants : (i + 1) * per_curr_variants])
+        print(f"  [interleave] {len(currs)} currs × ({N_REP} none + {per_curr_variants} prev) "
+              f"= {len(batch)} plans, contiguous-per-curr (same-host NONE↔PREV)")
 
         dest = os.path.join(OUTPUT_PATH, f"round_{r}")
         write_actions_to_execution_plans(batch, dest, PROFILING_MACHINES)

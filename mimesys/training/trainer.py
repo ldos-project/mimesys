@@ -346,6 +346,8 @@ class MimesysTrainer(pl.LightningModule):
                         continue
                     mean_err = float(np.mean(errs))
                     _all_raw_means.append(mean_err)
+                    # Legacy aggregate buckets — still log under the old short names
+                    # for backwards-compatible dashboards.
                     if m_name == "io":
                         self.log("emd/io",    mean_err, prog_bar=False, logger=True, on_epoch=True)
                     elif m_name == "l3_cache_usage":
@@ -354,6 +356,11 @@ class MimesysTrainer(pl.LightningModule):
                         self.log("emd/membw", mean_err, prog_bar=False, logger=True, on_epoch=True)
                     elif m_name.startswith("avg_cpu_utilizations"):
                         _cpu_vals.append(mean_err)
+                    # ALSO log every metric under its own name so v2 keys
+                    # (io_read, io_write, mb_read, mb_write, pqos_*) get
+                    # individual wandb charts.
+                    self.log(f"emd/m_{m_name}", mean_err,
+                             prog_bar=False, logger=True, on_epoch=True)
                 if _cpu_vals:
                     self.log("emd/cpu", float(np.mean(_cpu_vals)),
                              prog_bar=False, logger=True, on_epoch=True)
