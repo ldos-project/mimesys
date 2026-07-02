@@ -74,7 +74,7 @@ SSH_USER           = worker_config.USERNAME
 SSH_KEY_PATH       = os.path.expanduser(worker_config.PRIVATE_KEY_PATH)
 MY_HOSTNAME        = worker_config.MY_HOSTNAME
 
-NUM_ACTIONS    = 19
+NUM_ACTIONS    = int(os.environ.get("MIMESYS_NUM_ACTIONS", "19"))
 NUM_THREADS    = 20
 BATCH_SIZE     = int(os.environ.get("MIMESYS_BATCH_SIZE",
                      worker_config.PER_MACHINE_BATCH * len(PROFILING_MACHINES)))   # active-learning round size (env-overridable)

@@ -1,3 +1,4 @@
+import os
 from functools import partial
 from typing import Union
 from collections import defaultdict, deque
@@ -94,6 +95,42 @@ class MetricsOnlyContextEncoder(nn.Module):
 
     def forward(self, context_cond, **kwargs):
         return self.encoder(context_cond['metric'])
+
+
+class TransformerMetricsOnlyEncoder(nn.Module):
+    """Same as TransformerContextEncoder but ignores prev_action. Tokenizes the
+    metric vector as M scalar tokens (one per dimension), runs self-attention
+    across them, mean-pools, projects to context_dim. Lets the encoder learn
+    cross-metric interactions (e.g. high BW × low CPU implies a specific plan
+    pattern) that a 3-layer MLP can't capture without explicit hand-crafting."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.input_dim = int(cfg.input_dim)         # e.g., 28
+        h = int(cfg.hidden_dim)
+        # Per-metric scalar → hidden embedding (single shared linear w/ pos id).
+        self.token_proj  = nn.Linear(1, h)
+        self.metric_pos  = nn.Embedding(self.input_dim, h)
+        layers = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=h, nhead=int(cfg.num_heads),
+                dim_feedforward=h * 4, dropout=cfg.dropout,
+                activation="gelu", batch_first=True,
+            ),
+            num_layers=int(cfg.num_layers),
+        )
+        self.encoder = layers
+        self.head = nn.Linear(h, int(cfg.context_dim))
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']                          # (B, M)
+        B, M = metric.shape
+        x = self.token_proj(metric.unsqueeze(-1))                # (B, M, H)
+        pos = torch.arange(M, device=metric.device)
+        x = x + self.metric_pos(pos).unsqueeze(0)                # (B, M, H)
+        x = self.encoder(x)                                       # (B, M, H)
+        x = x.mean(dim=1)                                         # mean-pool tokens
+        return self.head(x)                                       # (B, context_dim)
 
 
 class PerPositionFiLMEncoder(nn.Module):
@@ -596,20 +633,26 @@ class TemporalResnetBlockCond(nn.Module):
         norm_fn=RMSNorm,
         dropout=0.0,
         use_scale_shift=True,
+        kernel_size=None,
     ):
         super().__init__()
         self.use_scale_shift = use_scale_shift
+        # Env override for kernel size: MIMESYS_RES_KERNEL=1 → pointwise (no
+        # spatial mixing across the categorical stressor axis). Default 3.
+        if kernel_size is None:
+            kernel_size = int(os.environ.get("MIMESYS_RES_KERNEL", "3"))
+        pad = (kernel_size - 1) // 2
 
         self.block1 = nn.ModuleList(
             [
-                nn.Conv1d(in_chn, out_chn, kernel_size=3, padding=1),
+                nn.Conv1d(in_chn, out_chn, kernel_size=kernel_size, padding=pad),
                 norm_fn(out_chn),
                 nn.Mish(),
                 nn.Dropout(dropout),
             ]
         )
         self.block2 = nn.Sequential(
-            nn.Conv1d(out_chn, out_chn, kernel_size=3, padding=1),
+            nn.Conv1d(out_chn, out_chn, kernel_size=kernel_size, padding=pad),
             norm_fn(out_chn),
             nn.Mish(),
             nn.Dropout(dropout),
@@ -704,6 +747,8 @@ class TemporalUnetCond(nn.Module):
             self.context_encoding = ConcatTransformerContextEncoder(context_args)
         elif _encoder_type == 'transformer_full':
             self.context_encoding = TransformerFullContextEncoder(context_args)
+        elif _encoder_type == 'transformer_metrics_only':
+            self.context_encoding = TransformerMetricsOnlyEncoder(context_args)
         elif _encoder_type == 'transformer_tokens':
             self.context_encoding = TransformerTokensContextEncoder(context_args)
         elif _encoder_type == 'residual_prev':
@@ -743,6 +788,12 @@ class TemporalUnetCond(nn.Module):
                 nn.Linear(time_dim * 4, time_dim),
             )
 
+        # Pointwise mode (MIMESYS_RES_KERNEL=1) → skip spatial downsampling too
+        # since the stressor axis has no neighbor structure to aggregate.
+        _pointwise = int(os.environ.get("MIMESYS_RES_KERNEL", "3")) == 1
+        _DownCls   = nn.Identity if _pointwise else DownSample
+        _UpCls     = nn.Identity if _pointwise else UpSample
+
         self.down_layers = nn.ModuleList([])
         for index, (in_dim, out_dim) in enumerate(in_out):
             self.down_layers.append(
@@ -752,10 +803,9 @@ class TemporalUnetCond(nn.Module):
                         t_res_block(out_dim, out_dim),
                         Residual(PreNorm(RMSNorm(out_dim), attn_block(out_dim))),
                         (
-                            DownSample(out_dim)
-                            if index < len(in_out) - 1
+                            _DownCls(out_dim) if _DownCls is not nn.Identity
                             else nn.Identity()
-                        ),
+                        ) if index < len(in_out) - 1 else nn.Identity(),
                     ]
                 )
             )
@@ -782,17 +832,18 @@ class TemporalUnetCond(nn.Module):
                             )
                         ),
                         (
-                            UpSample(in_dim)
-                            if index < len(in_out) - 1
+                            _UpCls(in_dim) if _UpCls is not nn.Identity
                             else nn.Identity()
-                        ),  # if condition will always be true
+                        ) if index < len(in_out) - 1 else nn.Identity(),
                     ]
                 )
             )
 
         in_dim, out_dim = in_out[0]
+        _ok = int(os.environ.get("MIMESYS_RES_KERNEL", "3"))
+        _opad = (_ok - 1) // 2
         self.output_layer = nn.Sequential(
-            nn.Conv1d(out_dim, out_dim, kernel_size=3, padding=1),
+            nn.Conv1d(out_dim, out_dim, kernel_size=_ok, padding=_opad),
             RMSNorm(out_dim),
             nn.Mish(),
             nn.Dropout(dropout),

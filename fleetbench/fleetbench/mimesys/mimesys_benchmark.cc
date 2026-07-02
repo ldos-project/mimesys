@@ -22,6 +22,7 @@
 #include <thread>
 #include <papi.h>
 #include <pqos.h>
+#include <immintrin.h>  // AVX intrinsics for NT-store / NT-load kernels
 #include <ctime>
 #include <numeric>
 #include <optional>
@@ -569,23 +570,16 @@ std::tuple<std::vector<int>, double> GetNumBenchmarkItersFromExecutionPlan(
     std::advance(it, i);
     int64_t time_per_iter = it->second;
 
-    // Compute the number of iterations (find the closest integer)
+    // Sleep-matched profiling_cache (time_per_iter = each kernel's kSleepUs)
+    // provides natural per-kernel residual cutoff via rounding: fixed-work
+    // kernels with kSleepUs=500ms need w ≥ 0.5 to yield num_iters=1; smaller
+    // weights round to 0 and are skipped without firing any usleep-blocking
+    // calls. No separate min-weight threshold needed.
     int num_iters_for_benchmark = 0;
     if (time_per_iter > 0) {
       double quotient = target_time / static_cast<double>(time_per_iter);
       num_iters_for_benchmark = static_cast<int>(std::round(quotient));
       if (num_iters_for_benchmark < 0) num_iters_for_benchmark = 0;
-    }
-    // If this stressor is active (ratio>0) but the iteration-count round-down
-    // gave 0 — happens for direct kernels (time_per_iter=0) and for framework
-    // benchmarks profiled at >slot duration — set the number of entries
-    // proportional to the ratio with ~1% granularity. This preserves the
-    // intended weight mix in execution_order so RunMimesysExecutionOrder can
-    // give each stressor a proportional share of the slot time.
-    // (Earlier behavior was always =1, which lost the ratio for direct kernels
-    // and caused the first entry to monopolize the slot.)
-    if (ratio > 0.0 && num_iters_for_benchmark < 1) {
-      num_iters_for_benchmark = std::max(1, static_cast<int>(std::round(ratio * 100.0)));
     }
     num_iters.push_back(num_iters_for_benchmark);
   }
@@ -1504,6 +1498,118 @@ static void DirectStreamSIMDImpl(long deadline_us) {
 
 static void DirectStreamSIMD_32MB_NoSleep(long d) { DirectStreamSIMDImpl<32 * 1024 * 1024, 0, 's', 'z'>(d); }
 static void DirectStreamSIMD_8MB_NoSleep(long d)  { DirectStreamSIMDImpl< 8 * 1024 * 1024, 0, 's', 'a'>(d); }
+static void DirectStreamSIMD_4MB_NoSleep(long d)  { DirectStreamSIMDImpl< 4 * 1024 * 1024, 0, 's', '4'>(d); }
+
+// ──────────────────────────────────────────────────────────────────────────
+// MEMCPY-STREAM kernel: per-thread src + dst buffers. memcpy generates BOTH
+// reads (src) and writes (dst), giving symmetric mid-BW when buffer ≥ LLC.
+// Fills the empty (BW_rd in [1,7] AND BW_wr in [1,7]) corner identified
+// in the v2 pool's coverage analysis.
+template <size_t kBufBytes, int kSleepUs, char... kTag>
+static void DirectMemcpyStreamImpl(long deadline_us) {
+  static thread_local std::vector<char> src;
+  static thread_local std::vector<char> dst;
+  if (src.empty()) { src.assign(kBufBytes, 'A'); dst.assign(kBufBytes, 0); }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(64,
+      static_cast<size_t>(duty * static_cast<double>(kBufBytes)));
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    std::memcpy(dst.data(), src.data(), target);
+    benchmark::DoNotOptimize(dst.data());
+    if (kSleepUs > 0) usleep(kSleepUs);
+  }
+}
+
+static void DirectMemcpy_8MB_NoSleep(long d)  { DirectMemcpyStreamImpl< 8 * 1024 * 1024, 0, 'p', 'a'>(d); }
+static void DirectMemcpy_32MB_NoSleep(long d) { DirectMemcpyStreamImpl<32 * 1024 * 1024, 0, 'p', 'z'>(d); }
+
+// ──────────────────────────────────────────────────────────────────────────
+// NT-STORE kernel: write-only DRAM traffic via _mm256_stream_si256. NT stores
+// bypass cache, so the read side is essentially zero — fills the (BW_wr in
+// [1,7] AND BW_rd < 1) corner. K=1 yields ~3 GB/s write, K=4 ~12 GB/s, scales
+// linearly until memory controller saturation.
+template <size_t kBufBytes, int kSleepUs, char... kTag>
+static void DirectNTStoreImpl(long deadline_us) {
+  static thread_local char* buf = nullptr;
+  if (!buf) {
+    if (posix_memalign(reinterpret_cast<void**>(&buf), 32, kBufBytes) != 0) return;
+    std::memset(buf, 0, kBufBytes);
+  }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(32,
+      static_cast<size_t>(duty * static_cast<double>(kBufBytes)));
+  target = (target / 32) * 32;
+  const __m256i val = _mm256_set1_epi64x(static_cast<long long>(0xCAFEBABEull));
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    __m256i* p = reinterpret_cast<__m256i*>(buf);
+    const size_t n_blocks = target / 32;
+    for (size_t i = 0; i < n_blocks; ++i) {
+      _mm256_stream_si256(p + i, val);
+    }
+    _mm_sfence();
+    benchmark::DoNotOptimize(buf);
+    if (kSleepUs > 0) usleep(kSleepUs);
+  }
+}
+
+static void DirectNTStore_8MB_NoSleep(long d)  { DirectNTStoreImpl< 8 * 1024 * 1024, 0, 'n', 'a'>(d); }
+static void DirectNTStore_32MB_NoSleep(long d) { DirectNTStoreImpl<32 * 1024 * 1024, 0, 'n', 'z'>(d); }
+
+// ──────────────────────────────────────────────────────────────────────────
+// SCAN kernel: read-only DRAM via _mm256_stream_load_si256 (NT load) over a
+// per-thread buffer. Reads are streaming (cache-bypassing on supported
+// platforms), so writes ≈ 0 and reads scale with K_thread. Pairs with NT-store
+// to give us independent rd-only and wr-only axes.
+template <size_t kBufBytes, int kSleepUs, char... kTag>
+static void DirectScanImpl(long deadline_us) {
+  static thread_local char* buf = nullptr;
+  if (!buf) {
+    if (posix_memalign(reinterpret_cast<void**>(&buf), 32, kBufBytes) != 0) return;
+    std::memset(buf, 'S', kBufBytes);
+  }
+  double duty = std::max(0.0, std::min(1.0, g_current_duty));
+  if (duty < 0.005) {
+    std::this_thread::sleep_for(std::chrono::microseconds(deadline_us));
+    return;
+  }
+  size_t target = std::max<size_t>(32,
+      static_cast<size_t>(duty * static_cast<double>(kBufBytes)));
+  target = (target / 32) * 32;
+  const size_t n_blocks = target / 32;
+  __m256i acc = _mm256_setzero_si256();
+  auto loop_start = std::chrono::steady_clock::now();
+  while (true) {
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - loop_start).count();
+    if (elapsed >= deadline_us) break;
+    const __m256i* p = reinterpret_cast<const __m256i*>(buf);
+    for (size_t i = 0; i < n_blocks; ++i) {
+      __m256i v = _mm256_stream_load_si256(p + i);
+      acc = _mm256_xor_si256(acc, v);
+    }
+    benchmark::DoNotOptimize(acc);
+    if (kSleepUs > 0) usleep(kSleepUs);
+  }
+}
+
+static void DirectScan_8MB_NoSleep(long d)  { DirectScanImpl< 8 * 1024 * 1024, 0, 'r', 'a'>(d); }
+static void DirectScan_32MB_NoSleep(long d) { DirectScanImpl<32 * 1024 * 1024, 0, 'r', 'z'>(d); }
 
 // Four candidates spanning the IO bandwidth space (max size × sleep_us):
 //   4KB   / 10 ms : LIGHT       — peak ~  8 MB/s @ 20 threads
@@ -1679,6 +1785,14 @@ static const std::unordered_map<std::string, KernelFn>& Kernels() {
     {"BM_DIRECTMEMSET_32MB_NoSleep",                 DirectMemset_32MB_NoSleep},
     {"BM_DIRECTSTREAMSIMD_32MB_NoSleep",             DirectStreamSIMD_32MB_NoSleep},
     {"BM_DIRECTSTREAMSIMD_8MB_NoSleep",              DirectStreamSIMD_8MB_NoSleep},
+    {"BM_DIRECTSTREAMSIMD_4MB_NoSleep",              DirectStreamSIMD_4MB_NoSleep},
+    // New mid-BW kernels for the 1-7 GB/s coverage hole.
+    {"BM_DIRECTMEMCPY_8MB_NoSleep",                  DirectMemcpy_8MB_NoSleep},
+    {"BM_DIRECTMEMCPY_32MB_NoSleep",                 DirectMemcpy_32MB_NoSleep},
+    {"BM_DIRECTNTSTORE_8MB_NoSleep",                 DirectNTStore_8MB_NoSleep},
+    {"BM_DIRECTNTSTORE_32MB_NoSleep",                DirectNTStore_32MB_NoSleep},
+    {"BM_DIRECTSCAN_8MB_NoSleep",                    DirectScan_8MB_NoSleep},
+    {"BM_DIRECTSCAN_32MB_NoSleep",                   DirectScan_32MB_NoSleep},
     {"BM_DIRECTMEMSET_32MB_WeightScaled_50ms",       DirectMemset_32MB_WeightScaled50ms},
     {"BM_STRESS_NG_Hdd_64KB",                  DirectHdd64KB},
     {"BM_STRESS_NG_Hdd_16KB_Throttled_5ms",    DirectHdd16KB_Throttled5ms},

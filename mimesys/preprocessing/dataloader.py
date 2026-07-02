@@ -303,11 +303,16 @@ def read_metric_file_per_second(file_path: str) -> list[dict]:
         pq = {}
     n_steps = len(next(iter(metrics_output.values()))) if metrics_output else 0
     for k in PQOS_METRIC_KEYS:
-        v = pq.get(k, [])
-        if len(v) == n_steps:
-            metrics_output[k] = list(v)
-        else:
-            metrics_output[k] = [0.0] * n_steps
+        v = list(pq.get(k, []))
+        # mimesys_benchmark's libpqos polling is often 1 sample short of HPC
+        # (the last HPC tick fires before the next pqos snapshot). Pad/truncate
+        # to align lengths instead of zero-filling — zeros would zero out the
+        # entire pqos GT vector and silently kill the pqos reward term.
+        if len(v) < n_steps:
+            v = v + [v[-1] if v else 0.0] * (n_steps - len(v))
+        elif len(v) > n_steps:
+            v = v[:n_steps]
+        metrics_output[k] = v
     return [metrics_output]
 
 
@@ -859,19 +864,39 @@ class CustomDataLoader(pl.LightningDataModule):
                 continue
             file_items = per_file_index[fname]
             seq_items = file_items[t_start : t_end + 1]
-            metric_seq    = [it["clean_trace"]    for it in seq_items]            # (W, 23)
-            raw_seq_4d    = [(sum(it["collated_trace"][:20]) / 20,
-                              it["collated_trace"][-3],
-                              it["collated_trace"][-2],
-                              it["collated_trace"][-1])
-                             for it in seq_items]                                  # (W, 4)  raw
+            metric_seq    = [it["clean_trace"]    for it in seq_items]            # (W, D=23|28)
+            D = len(seq_items[0]["collated_trace"]) if seq_items else 23
+            has_pqos = (D >= 28)
+            # When pqos columns are present the 28-D layout (sorted-key order) is:
+            #   [0..19] per-core CPU, [20] io_read, [21] io_write, [22] l3_cache_usage,
+            #   [23] mem_bw_read, [24] mem_bw_write, [25] pqos_ipc, [26] pqos_llc_kb,
+            #   [27] pqos_misses. Summed io/bw recover the legacy aggregate so the
+            #   downstream raw_seq_4d stays comparable across collection eras.
+            if has_pqos:
+                raw_seq_4d    = [(sum(it["collated_trace"][:20]) / 20,
+                                  it["collated_trace"][20] + it["collated_trace"][21],
+                                  it["collated_trace"][22],
+                                  it["collated_trace"][23] + it["collated_trace"][24])
+                                 for it in seq_items]                              # (W, 4) raw
+                raw_seq_pqos  = [(it["collated_trace"][25],
+                                  it["collated_trace"][26],
+                                  it["collated_trace"][27])
+                                 for it in seq_items]                              # (W, 3) raw
+            else:
+                raw_seq_4d    = [(sum(it["collated_trace"][:20]) / 20,
+                                  it["collated_trace"][-3],
+                                  it["collated_trace"][-2],
+                                  it["collated_trace"][-1])
+                                 for it in seq_items]                              # (W, 4) raw
+                raw_seq_pqos  = None
             # Per-core CPU GT for per-core-CPU-DTW reward (Layout: collated_trace[:20] = per-core CPU%)
             raw_seq_percore = [list(it["collated_trace"][:20]) for it in seq_items]  # (W, 20) raw
-            prev_first = file_items[t_start - 1]["clean_trace"] if t_start > 0 else [0.0] * 23
+            prev_first = file_items[t_start - 1]["clean_trace"] if t_start > 0 else [0.0] * D
             out.append({
                 "metric_seq":         metric_seq,
                 "raw_metric_seq_4d":  raw_seq_4d,
                 "raw_metric_seq_percore": raw_seq_percore,
+                "raw_metric_seq_pqos":    raw_seq_pqos,
                 "prev_clean_trace":   prev_first,
                 "_file":     fname,
                 "_t_center": t_center,

@@ -702,6 +702,12 @@ class MimesysTrainer(pl.LightningModule):
             "llc": float(dm.trace_range["l3_cache_usage"][1]),
             "bw":  float(dm.trace_range["memory_bandwidth"][1]),
         }
+        # pqos families — only added when trace_range has them (new pqos-enabled traces).
+        for k_meas, k_range in [("pqos_ipc", "pqos_ipc"),
+                                 ("pqos_llc", "pqos_llc_kb"),
+                                 ("pqos_misses", "pqos_misses")]:
+            if k_range in dm.trace_range:
+                self._windowed_metric_max[k_meas] = float(dm.trace_range[k_range][1])
         print(f"[windowed-dtw] pool size {len(pool)} ; METRIC_MAX={self._windowed_metric_max}")
 
     def _on_train_epoch_start_windowed(self) -> None:
@@ -747,6 +753,13 @@ class MimesysTrainer(pl.LightningModule):
                                        dtype=_np.float64)                                              # (N, W, 20)
         else:
             raw_gt_percore = None
+        # Pqos GT (W, 3) = [ipc, llc_kb, misses]. Only present if test traces had
+        # pqos.log siblings; otherwise raw_metric_seq_pqos is None per-entry.
+        if sel and sel[0].get("raw_metric_seq_pqos") is not None:
+            raw_gt_pqos = _np.array([s["raw_metric_seq_pqos"] for s in sel],
+                                     dtype=_np.float64)                                                # (N, W, 3)
+        else:
+            raw_gt_pqos = None
 
         # ---- (2) auto-regressive rollout
         chains_per_step, log_probs_per_step, plans_raw = rollout_windowed_with_medoid(
@@ -773,6 +786,9 @@ class MimesysTrainer(pl.LightningModule):
             "llc":          float(self.cfg.train.ddpo.get("llc_reward_weight",   1.0)),
             "bw":           float(self.cfg.train.ddpo.get("membw_reward_weight", 1.0)),
             "per_core_cpu": float(self.cfg.train.ddpo.get("per_core_cpu_reward_weight", 1.0)),
+            "pqos_ipc":     float(self.cfg.train.ddpo.get("pqos_ipc_reward_weight",    0.0)),
+            "pqos_llc":     float(self.cfg.train.ddpo.get("pqos_llc_reward_weight",    0.0)),
+            "pqos_misses":  float(self.cfg.train.ddpo.get("pqos_misses_reward_weight", 0.0)),
         }
         distance = str(self.cfg.train.ddpo.get("windowed_dtw_distance", "l1"))
         rewards_list, dtw_diag = [], []
@@ -783,9 +799,11 @@ class MimesysTrainer(pl.LightningModule):
                 continue
             gt_pc_i = (raw_gt_percore[i] if use_percore and raw_gt_percore is not None
                        else None)
+            gt_pq_i = (raw_gt_pqos[i] if raw_gt_pqos is not None else None)
             d = dtw_reward_per_sample(measured[i], raw_gt_4d[i],
                                        self._windowed_metric_max, window_size=W,
-                                       gt_percore=gt_pc_i, weights=reward_weights,
+                                       gt_percore=gt_pc_i, gt_pqos=gt_pq_i,
+                                       weights=reward_weights,
                                        distance=distance)
             rewards_list.append(-float(d["mean_dtw"]))     # minimize DTW → negative reward
             dtw_diag.append(d)
@@ -797,6 +815,9 @@ class MimesysTrainer(pl.LightningModule):
             log_keys = ["cpu_dtw", "io_dtw", "llc_dtw", "bw_dtw", "mean_dtw"]
             if use_percore:
                 log_keys.append("per_core_cpu_dtw")
+            # pqos diagnostics — logged whether weights are 0 or not, so you can see
+            # the measured drift even before turning them on as reward.
+            log_keys += ["pqos_ipc_dtw", "pqos_llc_dtw", "pqos_misses_dtw"]
             for k in log_keys:
                 vals = [d[k] for d in ok if not np.isnan(d.get(k, float("nan")))]
                 if not vals: continue
@@ -1014,7 +1035,8 @@ def train(cfg: DictConfig):
         key: [float(v[0]), float(v[1])] for key, v in dataloader.trace_range.items()
     }
 
-    model = initialize_diffusion_model(cfg.model, model_arch="unet")
+    arch = getattr(cfg, "model_arch", "unet")
+    model = initialize_diffusion_model(cfg.model, model_arch=arch)
     wandb_logger = initialize_logger(cfg.log)
     callbacks = initialize_callbacks(cfg.train.callbacks)
     trainer_model = eval(cfg.train.trainer.trainer_model_name)(model, cfg)

@@ -140,11 +140,38 @@ class Profiler:
                 f"&& rm chunk_{host_idx}.zip"
             ))
 
+            # Forward MIMESYS_* env from controller so the worker binary runs
+            # with the intended slot/iter config AND enables its internal profiling
+            # (StopProfiling writes stats-plan_XXXXX.txt only when
+            # MIMESYS_INTERNAL_PROFILING=1).  Without this the binary skips
+            # profiling, no new stats file is written, and the pull step below
+            # picks up a STALE stats-plan_XXXXX.txt left over from a prior run —
+            # so every RL step gets the same frozen reward regardless of the
+            # plan just generated.  Mirrors process_host_fleetbench.
+            mimesys_iters = os.environ.get("MIMESYS_ITERS", "4")
+            internal_prof = os.environ.get("MIMESYS_INTERNAL_PROFILING", "1")
+            env_prefix = f"MIMESYS_ITERS={mimesys_iters} MIMESYS_INTERNAL_PROFILING={internal_prof}"
+            slot_us = os.environ.get("MIMESYS_SLOT_US")
+            if slot_us:
+                env_prefix += f" MIMESYS_SLOT_US={slot_us}"
+            sleep_env = os.environ.get("MIMESYS_SLEEP")
+            if sleep_env is not None:
+                env_prefix += f" MIMESYS_SLEEP={sleep_env}"
+
+            # Clear stale results BEFORE running the benchmark.  If the binary
+            # silently skips writing (e.g. missing env or MIN_PLANS abort), the
+            # pull step must return nothing rather than a stale file — otherwise
+            # the RL reward collapses to a fixed target.
+            machine.run_command(client=client, command=(
+                f"sudo rm -f /users/{self.user_name}/results/stats-plan_*.txt "
+                f"/users/{self.user_name}/results/pqos-plan_*.log 2>/dev/null; true"
+            ))
+
             # Run benchmark synchronously (waits for completion)
             print(f"Chunk {host_idx}: running benchmark on {machine.hostname} ({len(plan_files)} plans)...")
             machine.run_command(client=client, command=(
                 f"cd /users/{self.user_name}/fleetbench && "
-                f"bash collect_mimesys_data.sh > ~/benchmark.log 2>&1"
+                f"{env_prefix} bash collect_mimesys_data.sh > ~/benchmark.log 2>&1"
             ))
             print(f"Chunk {host_idx}: benchmark done on {machine.hostname}")
 
@@ -634,6 +661,8 @@ class Profiler:
 
             metrics_file_pair.sort(key=lambda x: x[0])
 
+            # Per-epoch sample counter for the debug print below.
+            _printed_in_epoch = 0
             for batch_idx, trial_idx, file_path, ground_truth_path in metrics_file_pair:
                 try:
                     header, parsed_traces = parse_trace_file(file_path)
@@ -651,6 +680,22 @@ class Profiler:
                     metrics_std = {}
                     if profiled_metrics is None:
                         continue
+
+                    # Debug: print per-window measured-vs-GT for first N samples
+                    # per epoch (MIMESYS_RL_PRINT_PROFILE=N, default 0 = off).
+                    N_print = int(os.environ.get("MIMESYS_RL_PRINT_PROFILE", "0"))
+                    if N_print > 0 and _printed_in_epoch < N_print:
+                        def _fmt(seq, w=6, p=1):
+                            if not seq: return "[]"
+                            return "[" + ", ".join(f"{float(v):>{w}.{p}f}" for v in seq[:8]) + ("...]" if len(seq) > 8 else "]")
+                        def _g(name): return ground_truth.get(name, [])
+                        def _p(name): return profiled_metrics.get(name, [])
+                        print(f"\n[rl-profile] step={req.step} batch={batch_idx} trial={trial_idx} (sample {_printed_in_epoch+1}/{N_print}):", flush=True)
+                        for k in ("avg_cpu_utilizations_core_00", "io_read", "io_write",
+                                  "l3_cache_usage", "memory_bandwidth_read", "memory_bandwidth_write",
+                                  "pqos_ipc", "pqos_llc_kb", "pqos_misses"):
+                            print(f"    {k:<32}  gt={_fmt(_g(k))}  meas={_fmt(_p(k))}", flush=True)
+                        _printed_in_epoch += 1
 
                     for target_metric, metrics in profiled_metrics.items():
                         if target_metric not in ground_truth:

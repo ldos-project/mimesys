@@ -1,3 +1,4 @@
+import os
 import h5py
 import numpy as np
 import torch
@@ -111,6 +112,17 @@ def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> Gau
             dim_head=cfg.unet.dim_head,
             num_heads=cfg.unet.num_heads,
             dropout=cfg.unet.dropout,
+            context_args=cfg.context,
+        )
+    elif model_arch == "dit":
+        # DiT 2D transformer denoiser. Each (s, t) cell is one token; AdaLN-zero
+        # modulation by (time + context) at every block. Stressor/thread counts
+        # default to 20 each (read from cfg.unet.input_dim for compatibility).
+        from mimesys.models.dit_cond import DiTCond
+        n_threads = int(getattr(cfg.unet, "input_dim", 20))
+        base_model = DiTCond(
+            num_stressors=20,
+            num_threads=n_threads,
             context_args=cfg.context,
         )
     else:

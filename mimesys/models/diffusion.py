@@ -31,16 +31,9 @@ def make_timesteps(t, batch_size, device):
 
 class GaussianDiffusion(nn.Module):
     def __init__(
-        self, model, n_timesteps, clipped_denoised=False, cfg_drop_prob=0, cfg_guide_w=0,
-        sdd_enabled=False,
+        self, model, n_timesteps, clipped_denoised=False, cfg_drop_prob=0, cfg_guide_w=0
     ):
         super().__init__()
-        # SDD (Sparse Data Diffusion, Ostheimer 2025): doubles the stressor
-        # (channel) dim — top half is the action value, bottom half is a binary
-        # sparsity indicator. At sample time, threshold the bottom half and
-        # multiply by the top to enforce hard zeros where the model predicts
-        # "inactive". Underlying `model` must have input/output channel = 2*S.
-        self.sdd_enabled = sdd_enabled
         """
         this gaussian diffusion model will condition on observation cond and hard condition for trajectories
         """
@@ -126,38 +119,6 @@ class GaussianDiffusion(nn.Module):
         """
         self.threshold = new_threshold
 
-    # ─── SDD helpers ─────────────────────────────────────────────────────────
-    # x is in [-1, 1] model space; the raw weight is (x + 1) * 0.5 ∈ [0, 1].
-    # A position is "active" iff raw weight > 0 ⇔ x > -1 (with eps slack).
-    _SDD_ACTIVE_THRESH = -0.95     # train-time bit derivation threshold
-
-    def _sdd_encode(self, x):
-        """Concat sparsity bits on the *thread* axis (last dim, which becomes
-        the conv-channel axis after the model's `rearrange("b h c -> b c h")`).
-        Input (B, S, T) → output (B, S, 2T). First T = action values, second
-        T = ±1 sparsity bits for each (stressor, thread) cell."""
-        active = (x > self._SDD_ACTIVE_THRESH).float() * 2.0 - 1.0
-        return torch.cat([x, active], dim=-1)
-
-    def _sdd_decode(self, x_hat):
-        """Split last axis → threshold bits → mask values. Input (B, S, 2T)
-        → output (B, S, T) in [-1, 1] model space; inactive cells go to -1."""
-        T = x_hat.shape[-1] // 2
-        values = x_hat[..., :T]
-        bits   = x_hat[..., T:]
-        bit_mask = (bits > 0.0).float()
-        return values * bit_mask + (-1.0) * (1.0 - bit_mask)
-
-    def _sdd_encode_context(self, context_cond):
-        """If prev_action is in context, double its channels too so the encoder
-        sees consistent 2S input."""
-        if context_cond is None or "prev_action" not in context_cond:
-            return context_cond
-        new_cond = dict(context_cond)
-        new_cond["prev_action"] = self._sdd_encode(context_cond["prev_action"])
-        return new_cond
-    # ─────────────────────────────────────────────────────────────────────────
-
     def predict_start_from_noise(self, xt, t, noise):
         """
         [for infernece] derived from forward diffusion process
@@ -213,24 +174,17 @@ class GaussianDiffusion(nn.Module):
 
     def p_sample_loop(self, shape, context_cond=None):
         """
-        [for inference] sample x0 from random noise.
-
-        Callers pass the EXTERNAL shape (B, S, T). With SDD enabled, the
-        denoiser internally operates on (B, 2S, T) and the post-process
-        thresholds the sparsity bits to mask values. Returned chain is in
-        the external (B, S, T) shape so downstream code is unchanged.
+        [for inference] sample x0 from random noise
+        => initialize xt
+        => for t=T to 0
+        =>   convert t to tensor
+        =>   xt = sample_fn(self, xt, t, context_cond) [can be either ddpm sample, ddim sample, or guided ddpm]
+        =>   apply hard condition on xt [optional]
         """
         device = self.alpha.device
         batch_size = shape[0]
 
-        if self.sdd_enabled:
-            B, S, T = shape
-            internal_shape = (B, S, 2 * T)
-            context_cond = self._sdd_encode_context(context_cond)
-        else:
-            internal_shape = shape
-
-        xt = torch.randn(*internal_shape, device=device)
+        xt = torch.randn(*shape, device=device)
         chain = [xt]
 
         for t in reversed(range(self.n_timesteps)):
@@ -240,8 +194,6 @@ class GaussianDiffusion(nn.Module):
             )  # simple ddpm sample function
             chain.append(xt)
 
-        if self.sdd_enabled:
-            chain = [self._sdd_decode(c) for c in chain]
         return chain
 
     def p_sample_loop_with_logprobs(self, shape, context_cond=None):
@@ -331,12 +283,6 @@ class GaussianDiffusion(nn.Module):
         => noise_pred = model(xt, t, cond)
         => loss = loss_fn(noise, noise_pred)
         """
-        # SDD: extend channel dim with sparsity bits (also for prev_action so
-        # the encoder sees a consistent 2S input).
-        if self.sdd_enabled:
-            x0 = self._sdd_encode(x0)
-            context_cond = self._sdd_encode_context(context_cond)
-
         noise = torch.randn_like(x0)
         xt = self.q_sample(x0, t, noise)
 
@@ -372,10 +318,6 @@ class GaussianDiffusion(nn.Module):
             x0_pred = (
                 xt - extract(self.sqrt_one_minus_alpha_hat, t, x0.shape) * noise_pred
             ) / extract(self.sqrt_alpha_hat, t, x0.shape)
-            # SDD: only the first T columns are action values; bits are second half.
-            if self.sdd_enabled:
-                T_top = x0_pred.shape[-1] // 2
-                x0_pred = x0_pred[..., :T_top]
             # x0_pred conventions: label is stored as (B, S=stressors, T=threads),
             # i.e. axis 1 = stressors (13 legacy / 19 v2 / 20 v3) and axis -1 = threads (20).
             if x0_pred.dim() == 3 and x0_pred.shape[1] in (13, 19, 20) and x0_pred.shape[-1] == 20:
