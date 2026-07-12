@@ -197,6 +197,7 @@ from mimesys.preprocessing.system_trace import get_min_max, normalize_trace
 from mimesys.preprocessing.pqos_parser import pqos_metrics_dict, PQOS_METRIC_KEYS
 from mimesys.preprocessing.parsers import (
     get_tacc_stats_and_energy_from_benchmark_name,
+    get_timestamp,
     parse_trace_file,
     process_trace,
     process_trace_fine_grained,
@@ -289,7 +290,17 @@ def read_metric_file_per_second(file_path: str) -> list[dict]:
     N = len(parsed_traces)
     if N <= 0:
         return []
-    metrics_output = process_trace_granular(parsed_traces, period=1, duration=N)
+    # Duration must be in SECONDS, not # of parsed blocks. tacc_stats samples
+    # ~2 blocks/sec at rest (main + companion) but under mimesys_benchmark synth
+    # collection the rate rises to ~3-8 blocks/sec. process_trace_granular's
+    # `dt > period-eps` filter still emits exactly one per-second value, but
+    # _pad_or_truncate uses `duration/period` as the target length. Passing
+    # N_blocks over-pads with trailing zeros (474 zeros on a 237-sec synth run),
+    # which silently misaligns any consumer that indexes by second.
+    t0 = get_timestamp(parsed_traces[0])
+    t_last = get_timestamp(parsed_traces[-1])
+    duration_sec = max(1, int(np.ceil(t_last - t0)))
+    metrics_output = process_trace_granular(parsed_traces, period=1, duration=duration_sec)
     if metrics_output is None:
         return []
     # Mirror training-side processing: drop redundant combined keys + pair pqos.
