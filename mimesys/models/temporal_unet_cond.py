@@ -98,17 +98,15 @@ class MetricsOnlyContextEncoder(nn.Module):
 
 
 class TransformerMetricsOnlyEncoder(nn.Module):
-    """Same as TransformerContextEncoder but ignores prev_action. Tokenizes the
-    metric vector as M scalar tokens (one per dimension), runs self-attention
-    across them, mean-pools, projects to context_dim. Lets the encoder learn
-    cross-metric interactions (e.g. high BW × low CPU implies a specific plan
-    pattern) that a 3-layer MLP can't capture without explicit hand-crafting."""
+    """Like TransformerContextEncoder but ignores prev_action: tokenizes the
+    metric vector as M scalar tokens, self-attends across them, mean-pools,
+    projects to context_dim."""
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
         self.input_dim = int(cfg.input_dim)         # e.g., 28
         h = int(cfg.hidden_dim)
-        # Per-metric scalar → hidden embedding (single shared linear w/ pos id).
+        # Per-metric scalar → hidden embedding (shared linear + position id).
         self.token_proj  = nn.Linear(1, h)
         self.metric_pos  = nn.Embedding(self.input_dim, h)
         layers = nn.TransformerEncoder(
@@ -186,10 +184,8 @@ class ConcatContextEncoder(nn.Module):
 
 
 class ConcatSymContextEncoder(nn.Module):
-    """Concat-v2: symmetric (sum_row + sum_col) action encoding, like the
-    Transformer encoder uses, then concat with metric and pass through MLP.
-    Permutation-invariant on threads & on stressors → much harder to overfit
-    on prev-action patterns that don't generalize at test time.
+    """Concat with symmetric (sum_row + sum_col) action encoding: permutation-
+    invariant on threads and stressors.
     Expects action_dim = num_threads + num_stressors (e.g., 20 + 13 = 33)."""
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -212,14 +208,11 @@ class ConcatSymContextEncoder(nn.Module):
 
 
 class ResidualPrevContextEncoder(nn.Module):
-    """Metrics-only backbone + an ADDITIVE prev_action residual, gated by a scalar
-    initialised to 0 so the encoder starts EXACTLY equal to MetricsOnlyContextEncoder.
+    """Metrics-only backbone plus a gated additive prev_action residual.
 
-    Designed for warm-starting from a prev_none checkpoint: `self.encoder` has the
-    same architecture & submodule names as MetricsOnlyContextEncoder, so its weights
-    load verbatim; `prev_head` + `gate` are new (zero-init) and only move if the
-    prev_action genuinely lowers the loss. Read `gate` after training to see whether
-    prev_action carried usable signal."""
+    Supports warm-starting from a prev_none checkpoint: `self.encoder` mirrors
+    MetricsOnlyContextEncoder's architecture and submodule names so its weights
+    load verbatim; `prev_head` starts at zero output."""
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -235,12 +228,10 @@ class ResidualPrevContextEncoder(nn.Module):
             nn.Mish(),
             nn.Linear(cfg.hidden_dim, cfg.context_dim),
         )
-        # Zero-init ONLY the residual's last layer so initial output == metrics_only.
-        # The gate must start NON-zero (1.0): if both gate and prev_head's last layer
-        # are zero, the gradients ∂L/∂gate ∝ prev_head_out (=0) and ∂L/∂prev_head ∝ gate
-        # (=0) are both dead and the pathway can never escape zero. With gate=1 the
-        # prev_head has a live gradient; read prev_head's weight norm + gate after
-        # training to gauge how much prev_action signal was found.
+        # Zero-init only the residual's last layer so initial output equals
+        # metrics_only. The gate must start non-zero: if both gate and
+        # prev_head's last layer are zero, their gradients are mutually dead
+        # and the pathway can never leave zero.
         nn.init.zeros_(self.prev_head[-1].weight)
         nn.init.zeros_(self.prev_head[-1].bias)
         self.gate = nn.Parameter(torch.ones(1))
@@ -254,10 +245,9 @@ class ResidualPrevContextEncoder(nn.Module):
 
 
 class TransformerFullContextEncoder(nn.Module):
-    """Same architecture as TransformerContextEncoder, but feeds the FULL 260-D
+    """Same architecture as TransformerContextEncoder, but feeds the full
     flattened prev_action through the action projection instead of the 33-D
-    [sum_row, sum_col] aggregation. Direct apples-to-apples test of whether the
-    additional per-(thread, stressor) detail is useful.
+    [sum_row, sum_col] aggregation.
     Expects action_dim = num_stressors * num_threads (e.g., 13 * 20 = 260)."""
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -293,15 +283,13 @@ class TransformerFullContextEncoder(nn.Module):
 
 
 class TransformerTokensContextEncoder(nn.Module):
-    """Real multi-token transformer encoder over per-thread tokens.
+    """Multi-token transformer encoder over per-thread tokens.
 
-    Tokenizes prev_action as 20 per-thread tokens (each = 13-D stressor vector),
-    projects each to hidden_dim, prepends a [METRIC] token (projected metric),
-    adds learnable positional embeddings, and runs a true self-attention stack.
-    The [METRIC] token output is taken as the context embedding. Unlike
-    ConcatTransformerContextEncoder, there's NO raw-concat skip — this is a
-    pure test of what the transformer's attention extracts from the 260-D
-    prev_action.
+    Tokenizes prev_action as 20 per-thread tokens (each a 13-D stressor
+    vector), prepends a [METRIC] token, adds learnable positional embeddings,
+    and runs a self-attention stack. The [METRIC] token output is the context
+    embedding; unlike ConcatTransformerContextEncoder there is no raw-concat
+    skip.
     Expects action_dim = num_stressors * num_threads (e.g., 260)."""
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -410,9 +398,7 @@ class ConcatTransformerContextEncoder(nn.Module):
     Transformer attends over (H+1) tokens: one [METRIC] token plus one token
     per thread (C-dim stressor vector projected to hidden_dim). The pooled
     [METRIC] output is concatenated with the raw flat action + raw metric and
-    projected to context_dim. The raw-skip path preserves the strong direct
-    signal that made ConcatContextEncoder the v6 winner, while the transformer
-    branch contributes inter-thread structure on top.
+    projected to context_dim.
     """
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -657,12 +643,11 @@ class TemporalResnetBlockCond(nn.Module):
             nn.Mish(),
             nn.Dropout(dropout),
         )
-        # Shared FiLM head, used for BOTH broadcast (2D context) and per-position
-        # (3D context) paths so DDP never sees an unused parameter. The final
-        # rearrange to (B, C, L) is handled in _project_film() because it
-        # depends on the context shape at runtime. Existing ckpts saved with
-        # the previous Sequential(Mish, Linear, Rearrange) layout still load:
-        # Rearrange has no params so the state_dict only contained Linear.
+        # Shared FiLM head for both broadcast (2D context) and per-position
+        # (3D context) paths; the rearrange to (B, C, L) happens in
+        # _project_film() since it depends on the context shape. Checkpoints
+        # saved with the old Sequential(Mish, Linear, Rearrange) layout still
+        # load (Rearrange had no params).
         self.time_context_mlp = nn.Sequential(
             nn.Mish(),
             nn.Linear(time_context_dim, out_chn * 2 if use_scale_shift else out_chn),
@@ -855,41 +840,33 @@ class TemporalUnetCond(nn.Module):
         if self.use_socket_embed:
             self.socket_id_embed = nn.Embedding(3, input_dim)
 
-        # Optional per-thread channel conditioning. The 23-d cond vector is
-        # otherwise squashed into a global context that affects every thread
-        # position identically — destroying the positional correspondence
-        # between "core_07 is hot" and "thread 7 should be active". This flag
-        # exposes the per-core CPU values as 1 extra input channel (the value
-        # at thread i's position = per-core CPU of core i) plus 3 broadcast
-        # channels for global io / l3 / bw. The model's first conv1d then
-        # literally sees the per-core conditioning at the matching thread
-        # position. Order of conditioning entries in cond["metric"] is
-        # alphabetical (sorted by metric name): indices 0..19 = per-core CPU
+        # Optional per-thread channel conditioning: adds 1 input channel with
+        # the per-core CPU value at each thread's position plus 3 broadcast
+        # channels for global io / l3 / bw, so the first conv sees per-core
+        # conditioning aligned with thread positions. cond["metric"] is ordered
+        # alphabetically by metric name: indices 0..19 = per-core CPU
         # core_00..core_19, 20 = io, 21 = l3_cache_usage, 22 = memory_bandwidth.
         self.use_per_thread_cond = bool(getattr(context_args, 'use_per_thread_cond', False))
         if self.use_per_thread_cond:
             self._per_thread_n_extra = 4    # per-core (1) + io (1) + llc (1) + bw (1)
-            # 1x1 conv to project (input_dim + extra) → input_dim so down-layer
-            # input shape stays compatible with the existing U-Net body.
+            # 1x1 conv back to input_dim so the U-Net body is unchanged.
             self.input_proj = nn.Conv1d(input_dim + self._per_thread_n_extra,
                                          input_dim, kernel_size=1)
 
-        # Optional per-thread cross-attention conditioning. Each thread position
-        # gets a learned query, attends to the 23 metric tokens (each metric
-        # treated as a token with a learned positional embedding), and the
-        # attention output (B, T_threads, D_extra) is concatenated to the input
-        # action as extra channels. Provides position-aware conditioning without
-        # the metric-channel/positional mixing of `use_per_thread_cond`.
-        # Per-position FiLM: extends (a)'s "give the model per-thread conditioning at
-        # the input" idea to ALL resnet blocks, by producing a 3D context of shape
-        # (B, context_dim, num_threads) that gets downsampled in sync with x and
-        # re-injected as scale/shift at every block. The global ContextEncoder is
-        # still built (and used for the legacy broadcast path); when this flag is
-        # on, blocks receive the per-position context tensor instead.
+        # Optional per-position FiLM: a 3D context (B, context_dim, num_threads)
+        # is downsampled in sync with x and injected as scale/shift at every
+        # resnet block. The global ContextEncoder is still built (legacy
+        # broadcast path); with this flag on, blocks receive the per-position
+        # context instead.
         self.use_per_position_film = bool(getattr(context_args, 'use_per_position_film', False))
         if self.use_per_position_film:
             self.per_position_encoder = PerPositionFiLMEncoder(context_args)
 
+        # Optional per-thread cross-attention conditioning: each thread position
+        # gets a learned query that attends over the metric tokens (one token
+        # per metric, with learned positional embedding); the attention output
+        # (B, T_threads, D_extra) is concatenated to the input action as extra
+        # channels.
         self.use_cross_attn_cond = bool(getattr(context_args, 'use_cross_attn_cond', False))
         if self.use_cross_attn_cond:
             num_threads = int(getattr(context_args, 'cross_attn_num_threads', 20))
@@ -918,24 +895,21 @@ class TemporalUnetCond(nn.Module):
         current_h = x.shape[2]
 
         next_power_of_2 = 2 ** (current_h - 1).bit_length()
-        # Build per-thread conditioning channels BEFORE padding so the per-core
-        # alignment matches thread positions. Then pad both together and
-        # project back to the U-Net's expected input_dim.
+        # Build per-thread conditioning channels before padding so the per-core
+        # values stay aligned with thread positions.
         if self.use_per_thread_cond:
             metric = context_cond.get("metric")     # (B, 23) — alphabetical order
             B = metric.shape[0]
-            # Mask conditioning when cfg_mask is 0 (matches how context is dropped below).
+            # cfg_mask drops the conditioning (matches the context drop below).
             cfg_mask_v = cfg_mask.view(-1, 1)
-            # Per-core CPU lines up 1:1 with thread positions.
-            per_core = metric[:, :20] * cfg_mask_v          # (B, 20)
+            per_core = metric[:, :20] * cfg_mask_v          # (B, 20), aligned 1:1 with threads
             io_b   = (metric[:, 20] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
             l3_b   = (metric[:, 21] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
             bw_b   = (metric[:, 22] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
-            # Slice per_core to the unpadded length (it's 20 already; current_h is 20).
             extra = torch.stack([per_core[:, :current_h], io_b, l3_b, bw_b], dim=1)  # (B, 4, L)
             x = torch.cat([x, extra], dim=1)               # (B, input_dim+4, L)
 
-        # Variant (b): per-thread cross-attention to metric tokens.
+        # Per-thread cross-attention to metric tokens.
         if self.use_cross_attn_cond:
             metric = context_cond.get("metric")    # (B, num_metrics)
             B = metric.shape[0]
@@ -959,7 +933,7 @@ class TemporalUnetCond(nn.Module):
             x = F.pad(x, (0, pad_size))
 
         if self.use_per_thread_cond:
-            # Project back to input_dim channels so the rest of the U-Net is unchanged.
+            # Project back to input_dim channels.
             x = self.input_proj(x)
         elif self.use_cross_attn_cond:
             x = self.cross_attn_input_proj(x)
@@ -982,11 +956,10 @@ class TemporalUnetCond(nn.Module):
         context = self.context_encoding(context_cond)
         context[cfg_mask == 0] = 0
 
-        # Build per-position context (B, context_dim, num_threads) once. Pad to
-        # match x's padded length, then we'll pool it in lockstep with x's spatial
-        # dim as we descend/ascend the U-Net. The global ContextEncoder output is
-        # additively merged so both encoders' parameters are exercised (otherwise
-        # DDP flags the unused global encoder).
+        # Per-position context (B, context_dim, num_threads), padded to x's
+        # length and pooled in lockstep with x through the U-Net. The global
+        # ContextEncoder output is additively merged so both encoders'
+        # parameters are exercised (otherwise DDP flags the unused encoder).
         if self.use_per_position_film:
             pp_ctx = self.per_position_encoder(context_cond)               # (B, C, T_threads)
             pp_ctx = pp_ctx + context.unsqueeze(-1)                         # +(B, C, 1) broadcast

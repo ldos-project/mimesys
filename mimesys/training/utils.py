@@ -115,9 +115,9 @@ def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> Gau
             context_args=cfg.context,
         )
     elif model_arch == "dit":
-        # DiT 2D transformer denoiser. Each (s, t) cell is one token; AdaLN-zero
-        # modulation by (time + context) at every block. Stressor/thread counts
-        # default to 20 each (read from cfg.unet.input_dim for compatibility).
+        # DiT 2D transformer denoiser: each (s, t) cell is one token, AdaLN-zero
+        # modulation by (time + context) at every block. Thread count comes from
+        # cfg.unet.input_dim (default 20).
         from mimesys.models.dit_cond import DiTCond
         n_threads = int(getattr(cfg.unet, "input_dim", 20))
         base_model = DiTCond(
@@ -138,11 +138,11 @@ def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> Gau
         clipped_denoised=cfg.diffusion.clipped_denoised,
         **cfg.diffusion.cfg_args,
     )
-    # Optional variant (c): auxiliary row-sum→CPU% supervision weight.
+    # Optional auxiliary losses (0.0 disables): row-sum→CPU% supervision and an
+    # asymmetric sparsity penalty on idle positions.
     diffusion.row_sum_aux_weight = float(
         getattr(cfg.diffusion, "row_sum_aux_weight", 0.0)
     )
-    # NEW: asymmetric sparsity penalty that zeros out idle positions.
     diffusion.sparsity_aux_weight = float(
         getattr(cfg.diffusion, "sparsity_aux_weight", 0.0)
     )

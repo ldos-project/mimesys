@@ -5,9 +5,8 @@ Each (s, t) cell is one token. Two learnable positional embeddings (stressor_id
 and thread_id) added per token. AdaLN-zero modulation by (time + context) at
 every block. Final unpatch back to (B, S, T).
 
-Replaces the U-Net which assumed spatial locality on the categorical stressor
-axis. This design has zero spatial-neighbor assumption — all attention is
-content + position based across the full 400-cell field.
+Unlike the U-Net, makes no spatial-locality assumption on the categorical
+stressor axis.
 """
 from __future__ import annotations
 
@@ -82,7 +81,6 @@ class DiTBlock(nn.Module):
         s1, h1, g1, s2, h2, g2 = proj.chunk(6, dim=-1)
         if proj.dim() == 2:
             s1, h1, g1, s2, h2, g2 = [v.unsqueeze(1) for v in (s1, h1, g1, s2, h2, g2)]
-        # else: already per-token (B, N, d)
         y  = self.norm1(x) * (1 + s1) + h1
         y, _ = self.attn(y, y, y, need_weights=False)
         x = x + g1 * y
@@ -171,10 +169,9 @@ class DiTCond(nn.Module):
         # Context encoder (delegated to the same factory as TemporalUnetCond).
         self.context_encoding, self._ctx_is_per_position = _build_encoder(context_args)
 
-        # IO mask buffer — shared across per-thread cond modes (bias, film).
-        # When enabled (MIMESYS_DIT_BIAS_NONIO=1), the per-thread CPU% signal is
-        # zeroed on IO-stressor tokens (idx 12..18 by default). This prevents
-        # IO weight predictions from being biased by per-core CPU info that
+        # IO mask buffer, shared by the per-thread cond modes (bias, film).
+        # MIMESYS_DIT_BIAS_NONIO=1 zeros the per-thread CPU% signal on
+        # IO-stressor tokens (idx 12..18 by default), since per-core CPU
         # doesn't drive IO behavior.
         if os.environ.get("MIMESYS_DIT_BIAS_NONIO", "0") == "1":
             io_idx_str = os.environ.get(
@@ -240,7 +237,7 @@ class DiTCond(nn.Module):
         metric = context_cond['metric']                             # (B, M=28)
         per_core = metric[:, :T].unsqueeze(-1)                      # (B, T, 1)
 
-        # ── thread-cond mode A: 'bias' — additive token bias per-thread ──
+        # 'bias' mode: additive per-thread token bias.
         if self.thr_cond_mode == "bias":
             thread_bias = self.per_core_proj(per_core)              # (B, T, d)
             # Broadcast across S stressors as (B, S, T, d). Optional IO mask
@@ -256,14 +253,11 @@ class DiTCond(nn.Module):
         time_emb = self.time_encoding(t)                            # (B, time_dim)
         ctx = self.context_encoding(context_cond)                   # (B, ctx_dim) or (B, ctx_dim, T)
 
-        # ── per-token cond construction ──
+        # Per-token cond construction.
         if self.thr_cond_mode == "film":
-            # Per-token context: (a) per_core CPU embedded to context_dim,
-            # broadcast across stressors, PLUS (b) the global encoder output
-            # `ctx` added in (so encoder params actually receive gradients;
-            # Lightning otherwise raises "unused parameters" if no DDP-style
-            # find_unused_parameters is set). Token (s, t) sees
-            #   per_core_emb(metric[t]) + global_ctx.
+            # Token (s, t) sees per_core_emb(metric[t]) + global_ctx. The
+            # global encoder output is added in so its params receive
+            # gradients (Lightning otherwise raises "unused parameters").
             if self._ctx_is_per_position:
                 ctx_global = ctx.mean(dim=-1)                       # collapse to global
             else:

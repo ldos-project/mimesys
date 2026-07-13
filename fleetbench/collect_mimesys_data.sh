@@ -6,7 +6,9 @@ set -eux -o pipefail
 # Configurable variables
 SOURCE_DIR="execution_plans"
 TARGET_DIR="fleetbench/mimesys/execution_plans"
-RUNFILES_DIR="/users/${USER:-dhkim}/.cache/bazel/_bazel_root/4ab79bdb1c421100af776bebe721ba14/execroot/_main/bazel-out/k8-opt-clang/bin/fleetbench/mimesys/mimesys_benchmark.runfiles/_main/fleetbench/mimesys/execution_plans"
+# Bazel runfiles dir of the benchmark binary. The _bazel_root hash component is
+# machine-specific, so resolve it by glob; override with RUNFILES_DIR if needed.
+RUNFILES_DIR="${RUNFILES_DIR:-$(echo "${HOME}"/.cache/bazel/_bazel_root/*/execroot/_main/bazel-out/k8-opt-clang/bin/fleetbench/mimesys/mimesys_benchmark.runfiles/_main/fleetbench/mimesys/execution_plans)}"
 BATCH_SIZE=1
 
 files=($(ls ${SOURCE_DIR}/plan_[0-9][0-9][0-9][0-9][0-9][0-9].h5 | sort))
@@ -23,11 +25,8 @@ echo "collect_mimesys_data: processing $total_files plans"
 for ((batch_idx=0; batch_idx<num_batches; batch_idx++)); do
     echo "Processing batch $((batch_idx + 1))/$num_batches..."
 
-    # Clean BOTH the target source dir AND the bazel runfiles execution_plans dir.
-    # Without cleaning runfiles, stale plan_XXXXX.h5 symlinks left over from
-    # previous invocations get processed by the binary alongside/instead of the
-    # newly-copied plan — RL rewards then correspond to whatever was staged into
-    # runfiles at first bazel-run time, not the current plan.
+    # Clean both the target dir and the bazel runfiles dir — stale plan_*.h5
+    # symlinks in runfiles would otherwise be processed instead of the current plan.
     sudo rm -f "${TARGET_DIR}/plan_"*.h5
     sudo rm -f "${RUNFILES_DIR}/plan_"*.h5
 
@@ -41,9 +40,8 @@ for ((batch_idx=0; batch_idx<num_batches; batch_idx++)); do
 
     for ((i=start_idx; i<end_idx; i++)); do
         sudo cp "${files[i]}" "${TARGET_DIR}/"
-        # Also stage the plan into bazel runfiles so the binary's Runfiles::Rlocation
-        # sees it. bazel's own runfile refresh isn't reliable across successive
-        # sudo bazel run invocations when the plan filename changes.
+        # Stage the plan into bazel runfiles (Runfiles::Rlocation); bazel's own
+        # runfile refresh isn't reliable across sudo bazel run invocations.
         sudo ln -sf "$(readlink -f "${TARGET_DIR}/$(basename ${files[i]})")" \
             "${RUNFILES_DIR}/$(basename ${files[i]})"
     done

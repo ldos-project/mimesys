@@ -14,26 +14,22 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Curr-only ("none-current") plan reconstruction
 # ---------------------------------------------------------------------------
-# A none-current plan skips profiling its (empty) prev window, so the plan H5
-# holds a single (curr) window. Here we reconstruct the canonical 2-window form
-# for training: prepend NONE_PREV (an all-zero "no previous action") as the prev
-# action and prepend an all-zero prev metric slot so curr stays at slot 1
-# (matching fully-profiled 2-window plans). Kept in sync with NONE_PREV in
-# mimesys/collection/collect_training_data.py (duplicated to avoid a circular
-# import: that module imports parsers from this one).
+# A none-current plan skips profiling its empty prev window, so its H5 holds a
+# single (curr) window. Reconstruct the canonical 2-window form by prepending
+# NONE_PREV as the prev action and an all-zero prev metric slot, keeping curr
+# at slot 1. Duplicates NONE_PREV from
+# mimesys/collection/collect_training_data.py to avoid a circular import.
 _NUM_THREADS, _NUM_STRESSORS = 20, 19
 _NONE_PREV_T = [[0.0] * _NUM_THREADS for _ in range(_NUM_STRESSORS)]   # [stressor][thread]
 
 def _prepend_zero_metric_slot(vals, cycle):
     """Insert a zero at the front of every `cycle`-length group in the flat
-    per-metric list, turning an N-slot capture into an (N+1)-slot one whose new
-    leading slot is all-zero (the un-profiled prev window).
+    per-metric list, so each N-slot capture gains an all-zero leading slot
+    (the un-profiled prev window).
 
-    Drops the FIRST `cycle`-block of `vals` (curr_0 + sleep_0). curr_0 contains
-    warmup-tail contamination from the kernel-init/populate phase that bleeds
-    into the first measured slot. With MIMESYS_ITERS=4 the kernel reports 4
-    curr slots and we keep the last 3 (curr_1..curr_3); with ITERS=3 we keep 2.
-    Set MIMESYS_KEEP_FIRST_CURR=1 to disable the drop (legacy v11 compat).
+    Also drops the first `cycle`-block (curr_0 + sleep_0): curr_0 is
+    contaminated by the kernel-init/populate warmup tail. Set
+    MIMESYS_KEEP_FIRST_CURR=1 to disable the drop.
     """
     import os
     drop_first = os.environ.get("MIMESYS_KEEP_FIRST_CURR", "0") != "1"
@@ -237,9 +233,8 @@ def read_metric_file_from_real_app(file_path: str) -> list[dict]:
             window.extend([defaultdict(int)] * (end_idx - len(parsed_traces)))
         trace_windows.append(window)
 
-    # Real-app pqos collected as a paired pqos-N_X-mix_Y.log file alongside
-    # stats-N_X-mix_Y.txt. Load the full per-second pqos series once for the
-    # whole file, then slice it into the same 30-sec windows used for stats.
+    # pqos is collected as a paired pqos-*.log alongside each stats-*.txt.
+    # Load the full per-second series once, then slice into the stats windows.
     pqos_path = file_path.replace("/stats", "/pqos").replace("stats-", "pqos-").replace(".txt", ".log")
     try:
         full_pq = pqos_metrics_dict(pqos_path) if Path(pqos_path).exists() else {}
@@ -254,21 +249,20 @@ def read_metric_file_from_real_app(file_path: str) -> list[dict]:
             output.pop("io", None)
             output.pop("memory_bandwidth", None)
             n_steps = len(next(iter(output.values()))) if output else 0
-            # Aggregate per-second pqos over each 30-sec window into period-2 buckets so
-            # length matches the stats-side n_steps. Falls back to zero-fill if missing.
+            # Bucket per-second pqos into period-2 means to match the
+            # stats-side n_steps; zero-fill if missing.
             win_start = win_idx * step_size
             win_end = min(win_start + window_size, len(full_pq.get(PQOS_METRIC_KEYS[0], [])))
             for k in PQOS_METRIC_KEYS:
                 series = full_pq.get(k, [])
                 if win_end > win_start and series:
                     chunk = series[win_start:win_end]
-                    # bucket-mean over period=2 to match process_trace_fine_grained's stride
                     if len(chunk) >= 2 * n_steps:
                         bucketed = [
                             float(np.mean(chunk[i*2:(i+1)*2])) for i in range(n_steps)
                         ]
                     else:
-                        # short tail — pad with zeros to n_steps
+                        # short tail: zero-pad to n_steps
                         bucketed = (chunk + [0.0] * n_steps)[:n_steps]
                     output[k] = bucketed
                 else:
@@ -278,25 +272,18 @@ def read_metric_file_from_real_app(file_path: str) -> list[dict]:
 
 
 def read_metric_file_per_second(file_path: str) -> list[dict]:
-    """Parse a TACC stats file and return ONE per-second metric dict for the whole file.
-
-    Unlike `read_metric_file_from_real_app` (which chops into 30-sec windows and runs
-    per-2-sec aggregation inside each), this produces one dict whose lists are length N
-    (one entry per second across the full file). This is the granularity the K=3000
-    K-means RL sampling expects: each output dict becomes N per-second data points after
-    `get_val_datasets_from_metric_data`.
+    """Parse a TACC stats file into a single metric dict with one entry per
+    second across the whole file (vs. the 30-sec windows of
+    `read_metric_file_from_real_app`). Used by the K-means RL sampling, where
+    each second becomes a data point after `get_val_datasets_from_metric_data`.
     """
     _, parsed_traces = parse_trace_file(file_path)
     N = len(parsed_traces)
     if N <= 0:
         return []
-    # Duration must be in SECONDS, not # of parsed blocks. tacc_stats samples
-    # ~2 blocks/sec at rest (main + companion) but under mimesys_benchmark synth
-    # collection the rate rises to ~3-8 blocks/sec. process_trace_granular's
-    # `dt > period-eps` filter still emits exactly one per-second value, but
-    # _pad_or_truncate uses `duration/period` as the target length. Passing
-    # N_blocks over-pads with trailing zeros (474 zeros on a 237-sec synth run),
-    # which silently misaligns any consumer that indexes by second.
+    # duration must be in seconds, not parsed-block count: tacc_stats emits a
+    # variable number of blocks per second, and process_trace_granular pads to
+    # duration/period, so passing N_blocks over-pads with trailing zeros.
     t0 = get_timestamp(parsed_traces[0])
     t_last = get_timestamp(parsed_traces[-1])
     duration_sec = max(1, int(np.ceil(t_last - t0)))
@@ -315,10 +302,8 @@ def read_metric_file_per_second(file_path: str) -> list[dict]:
     n_steps = len(next(iter(metrics_output.values()))) if metrics_output else 0
     for k in PQOS_METRIC_KEYS:
         v = list(pq.get(k, []))
-        # mimesys_benchmark's libpqos polling is often 1 sample short of HPC
-        # (the last HPC tick fires before the next pqos snapshot). Pad/truncate
-        # to align lengths instead of zero-filling — zeros would zero out the
-        # entire pqos GT vector and silently kill the pqos reward term.
+        # pqos polling is often 1 sample short of HPC; pad with the last value
+        # rather than zero-filling the whole vector.
         if len(v) < n_steps:
             v = v + [v[-1] if v else 0.0] * (n_steps - len(v))
         elif len(v) > n_steps:
@@ -347,14 +332,12 @@ def read_metric_action_datasets_fleetbench(
         metrics_output = process_trace_all(parsed_traces)
         if metrics_output is None:
             return None
-        # Drop redundant combined keys — r/w split versions carry the same info
-        # without double-counting at training time.
+        # Drop combined keys; the r/w splits carry the same info without
+        # double-counting.
         metrics_output.pop("io", None)
         metrics_output.pop("memory_bandwidth", None)
-        # Merge pqos (LLC occupancy KB, IPC, L3 misses/sec). libpqos in-process
-        # polling produces 1 sample per slot, sample-aligned with hpc, so the
-        # arrays slot into the same time-series structure as the hpc keys.
-        # Missing pqos.log → empty arrays, which get padded to zeros downstream.
+        # Merge pqos metrics. pqos produces one sample per slot, aligned with
+        # hpc; missing pqos.log yields zero-filled arrays.
         pqos_file = metric_file.replace("/stats-plan_", "/pqos-plan_").replace(".txt", ".log")
         try:
             pqos_d = pqos_metrics_dict(pqos_file) if Path(pqos_file).exists() else {}
@@ -367,9 +350,9 @@ def read_metric_action_datasets_fleetbench(
         action = FleetBenchAction.from_action_file(action_file)
         weights = action.to_2d_list(transpose=True)   # [window][stressor][thread]
         if len(action.weights) == 1:
-            # Curr-only (none-current) plan: prev profiling was skipped. Reconstruct
-            # [NONE_PREV, curr] and prepend a zero prev metric slot (capture cycled
-            # through curr/noop = 2 slots) so curr stays at slot 1.
+            # Curr-only plan: reconstruct [NONE_PREV, curr] and prepend a zero
+            # prev metric slot (capture cycle = curr/noop = 2) so curr stays
+            # at slot 1.
             metrics_output = {k: _prepend_zero_metric_slot(v, cycle=2)
                               for k, v in metrics_output.items()}
             weights = [_NONE_PREV_T] + weights
@@ -456,10 +439,9 @@ def get_datasets_from_metric_action_pairs(
         norm_mat  = _metrics_matrix(normalized, i)
         raw_mat   = _metrics_matrix(target_metrics, i)
         for t in range(len(labels_list[i])):
-            # Skip the NONE_PREV padding slot inserted by process_row for 1-window
-            # plans. Filter is by *identity* (this is literally the module-level
-            # _NONE_PREV_T singleton placed at slot 0), so we don't false-positive
-            # on real plans whose curr happens to be all-idle.
+            # Skip the NONE_PREV padding slot inserted for 1-window plans.
+            # Identity check on the module-level singleton, so all-idle real
+            # plans are not skipped.
             if labels_list[i][t] is _NONE_PREV_T:
                 continue
             datasets.append({
@@ -574,7 +556,7 @@ class StressNgTestDataset(Dataset):
 class CustomDataLoader(pl.LightningDataModule):
     _NUM_CHUNKS = 14
     _NUM_ROUNDS = 70
-    _SAMPLES_PER_CHUNK = 256  # round_0 has 190 plans/chunk (after 19-stressor refresh); Config C variants 112/chunk
+    _SAMPLES_PER_CHUNK = 256  # upper bound on plans per chunk
 
     def __init__(
         self,
@@ -617,11 +599,10 @@ class CustomDataLoader(pl.LightningDataModule):
                                    io_raw_threshold=io_raw_threshold)
             print(f"Augmented dataset size: {len(data)}")
 
-        # ── Tier 1.1: density filter on training samples ──────────────────────
-        # MIMESYS_DENSITY_MIN_ACTIVE_CORES (default 0, no filter): drop samples
-        # where fewer than this many of the 20 per-core CPU% values exceed
-        # MIMESYS_DENSITY_ACTIVE_THRESH (default 20). collated_trace[0..19] are
-        # raw per-core CPU% values.
+        # Optional density filter: MIMESYS_DENSITY_MIN_ACTIVE_CORES (default 0,
+        # no filter) drops samples where fewer than that many of the 20 per-core
+        # CPU% values (raw, collated_trace[0..19]) exceed
+        # MIMESYS_DENSITY_ACTIVE_THRESH (default 20).
         _min_active = int(os.environ.get("MIMESYS_DENSITY_MIN_ACTIVE_CORES", "0"))
         _active_thresh = float(os.environ.get("MIMESYS_DENSITY_ACTIVE_THRESH", "20"))
         if _min_active > 0:
@@ -637,9 +618,9 @@ class CustomDataLoader(pl.LightningDataModule):
         val_data   = data[: len(data) // 10]
         train_data = data[len(data) // 10 :]
 
-        # ── Tier 1.2: importance weights for WeightedRandomSampler ────────────
-        # MIMESYS_DENSITY_TARGET_PCMEAN (default 0, no weighting): bias sampling
-        # toward per-core CPU means near this target (e.g. 42.8 for test).
+        # Optional importance weights for WeightedRandomSampler:
+        # MIMESYS_DENSITY_TARGET_PCMEAN (default 0, no weighting) biases sampling
+        # toward per-core CPU means near the target via
         # weight_i = exp(-(per_core_mean_i - target)^2 / (2 * sigma^2)).
         _target_pcmean = float(os.environ.get("MIMESYS_DENSITY_TARGET_PCMEAN", "0"))
         _target_sigma  = float(os.environ.get("MIMESYS_DENSITY_TARGET_SIGMA",  "10"))
@@ -656,7 +637,6 @@ class CustomDataLoader(pl.LightningDataModule):
                   f"sigma={_target_sigma}, min/max={min(weights):.4f}/{max(weights):.4f}")
 
         if use_rl and rl_sample_method == "kmean":
-            # Per-second loading + K-means medoid selection (K=3000 by default).
             test_data = self._load_test_data_per_second(test_data_path, metrics_range_dict)
             test_data = self._sample_rl_test_data_kmean(test_data, K=rl_kmean_k)
         else:
@@ -668,10 +648,9 @@ class CustomDataLoader(pl.LightningDataModule):
         if use_rl and not rl_use_high_resource_supplements:
             print(f"[rl] high-resource supplements DISABLED — using {len(test_data)} test samples only.")
         if use_rl and rl_use_high_resource_supplements:
-            # For RL: supplement with high-resource training samples stratified across
-            # all four resource classes (IO, CPU, LLC, BW). Use the RAW values in
-            # info["collated_trace"] — `clean_trace` is normalized to [-1, 1] so the
-            # raw-scale thresholds (io>1000, cpu>50, etc.) would never match.
+            # Supplement with high-resource training samples stratified across
+            # IO, CPU, LLC and BW. Thresholds are raw-scale, so compare against
+            # info["collated_trace"] (clean_trace is normalized to [-1, 1]).
             # Layout: [0..19]=per-core CPU%, [20]=io, [21]=l3_cache_usage (agg),
             #         [22]=memory_bandwidth (agg).
             IO_IDX  = 20
@@ -685,10 +664,9 @@ class CustomDataLoader(pl.LightningDataModule):
             high_llc_train = [d for d in train_data if _raw(d)[LLC_IDX] > llc_max_threshold]
             high_bw_train  = [d for d in train_data if _raw(d)[BW_IDX]  > bw_max_threshold]
 
-            # Supplement budget = rl_train_ratio × max(len(test_data), rl_kmean_k).
-            # Falling back to rl_kmean_k lets us run RL with NO test conds at all
-            # (point test_data_path at an empty dir) — useful for algorithm sanity
-            # tests where you want pure-train conds.
+            # Budget = rl_train_ratio × max(len(test_data), rl_kmean_k); the
+            # rl_kmean_k floor keeps RL usable with an empty test dir
+            # (pure-train conditions).
             _budget_base = max(len(test_data), rl_kmean_k)
             n_total_train = int(_budget_base * rl_train_ratio)
             n_high_io  = min(len(high_io_train),  int(n_total_train * rl_high_io_fraction))
@@ -775,9 +753,8 @@ class CustomDataLoader(pl.LightningDataModule):
                 grouped: dict = defaultdict(list)
                 for sample_idx, v in enumerate(metrics):
                     grouped[sample_idx % num_slots].append(v)
-                # Always emit all num_slots slots (even if a short capture left some
-                # empty) so med_metrics_array stays rectangular across samples. A
-                # missing slot contributes 0 — same as an all-zero window.
+                # Emit all num_slots slots so med_metrics_array stays
+                # rectangular; a missing slot contributes 0.
                 for slot_idx in range(num_slots):
                     group = grouped.get(slot_idx, [])
                     nonzero = [v for v in group if v != 0]
@@ -816,13 +793,13 @@ class CustomDataLoader(pl.LightningDataModule):
 
     def _load_test_data_per_second(self, test_data_path: str, metrics_range_dict: dict) -> list:
         """Whole-file per-second loading. Each test trace becomes N per-second samples
-        (where N = file duration in seconds), with `prev_clean_trace` = the previous
-        second's normalized metric (zeros for t=0). This matches the K=3000 RL design.
+        (N = file duration in seconds), with `prev_clean_trace` = the previous
+        second's normalized metric (zeros for t=0).
         """
         test_data = []
         for file in Path(test_data_path).iterdir():
-            # Only stats-*.txt files are real test traces; pqos-*.log siblings are
-            # loaded via the paired-path logic inside read_metric_file_per_second.
+            # stats-*.txt only; pqos-*.log siblings are loaded by path pairing
+            # inside read_metric_file_per_second.
             if not (file.is_file() and file.name.startswith("stats-") and file.suffix == ".txt"):
                 continue
             print("Processing test file (per-second):", file)
@@ -831,14 +808,11 @@ class CustomDataLoader(pl.LightningDataModule):
         return test_data
 
     def _load_test_data_per_second_indexed(self, test_data_path: str, metrics_range_dict: dict) -> list:
-        """Like `_load_test_data_per_second` but also tags each per-second sample with
-        the source `file_name` and `t_index` (its position within that file). This is
-        required for the windowed-DTW path where the trainer needs to assemble 5-sec
-        windows around K-means medoids."""
+        """Like `_load_test_data_per_second` but tags each sample with its source
+        file and position, which the windowed-DTW path needs to assemble windows
+        around K-means medoids."""
         all_data = []
         for file in Path(test_data_path).iterdir():
-            # Same stats-only filter as _load_test_data_per_second — pqos-*.log are
-            # paired via path replacement, not iterated as a top-level file.
             if not (file.is_file() and file.name.startswith("stats-") and file.suffix == ".txt"):
                 continue
             print("Processing test file (per-second indexed):", file)
@@ -862,8 +836,8 @@ class CustomDataLoader(pl.LightningDataModule):
                                 (zeros if window starts at t=0)
           - "raw_metric_seq_4d": (W, 4) raw [avg_cpu, io, llc, bw] for GT-side DTW
           - "_file", "_t_center", "_t_start", "_t_end", "_window": metadata
-        Samples whose window would extend beyond a file boundary are SKIPPED (so all
-        returned windows are fully in-file, length exactly W).
+        Samples whose window would extend beyond a file boundary are skipped, so
+        all returned windows are fully in-file with length exactly W.
         """
         half = window // 2
         out = []
@@ -878,11 +852,10 @@ class CustomDataLoader(pl.LightningDataModule):
             metric_seq    = [it["clean_trace"]    for it in seq_items]            # (W, D=23|28)
             D = len(seq_items[0]["collated_trace"]) if seq_items else 23
             has_pqos = (D >= 28)
-            # When pqos columns are present the 28-D layout (sorted-key order) is:
+            # 28-D layout with pqos columns (sorted-key order):
             #   [0..19] per-core CPU, [20] io_read, [21] io_write, [22] l3_cache_usage,
             #   [23] mem_bw_read, [24] mem_bw_write, [25] pqos_ipc, [26] pqos_llc_kb,
-            #   [27] pqos_misses. Summed io/bw recover the legacy aggregate so the
-            #   downstream raw_seq_4d stays comparable across collection eras.
+            #   [27] pqos_misses. Summing io/bw recovers the legacy aggregates.
             if has_pqos:
                 raw_seq_4d    = [(sum(it["collated_trace"][:20]) / 20,
                                   it["collated_trace"][20] + it["collated_trace"][21],
@@ -900,7 +873,7 @@ class CustomDataLoader(pl.LightningDataModule):
                                   it["collated_trace"][-1])
                                  for it in seq_items]                              # (W, 4) raw
                 raw_seq_pqos  = None
-            # Per-core CPU GT for per-core-CPU-DTW reward (Layout: collated_trace[:20] = per-core CPU%)
+            # Per-core CPU GT for the per-core-CPU-DTW reward
             raw_seq_percore = [list(it["collated_trace"][:20]) for it in seq_items]  # (W, 20) raw
             prev_first = file_items[t_start - 1]["clean_trace"] if t_start > 0 else [0.0] * D
             out.append({
@@ -923,23 +896,18 @@ class CustomDataLoader(pl.LightningDataModule):
                                              random_state: int = 42) -> list:
         """K-means medoid selection on per-second samples, then expand each medoid into
         a `window`-second consecutive sequence. Returns up to K windowed dicts.
-        The returned dicts are sequence-flavored (have `metric_seq`/`raw_metric_seq_4d`)
-        and are NOT compatible with the standard StressNgTestDataset — the trainer's
-        windowed-DTW path consumes them directly.
+        The returned dicts are sequence-flavored (`metric_seq`/`raw_metric_seq_4d`)
+        and not compatible with StressNgTestDataset; the trainer's windowed-DTW
+        path consumes them directly.
         """
         indexed = self._load_test_data_per_second_indexed(test_data_path, metrics_range_dict)
-        # Build per-file index for fast lookup
         per_file = defaultdict(list)
         for s in indexed:
             per_file[s["_file"]].append(s)
-        # Each file's list is already in t-order because get_val_datasets_from_metric_data emits t=0..N-1
-        # but make sure by sorting:
         for f in per_file:
             per_file[f].sort(key=lambda x: x["_t"])
 
-        # Apply K-means medoid selection on the FULL per-sec pool
         medoids = self._sample_rl_test_data_kmean(indexed, K=K, random_state=random_state)
-        # Expand each medoid to a window
         windowed = self._expand_kmean_to_windows(dict(per_file), medoids, window=window)
         print(f"[rl-kmean-windowed] K={K} medoids → {len(windowed)} windows of length {window} "
               f"(dropped {len(medoids) - len(windowed)} for boundary)")
@@ -949,8 +917,8 @@ class CustomDataLoader(pl.LightningDataModule):
     def _sample_rl_test_data_kmean(test_data: list, K: int = 3000,
                                     random_state: int = 42) -> list:
         """K-means on per-second test points (4-D feature = avg-CPU, IO, LLC, BW from
-        clean_trace), pick the medoid (sample closest to centroid) per cluster. Returns
-        up to K representative samples. Matches the K=3000 RL selection scheme.
+        clean_trace), picking the medoid (sample closest to centroid) per cluster.
+        Returns up to K representative samples.
         """
         if len(test_data) <= K:
             print(f"[rl-kmean] only {len(test_data)} per-sec samples available (<= K={K}); "
@@ -1009,8 +977,8 @@ class CustomDataLoader(pl.LightningDataModule):
         return [test_data[i] for i in list(sampled_indices)[:K]]
 
     def train_dataloader(self, shuffle: bool = True) -> DataLoader:
-        # If Tier 1.2 importance weights were computed, use WeightedRandomSampler
-        # (replaces `shuffle=True`). num_samples=len(weights) preserves epoch size.
+        # Density importance weights (if computed) replace shuffle=True;
+        # num_samples=len(weights) preserves epoch size.
         if getattr(self, "_train_weights", None):
             from torch.utils.data import WeightedRandomSampler
             sampler = WeightedRandomSampler(self._train_weights,

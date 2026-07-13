@@ -374,12 +374,8 @@ def num_sectors_to_kb(num_sectors: int, sector_size: int = 512) -> int:
 
 
 def calculate_io_utilization_from_list(io_data_list):
-    # Sum across BOTH sda and sdb because c220g5 host disk layouts vary:
-    # most hosts have sda = SSD (where /tmp lives, our workload target), but
-    # at least c220g5-110907 has sda = HDD and sdb = SSD. Reading only "sda"
-    # silently misses ALL disk IO on the swapped host. Summing both is safe
-    # because exactly one of them is the active workload disk and the other
-    # sits at a near-zero idle counter.
+    # Disk device naming varies across hosts (the workload SSD may be sda or
+    # sdb), so sum both; the inactive device idles near zero.
     read_kb_sum = write_kb_sum = 0
     for io_trace in io_data_list:
         line = io_trace.split()
@@ -566,8 +562,8 @@ def process_trace_granular(
         if period is not None and delta_time <= period - epsilon:
             continue
 
-        # Split memory BW into read/write (separate iMC counters) and keep a
-        # summary `memory_bandwidth` = read+write for backwards compat / bucketing.
+        # read/write come from separate iMC counters; combined
+        # `memory_bandwidth` = read+write is kept for backwards compat.
         bw_read_diff  = (memory_bandwidth_read_total  - prev["memory_bandwidth_read"])  / 1e9
         bw_write_diff = (memory_bandwidth_write_total - prev["memory_bandwidth_write"]) / 1e9
         peak_bw = float(system_spec["Memory BW"])
@@ -584,7 +580,6 @@ def process_trace_granular(
         for cpu_id, util in enumerate(cpu_util_per_core):
             metrics[f"avg_cpu_utilizations_core_{cpu_id:02d}"].append(util)
 
-        # Split disk IO into read/write and keep a summary `io` = read+write.
         io_read_kbps  = (read_kb_sum  - prev["read_kb_sum"])  / delta_time
         io_write_kbps = (write_kb_sum - prev["write_kb_sum"]) / delta_time
         metrics["io_read"].append(io_read_kbps)

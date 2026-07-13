@@ -21,9 +21,8 @@ class FleetBenchAction:
         return cls(weights=actions)
 
     def to_2d_list(self, num_max_threads: int = 20, transpose: bool = False) -> list[list[float]]:
-        # Pool may mix 19- and 20-stressor plans (legacy seed + new s19-extended
-        # plans). Pad the stressor (per-thread vector length) to MIMESYS_PAD_STRESSORS
-        # so batches stack cleanly. Default = no pad (preserve legacy behavior).
+        # Plans may differ in stressor count; MIMESYS_PAD_STRESSORS pads each
+        # per-thread vector to that length so batches stack. Default 0 = no padding.
         target_S = int(os.environ.get("MIMESYS_PAD_STRESSORS", "0"))
         num_actions = len(self.weights[0][0])
         if target_S > num_actions:

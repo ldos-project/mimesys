@@ -17,7 +17,7 @@ host_name=$(hostname)
 
 fleetbench_dir="/users/$username/fleetbench"
 
-# Wipe stale stats from any previous run on this host so we never ship recycled data.
+# Wipe stale stats from any previous run.
 sudo rm -rf "$HOME/results" 2>/dev/null
 mkdir -p "$HOME/results"
 

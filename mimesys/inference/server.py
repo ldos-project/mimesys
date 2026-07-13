@@ -455,7 +455,7 @@ def generate_series(req: SeriesRequest):
 async def profile(req: ProfileRequest):
     """
     Submits a profiling job and returns a **job_id** immediately (HTTP 202).
-    The job generates a plan, deploys it to a CloudLab worker, runs the
+    The job generates a plan, deploys it to a profiling worker, runs the
     benchmark, and collects measured hardware metrics — all in the background.
 
     **Requires** `--enable_profiling` at server startup.
@@ -555,7 +555,7 @@ async def profile_result(job_id: str):
 async def profile_series(req: ProfileSeriesRequest):
     """
     Generates T actions from T traces (autoregressive diffusion), packs them into
-    a single H5 execution plan, and runs the benchmark on a CloudLab worker with
+    a single H5 execution plan, and runs the benchmark on a profiling worker with
     ``MIMESYS_ITERS=1 MIMESYS_SLEEP=0`` so each slot is executed
     exactly once without an inter-slot sleep.
 

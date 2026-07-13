@@ -99,11 +99,8 @@ class GaussianDiffusion(nn.Module):
         self.model = model
         self.cfg_drop_prob = cfg_drop_prob
         self.cfg_guide_w = cfg_guide_w
-        # Mode-collapse penalty: encourage per-feature variance of model output
-        # across the batch to match the variance of the noise targets. Mitigates
-        # the failure mode where the diffusion model collapses to the conditional
-        # mean (averaging over multi-modal action distributions per cond).
-        # Enable via env var MIMESYS_DIVERSITY_WEIGHT=<float>.
+        # Variance-matching aux loss weight (counters collapse to the
+        # conditional mean); set via env var MIMESYS_DIVERSITY_WEIGHT.
         self.diversity_weight = float(os.environ.get("MIMESYS_DIVERSITY_WEIGHT", "0"))
 
         if self.cfg_drop_prob > 0:
@@ -294,61 +291,48 @@ class GaussianDiffusion(nn.Module):
 
         loss = self.loss_fn(noise_pred, noise)
 
-        # Optional variant (c): auxiliary row-sum supervision. The trainer sets
-        # `self.row_sum_aux_weight > 0` to enable. Decodes the noise prediction
-        # back to a predicted x0, sums each thread row's stressor weights, and
-        # compares against the per-core CPU% target (alphabetical metric layout:
-        # indices [0:20] = per-core CPU 0..19). Encourages the simple algebraic
-        # relationship `row_sum ∝ CPU%` that the U-Net's spatial mixing makes
-        # hard to learn directly.
-        # Variance-matching auxiliary loss: penalize when per-feature variance
-        # of model predictions across the batch differs from variance of the
-        # noise targets. The diffusion model otherwise collapses to predicting
-        # the conditional mean (averaging multi-modal actions per cond), so
-        # forcing variance parity preserves output diversity.
+        # Variance-matching aux loss: match per-feature variance of predictions
+        # to that of the noise targets, to counter collapse to the conditional
+        # mean (averaging multi-modal actions per cond).
         if self.diversity_weight > 0.0 and noise_pred.shape[0] > 1:
             pred_var = noise_pred.flatten(1).var(dim=0)
             target_var = noise.flatten(1).var(dim=0)
             diversity_aux = F.mse_loss(pred_var, target_var)
             loss = loss + self.diversity_weight * diversity_aux
 
+        # Aux supervision on the decoded x0: row_sum matches per-thread stressor
+        # totals to the per-core CPU% target (metric layout is alphabetical:
+        # indices [0:20] = per-core CPU 0..19); enabled when the trainer sets
+        # row_sum_aux_weight / sparsity_aux_weight > 0.
         row_sum_w = getattr(self, "row_sum_aux_weight", 0.0)
         sparsity_w = getattr(self, "sparsity_aux_weight", 0.0)
         if row_sum_w > 0.0 or sparsity_w > 0.0:
             x0_pred = (
                 xt - extract(self.sqrt_one_minus_alpha_hat, t, x0.shape) * noise_pred
             ) / extract(self.sqrt_alpha_hat, t, x0.shape)
-            # x0_pred conventions: label is stored as (B, S=stressors, T=threads),
-            # i.e. axis 1 = stressors (13 legacy / 19 v2 / 20 v3) and axis -1 = threads (20).
+            # Label layout: (B, S=stressors, T=threads); S is 13 legacy / 19 v2 / 20 v3.
             if x0_pred.dim() == 3 and x0_pred.shape[1] in (13, 19, 20) and x0_pred.shape[-1] == 20:
-                # Clamp to the [0,1] weight space the action_pred is *supposed* to
-                # live in. Without an upper clamp, large noise-prediction errors at
-                # high diffusion timesteps explode row_sums (≥ 19·max_pred) and
-                # make this aux dominate the base MSE.
+                # Clamp to [0,1] weight space; without the upper clamp, noise-
+                # prediction errors at high timesteps explode row_sums and let
+                # this aux dominate the base MSE.
                 action_pred = ((x0_pred + 1.0) * 0.5).clamp(0.0, 1.0)
                 row_sums = action_pred.sum(dim=1)                        # sum over stressors -> (B, T=20)
-                # Conditioning is normalized to [-1, 1] in our v2 dataloader; map
-                # back to [0, 1] for scale match with row_sums (also in [0, 1] for
-                # active rows since one or two dominant stressors carry the weight).
+                # Conditioning is [-1, 1] normalized (v2 dataloader); map back
+                # to [0, 1] to match row_sums' scale.
                 metric = context_cond["metric"]
                 if metric.dim() == 2 and metric.shape[1] >= 20:
                     cpu_target = ((metric[:, :20] + 1.0) * 0.5).clamp(0, 1)  # (B, 20)
                     sample_mask = cfg_mask.view(-1, 1)                       # (B, 1)
 
-                    # row_sum aux: L1 match between row_sum and target CPU.
-                    # Symmetric — pulls row_sum toward the cond-implied magnitude.
+                    # row_sum aux: symmetric L1 between row_sum and target CPU.
                     if row_sum_w > 0.0:
                         aux = F.l1_loss(row_sums * sample_mask,
                                         cpu_target * sample_mask)
                         loss = loss + row_sum_w * aux
 
-                    # NEW: sparsity aux. Asymmetric — penalize ALL stressor weight
-                    # (per-thread sum) where cond shows the core is idle.
-                    # idle_weight = (1 - cpu_target) → high when cond says core idle.
-                    # This explicitly drives the model to zero out positions the
-                    # conditioning implies are inactive, addressing the K-overshoot
-                    # observed when the model puts non-trivial intensity on every
-                    # row regardless of cond.
+                    # Sparsity aux: asymmetric — penalize stressor weight on
+                    # threads whose core the cond marks idle (weighted by
+                    # 1 - cpu_target), pushing inactive positions to zero.
                     if sparsity_w > 0.0:
                         idle_weight = (1.0 - cpu_target)                     # (B, 20)
                         sparsity_aux = ((row_sums * idle_weight) * sample_mask).mean()

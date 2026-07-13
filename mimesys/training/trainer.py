@@ -88,12 +88,10 @@ class MimesysTrainer(pl.LightningModule):
         self.samples = []
         self.ref_model = None  # frozen pretrained snapshot for KL regularization
 
-        # Dynamic reward-weight state (Lagrangian-style adaptive λ_m). Enabled via
-        # train.ddpo.dynamic_weights=true. After each profiling step the trainer
-        # reads the RAW per-metric medians, appends to a rolling window, and updates
-        # λ_m toward the relative violation from per-metric targets (pretrain K=200
-        # baselines by default). λ_m is clamped to [0.1, dynamic_max_weight] and
-        # passed into the NEXT ProfileRequest as the static io/llc/membw/cpu_reward_weight.
+        # Dynamic reward weights (adaptive λ_m), train.ddpo.dynamic_weights. Each
+        # profiling step appends raw per-metric medians to a rolling window, updates
+        # λ_m from violations vs per-metric targets, and feeds the result into the
+        # next ProfileRequest's io/llc/membw/cpu_reward_weight.
         ddpo_cfg = self.cfg.train.ddpo
         self.dyn_enabled = bool(ddpo_cfg.get("dynamic_weights", False))
         if self.dyn_enabled:
@@ -106,7 +104,7 @@ class MimesysTrainer(pl.LightningModule):
                 "memory_bandwidth": float(ddpo_cfg.get("membw_reward_weight", 1.0)),
                 "cpu":              float(ddpo_cfg.get("cpu_reward_weight", 1.0)),
             }
-            # Targets default to pretrain v10 concat K=200 medians
+            # Default targets: pretrain baseline medians
             self.dyn_targets = {
                 "io":               float(ddpo_cfg.get("dynamic_target_io",  0.0232)),
                 "l3_cache_usage":   float(ddpo_cfg.get("dynamic_target_llc", 0.0362)),
@@ -165,20 +163,17 @@ class MimesysTrainer(pl.LightningModule):
         is_training_data = batch["training_data"]
 
         prev_states = -torch.ones_like(x0).cuda()
-        # When skip_prev_state=True (metrics_only encoder convention): no
-        # prev_action signal is meaningful, so we leave prev_states at -1 (idle
-        # in scaled space), skip the prev_medoid diffusion, and write 1-window
-        # plans below. The deploy then has cycle (curr, sleep) × ITERS.
+        # skip_prev_state (metrics_only encoder): prev_states stays at -1 (idle in
+        # scaled space), no prev_medoid diffusion, 1-window plans written below;
+        # deploy cycle becomes (curr, sleep) × ITERS.
         skip_prev_state = bool(self.cfg.train.ddpo.get("skip_prev_state", False))
         if skip_prev_state:
             pass  # leave prev_states at -ones
         elif (prev_medoid_n := int(self.cfg.train.ddpo.get("prev_medoid_n", 1))) > 1:
-            # Match predict_autoregressive_h5.py's prev_raw computation for one step:
-            #   prev_raw_init = zeros (raw [0,1])  →  scaled = -ones (idle)
-            #   for K candidates: diffusion(cond={"metric": prev_trace, "prev_action": idle})
-            #   medoid = argmin_k sum_j mean_d |a_j[d] - a_k[d]|     (sum-L1, dim-averaged)
-            # The selected medoid (scaled [-1,+1]) is used as prev_action input to the
-            # subsequent curr-action diffusion call (matches inference t=0 → t=1 transition).
+            # One step of predict_autoregressive_h5.py's prev_raw computation:
+            # sample K candidates from idle prev_action, take
+            # medoid = argmin_k sum_j mean_d |a_j[d] - a_k[d]|, and use it (scaled
+            # [-1,+1]) as prev_action for the curr-action diffusion call.
             K = prev_medoid_n
             prev_trace_K  = prev_trace.repeat_interleave(K, dim=0).cuda()     # (N*K, dim)
             prev_states_K = prev_states.repeat_interleave(K, dim=0)            # (N*K, S, T)  all -1 (idle)
@@ -188,7 +183,6 @@ class MimesysTrainer(pl.LightningModule):
                     shape_K, {"metric": prev_trace_K, "prev_action": prev_states_K}
                 )
             final = chains_K[-1].view(N, K, *x0.shape[1:])                     # (N, K, S, T) scaled
-            # Medoid by min sum-L1 (dim-averaged), GPU-resident; identical formula to inference.
             flat = final.reshape(N, K, -1)                                     # (N, K, S*T)
             # pairwise: (N, K_query, K_other, D) → mean over D → sum over K_other → (N, K_query)
             d = (flat.unsqueeze(2) - flat.unsqueeze(1)).abs().mean(dim=-1).sum(dim=2)  # (N, K)
@@ -206,12 +200,9 @@ class MimesysTrainer(pl.LightningModule):
 
         trace = (trace + torch.randn_like(trace) * 1e-4).cuda()
 
-        # === curr_action selection ===
-        # curr_medoid_n=K: sample K candidates per row in one inflated-batch diffusion
-        # call, pick the per-row medoid (min sum-L1 to other candidates) — matches
-        # predict_autoregressive_h5.py's curr-action selection. The medoid's chain
-        # and log_probs are kept for the DDPO gradient (other K-1 chains discarded).
-        # Falls back to best_of_n=1 single-sample when curr_medoid_n<=1.
+        # curr_action: curr_medoid_n=K samples K candidates per row in one
+        # inflated-batch call and keeps the per-row medoid's chain/log_probs for the
+        # DDPO gradient (matches predict_autoregressive_h5.py); otherwise best_of_n.
         curr_medoid_n = int(self.cfg.train.ddpo.get("curr_medoid_n", 1))
         if curr_medoid_n > 1:
             K = curr_medoid_n
@@ -248,8 +239,7 @@ class MimesysTrainer(pl.LightningModule):
                     )
                     all_chains.append(chains_k)
                     all_log_probs.append(log_probs_k)
-            # Default-path tensors (matching the K=1 case) reference the first sample;
-            # we overwrite chains/log_probs after profiling selects per-sample winners.
+            # First sample as default; overwritten once profiling picks per-sample winners.
             chains = all_chains[0]
             log_probs = all_log_probs[0]
         predicted_labels = chains[-1].cpu().detach().numpy()
@@ -277,13 +267,9 @@ class MimesysTrainer(pl.LightningModule):
                     )
                     os.makedirs(dirname, exist_ok=True)
                     if k == 0:
-                        # target metric is shared across k; write only once equivalently
                         self.write_system_traces_to_file(dirname, batch["clean_trace"][sample_idx])
                     else:
                         self.write_system_traces_to_file(dirname, batch["clean_trace"][sample_idx])
-                    # Skip prev window entirely when skip_prev_state — the
-                    # benchmark sees a 1-window plan; deploy cycle becomes
-                    # (curr, sleep) × ITERS instead of (prev, curr, sleep) × ITERS.
                     plan_windows = (
                         [action_k] if skip_prev_state
                         else [prev_state, action_k]
@@ -293,7 +279,6 @@ class MimesysTrainer(pl.LightningModule):
                         os.path.join(dirname, "predicted_actions_trainer_0.h5"),
                     )
 
-            # Current step's reward weights: dynamic λ if enabled, else static config.
             if self.dyn_enabled:
                 w_io  = float(self.dyn_lambdas["io"])
                 w_llc = float(self.dyn_lambdas["l3_cache_usage"])
@@ -304,10 +289,9 @@ class MimesysTrainer(pl.LightningModule):
                 w_llc = self.cfg.train.ddpo.get("llc_reward_weight", 1.0)
                 w_bw  = self.cfg.train.ddpo.get("membw_reward_weight", 1.0)
                 w_cpu = self.cfg.train.ddpo.get("cpu_reward_weight", 1.0)
-            # Reward-slice indexing: skip_prev_state produces a (curr, sleep)×ITERS
-            # measurement stream, so pick even indices (period=2, offset=0). The
-            # historical 2-window deploy uses (period=3, offset=1) to land on the
-            # curr entry of each (prev, curr, sleep) triplet.
+            # Reward-slice indexing: skip_prev_state deploys (curr, sleep)×ITERS →
+            # (period=2, offset=0); the 2-window deploy is (prev, curr, sleep)×ITERS →
+            # (period=3, offset=1) to land on curr.
             default_slice_period = 2 if skip_prev_state else 3
             default_slice_offset = 0 if skip_prev_state else 1
             profile_request = ProfileRequest(
@@ -335,9 +319,8 @@ class MimesysTrainer(pl.LightningModule):
                 )
             )
 
-            # Log per-metric RAW L1 errors (unweighted by λ) to wandb so we can see
-            # whether mem-BW / LLC actually improved, independent of the reward signal.
-            # Aggregates avg_cpu_utilizations* keys into a single "cpu".
+            # Log per-metric raw (λ-unweighted) L1 errors; avg_cpu_utilizations*
+            # sub-keys aggregate into "cpu".
             if avg_emd_by_metrics:
                 _cpu_vals = []
                 _all_raw_means = []
@@ -346,8 +329,7 @@ class MimesysTrainer(pl.LightningModule):
                         continue
                     mean_err = float(np.mean(errs))
                     _all_raw_means.append(mean_err)
-                    # Legacy aggregate buckets — still log under the old short names
-                    # for backwards-compatible dashboards.
+                    # Legacy short names kept for existing dashboards.
                     if m_name == "io":
                         self.log("emd/io",    mean_err, prog_bar=False, logger=True, on_epoch=True)
                     elif m_name == "l3_cache_usage":
@@ -356,35 +338,25 @@ class MimesysTrainer(pl.LightningModule):
                         self.log("emd/membw", mean_err, prog_bar=False, logger=True, on_epoch=True)
                     elif m_name.startswith("avg_cpu_utilizations"):
                         _cpu_vals.append(mean_err)
-                    # ALSO log every metric under its own name so v2 keys
-                    # (io_read, io_write, mb_read, mb_write, pqos_*) get
-                    # individual wandb charts.
+                    # Every metric also gets its own chart (io_read, mb_read, pqos_*, ...).
                     self.log(f"emd/m_{m_name}", mean_err,
                              prog_bar=False, logger=True, on_epoch=True)
                 if _cpu_vals:
                     self.log("emd/cpu", float(np.mean(_cpu_vals)),
                              prog_bar=False, logger=True, on_epoch=True)
-                # Mean RAW L1 across all metric keys (what the reward WOULD be if all λ=1).
+                # Mean raw L1 across all metric keys (the reward if all λ=1).
                 if _all_raw_means:
                     self.log("emd/raw_mean", float(np.mean(_all_raw_means)),
                              prog_bar=False, logger=True, on_epoch=True)
-            # WEIGHTED L1 (the actual value that becomes −reward, before std penalty).
-            # avg_emd_by_batch is the per-batch mean of λ_m · err_m — exactly what's
-            # turned into rewards_flat = −emd_error_flat − 0.05·metrics_std_flat below.
+            # Weighted L1: per-batch mean of λ_m·err_m, i.e. −reward before the std penalty.
             if len(avg_emd_by_batch) > 0:
                 self.log("emd/weighted_mean", float(np.mean(avg_emd_by_batch)),
                          prog_bar=True, logger=True, on_epoch=True)
 
-            # Update dynamic λ_m via SOFTMAX over per-family rolling violations.
-            # Properties (vs the old Lagrangian PI update):
-            #   * sum(λ_m) is held constant at K=4 → total reward magnitude
-            #     does not inflate over time (fixes the "reward gets worse even when
-            #     emd improves" pathology caused by unbounded λ growth).
-            #   * If a metric is satisfied (violation==0) it doesn't get extra weight,
-            #     but it also doesn't strangle the others — softmax handles it gracefully.
-            #   * Targets being "unreachable" doesn't matter — softmax cares about
-            #     the RELATIVE ordering of violations across families.
-            # dyn_step is reinterpreted as softmax temperature τ; larger τ = more peaked.
+            # Update dynamic λ_m: softmax over per-family rolling violations, scaled
+            # so sum(λ_m) = 4. Fixed sum keeps reward magnitude from inflating, and
+            # only the relative ordering of violations matters (targets need not be
+            # reachable). dyn_step acts as softmax temperature τ (larger = more peaked).
             if self.dyn_enabled and avg_emd_by_metrics:
                 # 1) per-family rolling median (aggregate cpu sub-keys to one family)
                 for m_name, errs in avg_emd_by_metrics.items():
@@ -392,7 +364,7 @@ class MimesysTrainer(pl.LightningModule):
                         continue
                     key = "cpu" if m_name.startswith("avg_cpu_utilizations") else m_name
                     if key in self.dyn_lambdas:
-                        # avg_emd_by_metrics values are RAW (unweighted) — see profiling_server.py
+                        # avg_emd_by_metrics values are raw/unweighted (profiling_server.py)
                         self.dyn_history[key].append(float(np.median(errs)))
                 # 2) softmax(τ · max(0, rolling/target − 1)) → λ_m
                 order = ["io", "l3_cache_usage", "memory_bandwidth", "cpu"]
@@ -418,7 +390,6 @@ class MimesysTrainer(pl.LightningModule):
                                    round(lambdas[i], 3))
                                for i, k in enumerate(order)}
                 print(f"[dyn-w] (rolling, violation, λ): {update_info}")
-                # Log to wandb
                 _lam_key = {"io": "lambda/io", "l3_cache_usage": "lambda/llc",
                             "memory_bandwidth": "lambda/membw", "cpu": "lambda/cpu"}
                 _viol_key = {"io": "violation/io", "l3_cache_usage": "violation/llc",
@@ -433,12 +404,9 @@ class MimesysTrainer(pl.LightningModule):
             metrics_std_flat = torch.tensor(metrics_std_by_batch, dtype=torch.float32)
             rewards_flat = -emd_error_flat - metrics_std_flat * 0.05
 
-            # NaN-defense: a single NaN reward poisons mean/std in compute_advantage,
-            # making *all* future advantages NaN forever. NaN appears when the
-            # profiler's _parse_local_stats divides by len(normalized_metrics)=0
-            # (plan crashed mid-profile, no samples in the second-slot filter).
-            # Replace NaN/Inf with a "bad-but-not-poisoning" reward of -2.0, and
-            # clip extremes to keep advantage normalization stable.
+            # A NaN reward (profiler returns no samples when a plan crashes
+            # mid-profile) would poison the running mean/std in compute_advantage;
+            # replace with -2.0 and clamp to keep advantage normalization stable.
             if torch.isnan(rewards_flat).any() or torch.isinf(rewards_flat).any():
                 n_nan = int(torch.isnan(rewards_flat).sum() + torch.isinf(rewards_flat).sum())
                 rewards_flat = torch.nan_to_num(rewards_flat, nan=-2.0, posinf=2.0, neginf=-2.0)
@@ -446,10 +414,9 @@ class MimesysTrainer(pl.LightningModule):
             rewards_flat = torch.clamp(rewards_flat, -2.0, 2.0)
 
             if best_of_n > 1:
-                # Pad / truncate rewards_flat to expected size (N*best_of_n).
-                # Workers occasionally drop a profile (timeout/scp fail) which would
-                # leave fewer entries than expected; pad missing entries with the
-                # mean so the reshape works and the "missing" k is unlikely to win.
+                # Workers can drop a profile (timeout/scp fail), leaving fewer than
+                # N*best_of_n rewards; pad with the mean so the reshape works and a
+                # missing k is unlikely to win.
                 expected = N * best_of_n
                 if rewards_flat.numel() < expected:
                     pad_val = rewards_flat.mean().item() if rewards_flat.numel() > 0 else 0.0
@@ -463,7 +430,6 @@ class MimesysTrainer(pl.LightningModule):
                 rewards_mat = rewards_flat.view(N, best_of_n)
                 best_k = rewards_mat.argmax(dim=1)
                 rewards = rewards_mat.gather(1, best_k.unsqueeze(1)).squeeze(1)
-                # Pick chains/log_probs for the winning k per sample
                 chains_picked_list = []
                 log_probs_picked_list = []
                 for i in range(N):
@@ -498,17 +464,16 @@ class MimesysTrainer(pl.LightningModule):
                         final_state=trajectory[0],
                     )
 
-                # Augmentation (rl_aug-1 extra copies). Always intra-socket perm; if
-                # socket_swap_aug=True, half of the copies also swap socket 0<->1.
-                # Threads 0-9 belong to socket 0, 10-19 to socket 1. LLC and BW
-                # metrics are now socket-aggregated (single fields each), so no
-                # per-socket metric swap is needed under socket swap.
+                # Augmentation (rl_aug-1 extra copies): intra-socket thread perm; with
+                # socket_swap_aug, half of the copies also swap sockets 0<->1.
+                # Threads 0-9 = socket 0, 10-19 = socket 1. LLC/BW metrics are
+                # socket-aggregated, so no metric swap is needed under socket swap.
                 socket_swap_aug = bool(self.cfg.train.ddpo.get("socket_swap_aug", False))
                 for aug_idx in range(rl_aug - 1):
                     do_socket_swap = socket_swap_aug and (aug_idx % 2 == 1)
                     if do_socket_swap:
-                        # Within each socket intra-perm, then place socket-1 threads at
-                        # positions 0..9 and socket-0 threads at 10..19.
+                        # Intra-perm each socket, then place socket-1 threads at 0..9
+                        # and socket-0 threads at 10..19.
                         p_s1 = torch.randperm(10, device=trajectory.device) + 10
                         p_s0 = torch.randperm(10, device=trajectory.device)
                         thread_perm = torch.cat([p_s1, p_s0])
@@ -542,15 +507,14 @@ class MimesysTrainer(pl.LightningModule):
     def compute_advantage(self):
         T = self.trainer_model.n_timesteps
         if not self.replay_buffer.rewards:
-            # Whole profiling round returned no stats (e.g., chunk parse failures,
-            # ssh hiccups, or every plan landed in an empty chunk). Skip this epoch's
-            # advantage computation instead of crashing torch.stack([]).
+            # Profiling round returned no stats (parse/ssh failures); skip instead of
+            # crashing on torch.stack([]).
             print("[compute_advantage] replay_buffer empty — skipping (no profile data for this step)")
             return
         rewards_dedup = torch.tensor(
             self.replay_buffer.rewards[::T], dtype=torch.float32
         )
-        # Defense: if any pre-poisoned NaN slipped past the reward filter, scrub here.
+        # Scrub any NaN that slipped past the reward filter.
         rewards_dedup = torch.nan_to_num(rewards_dedup, nan=-2.0, posinf=2.0, neginf=-2.0)
         self.advantage_deque.extend(rewards_dedup)
 
@@ -567,8 +531,6 @@ class MimesysTrainer(pl.LightningModule):
         rewards = torch.nan_to_num(rewards, nan=-2.0, posinf=2.0, neginf=-2.0)
         advantages = (rewards - mean) / std if len(rewards_dedup) > 1 else rewards - mean
         clipped = torch.clip(advantages, -3.0, 3.0)
-        # Belt-and-suspenders: should be impossible to reach here with NaN, but
-        # if std is somehow NaN, fall back to centered-only.
         if not torch.isfinite(clipped).all():
             clipped = torch.nan_to_num(clipped, nan=0.0, posinf=3.0, neginf=-3.0)
             print(f"[advantage-nan-defense] clipped NaN/Inf to 0")
@@ -588,10 +550,8 @@ class MimesysTrainer(pl.LightningModule):
             del state_dict[k]
         if ref_keys:
             print(f"[on_load_checkpoint] Stripped {len(ref_keys)} ref_model keys from checkpoint")
-        # Warm-start support: when fine-tuning a NEW architecture (e.g. residual_prev
-        # adds prev_head + gate) from an old checkpoint that lacks those params,
-        # backfill the missing keys from the freshly-initialised current model so the
-        # strict load succeeds and the new params keep their (zero) init.
+        # Warm start: backfill keys missing from an older checkpoint (e.g. a new
+        # architecture's params) with the current init so the strict load succeeds.
         cur = self.state_dict()
         added = [k for k in cur if k not in state_dict]
         for k in added:
@@ -599,9 +559,9 @@ class MimesysTrainer(pl.LightningModule):
         if added:
             print(f"[on_load_checkpoint] Backfilled {len(added)} new-param keys "
                   f"(e.g. {added[:3]}) from current init — warm-start mode")
-            # New architecture ⇒ the saved optimizer/scheduler param groups no longer
-            # match. on_train_start resets the optimizer regardless, so drop them so
-            # Lightning doesn't fail restoring a mismatched optimizer state.
+            # Saved optimizer/scheduler param groups no longer match the new params;
+            # on_train_start resets the optimizer anyway, so drop them so Lightning
+            # doesn't fail restoring a mismatched optimizer state.
             checkpoint["optimizer_states"] = []
             checkpoint["lr_schedulers"] = []
             print("[on_load_checkpoint] Cleared optimizer/scheduler states (warm-start)")
@@ -702,7 +662,7 @@ class MimesysTrainer(pl.LightningModule):
             "llc": float(dm.trace_range["l3_cache_usage"][1]),
             "bw":  float(dm.trace_range["memory_bandwidth"][1]),
         }
-        # pqos families — only added when trace_range has them (new pqos-enabled traces).
+        # pqos families — only when trace_range has them (pqos-enabled traces).
         for k_meas, k_range in [("pqos_ipc", "pqos_ipc"),
                                  ("pqos_llc", "pqos_llc_kb"),
                                  ("pqos_misses", "pqos_misses")]:
@@ -770,15 +730,13 @@ class MimesysTrainer(pl.LightningModule):
         # ---- (3) deploy each N-window plan on the cluster
         out_dir = Path(self.cfg.train.callbacks.checkpoint.dirpath) / "training" / f"step_{self.global_step}_windowed"
         iters_per_window = int(self.cfg.train.ddpo.get("mimesys_iters_per_window", 1))
-        # Use the data.test_machines list (from the hydra override) explicitly so the
-        # deploy doesn't silently fall back to worker_scripts/config.HOSTNAMES, which
-        # may point at a different cluster than what training intends.
+        # Pass hosts explicitly; the deploy otherwise falls back to
+        # worker_scripts/config.HOSTNAMES, which may point at a different cluster.
         measured = deploy_windowed_plans(plans_raw_np, out_dir, window_size=W,
                                          hosts=list(self.test_machines),
                                          iters_per_window=iters_per_window)
 
         # ---- (4) DTW reward per sample
-        # Pick up per-family weights and the optional per-core CPU term.
         use_percore = bool(self.cfg.train.ddpo.get("per_core_cpu_reward", False))
         reward_weights = {
             "cpu":          float(self.cfg.train.ddpo.get("cpu_reward_weight",   1.0)),
@@ -815,8 +773,7 @@ class MimesysTrainer(pl.LightningModule):
             log_keys = ["cpu_dtw", "io_dtw", "llc_dtw", "bw_dtw", "mean_dtw"]
             if use_percore:
                 log_keys.append("per_core_cpu_dtw")
-            # pqos diagnostics — logged whether weights are 0 or not, so you can see
-            # the measured drift even before turning them on as reward.
+            # pqos diagnostics are logged even when their reward weights are 0.
             log_keys += ["pqos_ipc_dtw", "pqos_llc_dtw", "pqos_misses_dtw"]
             for k in log_keys:
                 vals = [d[k] for d in ok if not np.isnan(d.get(k, float("nan")))]
@@ -862,9 +819,6 @@ class MimesysTrainer(pl.LightningModule):
         if self.current_epoch % self.cfg.train.ddpo.num_inner_epochs != 0:
             return
 
-        # Windowed-DTW RL path (each "sample" = W-sec consecutive window from K-means
-        # medoid; rollout 5 actions auto-regressively, deploy as chained plan, reward =
-        # mean per-family normalized DTW vs GT 5-sec metric).
         if bool(self.cfg.train.ddpo.get("windowed_dtw", False)):
             self._on_train_epoch_start_windowed()
             return

@@ -1,18 +1,10 @@
 """Functions to load and normalize system traces.
 
-Two normalization modes are available, selected per-call:
+Two normalization modes, selected via the ``MIMESYS_NORM_MODE`` env var:
 
-  - "linear"  (default): standard min-max → [-1, 1].
-  - "log":     compress the dynamic range first, then min-max → [-1, 1].
-               Applies log1p((x - min)) and divides by log1p(max - min).
-               Useful when the metric distribution is heavily skewed (LLC,
-               BW, IO) and the model needs to resolve the low-resource tail
-               that linear scaling crams into [-1, -0.9].
-
-The active mode is read once from the env var ``MIMESYS_NORM_MODE`` so it
-applies consistently to dataloader.py, engine.py, k3000_medoid_dataset.py and
-any other caller without threading the choice through every API. To switch
-modes for one process, export ``MIMESYS_NORM_MODE=log`` before launch.
+  - "linear" (default): standard min-max → [-1, 1].
+  - "log":    log1p(x - min) / log1p(max - min), then → [-1, 1]. Resolves the
+              low-resource tail of heavily skewed metrics (LLC, BW, IO).
 """
 import math
 import os
@@ -41,8 +33,7 @@ def normalize_trace(
     metrics_list: list, min_val: float, max_val: float
 ) -> list:
     """Normalize a metric series to [-1, 1] using the mode selected by
-    ``MIMESYS_NORM_MODE``. Output range is the same for both modes so model
-    architectures don't change; the distribution within [-1, 1] differs."""
+    ``MIMESYS_NORM_MODE``."""
     mode = _get_mode()
     if max_val <= min_val:
         return [[0.0 for _ in row] for row in metrics_list]

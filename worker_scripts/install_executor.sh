@@ -1,4 +1,4 @@
-HOME_PATH=${HOME_PATH:-/users/dhkim}
+HOME_PATH=${HOME_PATH:-$HOME}
 
 # ─── Progress / status tracking ────────────────────────────────────────────
 # Writes a single-line status to $STATUS_FILE so install_remote_dependencies.py
@@ -72,8 +72,7 @@ bazel version
 mark_stage clone_mimesys
 cd $HOME_PATH
 if [ "${SKIP_CLONE_MIMESYS:-0}" = "1" ]; then
-    # The controller has already rsync'd the local fleetbench to
-    # $HOME_PATH/fleetbench — verify and proceed.
+    # Controller has already rsync'd the local fleetbench to $HOME_PATH/fleetbench.
     if [ ! -d "$HOME_PATH/fleetbench" ]; then
         echo "ERROR: SKIP_CLONE_MIMESYS=1 set but $HOME_PATH/fleetbench is missing" >&2
         exit 1
@@ -107,11 +106,8 @@ python generate_plans.py
 cd -
 mv fleetbench/mimesys/execution_plans .
 mkdir fleetbench/mimesys/execution_plans
-# Re-seed the BUILD-glob placeholder so future `bazel build` re-invocations
-# (e.g. after the controller pushes an updated mimesys_benchmark.cc) succeed
-# without the operator having to recreate it. The benchmark refuses to dispatch
-# on plan_0.h5 because it's empty, but the BUILD-time glob only checks
-# non-emptiness of the directory, not content.
+# Re-seed the BUILD-glob placeholder so later `bazel build` invocations
+# succeed; the benchmark skips the empty plan_0.h5.
 touch fleetbench/mimesys/execution_plans/plan_0.h5
 
 mark_stage disable_cpu_freq_scaling

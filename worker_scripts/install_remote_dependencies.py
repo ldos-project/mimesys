@@ -23,9 +23,8 @@ from dataclasses import dataclass
 
 import paramiko
 
-# Allow overriding the host config via env var or `--config-path`. Defaults to
-# the canonical `config.py` next to this script. We import the chosen module
-# under the name `config` so the rest of the script can keep using config.*.
+# Host config: override via MIMESYS_WORKER_CONFIG_PATH or --config-path
+# (defaults to config.py next to this script); loaded under the name `config`.
 _CFG_PATH = os.environ.get("MIMESYS_WORKER_CONFIG_PATH")
 if "--config-path" in sys.argv:
     _ci = sys.argv.index("--config-path")

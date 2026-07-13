@@ -116,6 +116,13 @@ static std::filesystem::path GetMemstrataCommandFile(absl::string_view prefix) {
   return files.empty() ? std::filesystem::path() : files.front();
 }
 
+// Default location under $HOME for profiler paths not overridden via
+// environment variables.
+static std::string HomeRelativePath(const std::string& suffix) {
+  const char* home = std::getenv("HOME");
+  return std::string(home ? home : "") + suffix;
+}
+
 int CollectTACCStats(std::string tacc_stats_dir) {
   // Start the profiling process
   // This function executes a bash command to start hpcperfstatsd and returns the collect_pid.
@@ -131,12 +138,9 @@ int CollectTACCStats(std::string tacc_stats_dir) {
   return 0;
 }
 
-// Async wrapper: kick the popen on a detached worker thread so the main slot
-// loop never blocks on it. Removes the ~100 ms/slot fork+exec+sudo overhead.
-// The actual `hpcperfstatsd collect` still runs in the background and writes
-// to the same TACC stats log file. Per-slot ordering vs the original code is
-// slightly different (the snapshot lands moments later) but per-second
-// granularity in the stats log is unchanged.
+// Runs CollectTACCStats on a detached thread so the slot loop never blocks on
+// the ~100 ms fork+exec+sudo. The snapshot lands moments later, which is fine
+// at the stats log's per-second granularity.
 void CollectTACCStatsAsync(const std::string& tacc_stats_dir) {
   std::thread([tacc_stats_dir]() {
     CollectTACCStats(tacc_stats_dir);
@@ -157,7 +161,7 @@ int StartTACCStats() {
   }
 
   const char* env_dir = std::getenv("TACC_STATS_DIR");
-  std::string tacc_stats_dir = env_dir ? env_dir : "/users/dhkim/HPCPerfStats/monitor/src"; // fallback if env not set
+  std::string tacc_stats_dir = env_dir ? env_dir : HomeRelativePath("/HPCPerfStats/monitor/src");
   std::string cmd = R"(sudo )" + tacc_stats_dir + R"(/hpcperfstatsd begin)";
   FILE* pipe = popen(cmd.c_str(), "r");
   if (!pipe) {
@@ -189,7 +193,7 @@ int StartProfilingTACCStats(int period) {
   }
 
   const char* env_dir = std::getenv("TACC_STATS_DIR");
-  std::string tacc_stats_dir = env_dir ? env_dir : "/users/dhkim/HPCPerfStats/monitor/src"; // fallback if env not set
+  std::string tacc_stats_dir = env_dir ? env_dir : HomeRelativePath("/HPCPerfStats/monitor/src");
   std::string cmd = R"(
     sudo )" + tacc_stats_dir + R"(/hpcperfstatsd begin
     (
@@ -222,7 +226,7 @@ int StartProfilingPCMThread(int period) {
   std::string pcm_path = env_dir ? env_dir : "/usr/sbin/pcm"; // fallback if env not set
 
   const char* log_env_dir = std::getenv("PCM_LOG_DIR");
-  std::string pcm_log_dir = log_env_dir ? log_env_dir : "/users/dhkim/pcm_results/output.csv"; // fallback if env not set
+  std::string pcm_log_dir = log_env_dir ? log_env_dir : HomeRelativePath("/pcm_results/output.csv");
 
   std::string cmd = R"(
     sudo )" + pcm_path + R"( )" + std::to_string(period) + R"( -csv=)" + pcm_log_dir + R"( &
@@ -249,7 +253,7 @@ int StartProfilingPCMThread(int period) {
 
 int StartProfilingPCM() {
   const char* log_env_dir = std::getenv("PCM_LOG_DIR");
-  std::string pcm_log_dir = log_env_dir ? log_env_dir : "/users/dhkim/pcm_results/output.csv"; // fallback if env not set
+  std::string pcm_log_dir = log_env_dir ? log_env_dir : HomeRelativePath("/pcm_results/output.csv");
 
   std::string cmd = "sudo truncate -s 0 " + pcm_log_dir;
   int ret = system(cmd.c_str());
@@ -275,32 +279,22 @@ std::string StopProfilingPCM(int collect_pid) {
   // system(cmd.c_str());
 
   const char* log_env_dir = std::getenv("PCM_LOG_DIR");
-  return log_env_dir ? log_env_dir : "/users/dhkim/pcm_results/output.csv"; // fallback if env not set
+  return log_env_dir ? log_env_dir : HomeRelativePath("/pcm_results/output.csv");
 }
 
 // =====================================================================
 // pqos CMT/MBM (LLC occupancy + memory BW + IPC) profiler — in-process libpqos.
 //
-// Previous implementation popen()'d the `pqos` CLI as a background 1Hz sampler.
-// That had several production issues:
-//   (a) sample timing was wall-clock + uncontrolled, producing 9 samples per
-//       6-sec workload that didn't align with hpcperfstatsd's 6 samples;
-//   (b) start-up race conditions when RMIDs were stuck from a prior session
-//       (cascaded failures: every plan on c220g5-110931 wrote 162-byte log);
-//   (c) resctrl filesystem auto-mount conflicting with --iface=msr;
-//   (d) lock file (/run/lock/libpqos) needed manual cleanup.
+// In-process libpqos (pqos_init / pqos_mon_start / pqos_mon_poll /
+// pqos_mon_stop) gives synchronous per-slot snapshots: CollectPqosSnapshot is
+// called alongside CollectTACCStatsAsync, so the series is timestamp-aligned
+// with hpcperfstatsd and has no warmup/teardown samples (a background `pqos`
+// CLI sampler cannot guarantee this alignment). pqos_mon_poll auto-tracks
+// deltas, so MBL/MBR readings are "cachelines since last poll".
 //
-// libpqos calls (pqos_init / pqos_mon_start / pqos_mon_poll / pqos_mon_stop)
-// give us synchronous in-process control: one snapshot per call, taken at
-// exactly the moment we choose (called per-slot alongside CollectTACCStatsAsync
-// so the resulting series is timestamp-aligned to hpc, no warmup/teardown
-// samples). pqos_mon_poll auto-tracks deltas so MBL/MBR readings are
-// "cachelines since last poll".
-//
-// We still write the legacy pqos.log file (TIME-blocked text rows) at stop
-// so the python parser (mimesys.preprocessing.pqos_parser) doesn't need any
-// change. The merged-group label is "0-19" by default; PQOS_CPUS env can
-// override (e.g. "0-9" / "0-19" / "0,2,4-7").
+// At stop we write a pqos-CLI-compatible pqos.log (TIME-blocked text rows)
+// consumed by mimesys.preprocessing.pqos_parser. The merged-group label is
+// "0-19" by default; PQOS_CPUS env can override (e.g. "0-9" / "0,2,4-7").
 // =====================================================================
 static struct pqos_mon_data g_pqos_grp;
 static bool g_pqos_initialized = false;
@@ -361,11 +355,9 @@ int StartProfilingPqos() {
   }
 
   // Reset all per-core RMID assignments to 0 before allocating new ones.
-  // RMID state lives in CPU MSRs and survives across binary invocations, so if
-  // a prior session crashed mid-monitoring (or just left RMIDs stuck), every
-  // subsequent pqos_mon_start fails with status 3 (PQOS_RETVAL_RESOURCE).
-  // c220g5-110931 reliably exhibits this: 100% of its chunk_3 pqos files were
-  // empty across 31 rounds without this reset.
+  // RMID state lives in CPU MSRs and survives across binary invocations;
+  // RMIDs left stuck by a prior session make every subsequent pqos_mon_start
+  // fail with status 3 (PQOS_RETVAL_RESOURCE), producing empty pqos logs.
   int reset_rc = pqos_mon_reset();
   if (reset_rc != PQOS_RETVAL_OK) {
     std::cerr << "pqos_mon_reset returned " << reset_rc << " (continuing)" << std::endl;
@@ -388,9 +380,8 @@ int StartProfilingPqos() {
   return 0;
 }
 
-// Take one pqos snapshot at the current moment. Call alongside
-// CollectTACCStatsAsync in the slot loop to get one snapshot per slot,
-// perfectly aligned with hpcperfstatsd.
+// Takes one pqos snapshot. Called alongside CollectTACCStatsAsync in the slot
+// loop so the pqos series aligns 1:1 with hpcperfstatsd samples.
 void CollectPqosSnapshot() {
   if (!g_pqos_started) return;
   struct pqos_mon_data* groups[1] = { &g_pqos_grp };
@@ -458,14 +449,11 @@ void StopProfilingPqos(int /*ignored*/) {
     pqos_mon_stop(&g_pqos_grp);
     g_pqos_started = false;
   }
-  // Write the legacy CLI-compatible log so the parser doesn't change.
+  // CLI-compatible log format expected by mimesys.preprocessing.pqos_parser.
   const char* log_env_dir = std::getenv("TACC_STATS_LOG_DIR");
   std::string log_dir = log_env_dir ? log_env_dir : "/var/log/hpcperfstats";
   WritePqosLog(log_dir + "/pqos.log");
-  // Keep g_pqos_initialized=true across plans within the same binary
-  // invocation — pqos_init is idempotent for re-start, but pqos_fini fully
-  // tears down. We fini only at process exit (atexit handler not needed for
-  // bazel-run lifecycle: each plan is a fresh binary).
+  // Full teardown; StartProfilingPqos re-runs pqos_init on the next plan.
   if (g_pqos_initialized) {
     pqos_fini();
     g_pqos_initialized = false;
@@ -498,7 +486,7 @@ void StopProfiling(int collect_pid, std::string filename) {
   std::string src_path = tacc_stats_dir + "/current";
 
   const char* results_env_dir = std::getenv("PROFILED_STATS_DIR");
-  std::string target_dir = results_env_dir ? results_env_dir : "/users/dhkim/results"; // fallback if env not set
+  std::string target_dir = results_env_dir ? results_env_dir : HomeRelativePath("/results");
 
   std::filesystem::path src = std::filesystem::path(src_path);
   std::filesystem::path dst = std::filesystem::path(target_dir) / ("stats-" + filename + ".txt");
@@ -570,11 +558,10 @@ std::tuple<std::vector<int>, double> GetNumBenchmarkItersFromExecutionPlan(
     std::advance(it, i);
     int64_t time_per_iter = it->second;
 
-    // Sleep-matched profiling_cache (time_per_iter = each kernel's kSleepUs)
-    // provides natural per-kernel residual cutoff via rounding: fixed-work
-    // kernels with kSleepUs=500ms need w ≥ 0.5 to yield num_iters=1; smaller
-    // weights round to 0 and are skipped without firing any usleep-blocking
-    // calls. No separate min-weight threshold needed.
+    // Round to the nearest iteration count. With sleep-matched time_per_iter
+    // values (each kernel's kSleepUs), weights too small to fill half an
+    // iteration round to 0 and the kernel is skipped for the slot — no
+    // separate min-weight threshold needed.
     int num_iters_for_benchmark = 0;
     if (time_per_iter > 0) {
       double quotient = target_time / static_cast<double>(time_per_iter);
@@ -624,13 +611,8 @@ struct CrcCtx {
   size_t buffer_bytes = 0;
 };
 
-// Parameterized contexts so we can have multiple buffer sizes coexisting:
-//   - 256 MB: original LLC-saturating version (high LLC + BW, ~25 % CPU)
-//   - 16  MB: fits in LLC (25 MB), gives high CPU at low LLC occupancy
-//   -  1  MB: fits in L2/L1, pure compute (highest CPU, ~zero LLC traffic)
-// Each is thread_local — total memory = sum(sizes) per thread × 20 threads.
-// Old default 256MB × 20 = 5 GB was a likely contributor to OS-scheduler
-// starvation post-init.
+// One thread_local context per buffer size (size rationale below); total
+// memory = sum(sizes) per thread × #threads.
 static thread_local CrcCtx g_ctx_256mb;
 static thread_local CrcCtx g_ctx_16mb;
 static thread_local CrcCtx g_ctx_1mb;
@@ -701,14 +683,12 @@ static void DirectComputeCrc32c(long deadline_us) {
   }
 }
 
-// Smaller-buffer Crc variants — fit entirely in L3 (16 MB) or L1/L2 (1 MB).
-// Per-call stride matches buffer size to avoid stride > buffer (which would
-// always restart at offset 0 and degrade to one cache-line of work).
-// Goal: give AL a path to the high-CPU + low-LLC corner that the 256MB
-// variant never produces.
+// Smaller-buffer Crc variants — fit entirely in L3 (16 MB) or L1/L2 (1 MB),
+// giving high CPU at low LLC occupancy. Per-call stride matches buffer size
+// to avoid stride > buffer (which would always restart at offset 0 and
+// degrade to one cache-line of work).
 template <size_t BufferBytes>
 static void DirectExtendCrc32c_Sized(long deadline_us) {
-  // Pick the right thread_local context for this buffer size.
   CrcCtx& ctx = (BufferBytes == 16 * 1024 * 1024) ? g_ctx_16mb : g_ctx_1mb;
   InitCrcCtx(ctx, BufferBytes);
   constexpr size_t stride = (BufferBytes <= 1 * 1024 * 1024) ? 4 * 1024 : 32 * 1024;
@@ -804,8 +784,7 @@ static void EnsureLlcMemCtx() {
       || posix_memalign(reinterpret_cast<void**>(&llc_mem_ctx.b), 4096, llc_mem_ctx.bufsize) != 0) {
     return;  // alloc failed
   }
-  // Bind to local NUMA node BEFORE first-touch so pages physically land
-  // on the same socket as this worker thread.
+  // Bind to local NUMA node BEFORE first-touch.
   BindToLocalNumaNode(llc_mem_ctx.a, llc_mem_ctx.bufsize);
   BindToLocalNumaNode(llc_mem_ctx.b, llc_mem_ctx.bufsize);
   std::memset(llc_mem_ctx.a, 0xAB, llc_mem_ctx.bufsize);
@@ -1184,11 +1163,10 @@ static void DirectHddReadWeightScaledImpl(long deadline_us) {
   static thread_local int fd = -1;
   static thread_local std::vector<char> buf;
   static thread_local size_t thread_offset = 0;
-  // 256 MB backing file: big enough that the page cache can't retain it all
-  // while still being achievable in a single sequential populate. The
-  // populate is triggered from MAIN THREAD before the worker pool starts and
-  // before the first measured slot — see PreInitOnMainThread() below — so the
-  // ~2.5 s populate cost does NOT pollute steady-state IO measurements.
+  // 256 MB backing file: big enough that the page cache can't retain it all,
+  // small enough for one sequential populate. The populate runs from the main
+  // thread's pre-init pass in BM_Mimesys, before the worker pool and the first
+  // measured slot, so its cost doesn't pollute steady-state IO measurements.
   static constexpr size_t kFileBytes = 256 * 1024 * 1024;
   static std::once_flag init_flag;
   static std::string shared_path;
@@ -1247,10 +1225,9 @@ static void DirectHddReadWeightScaledImpl(long deadline_us) {
 
 static void DirectHddRead1MB_WeightScaled50ms(long d)   { DirectHddReadWeightScaledImpl<1024 * 1024,    50000, 'r', 'm'>(d); }
 static void DirectHddRead1MB_WeightScaled200ms(long d)  { DirectHddReadWeightScaledImpl<1024 * 1024,   200000, 'r', 'X'>(d); }
-// Sub-10 MB/s coverage: smaller blocks + 500 ms sleep give long enough between
-// reads that the kernel can actually action posix_fadvise(DONTNEED) before the
-// next pread, so reads hit disk rather than being absorbed by the 187 GB page
-// cache that masked the earlier 256KB_NoSleep variant.
+// Sub-10 MB/s coverage: smaller blocks + 500 ms sleep leave enough time
+// between reads for the kernel to action posix_fadvise(DONTNEED) before the
+// next pread, so reads hit disk instead of being absorbed by the page cache.
 static void DirectHddRead256KB_WeightScaled500ms(long d) { DirectHddReadWeightScaledImpl< 256 * 1024,   500000, 'r', 'Y'>(d); }
 static void DirectHddRead64KB_WeightScaled500ms(long d)  { DirectHddReadWeightScaledImpl<  64 * 1024,   500000, 'r', 'Z'>(d); }
 static void DirectHddRead256KB_WeightScaled50ms(long d) { DirectHddReadWeightScaledImpl< 256 * 1024,    50000, 'r', 'q'>(d); }
@@ -1358,7 +1335,7 @@ static void DirectHddWriteCRCSpinImpl(long deadline_us) {
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - loop_start).count();
     if (elapsed >= deadline_us) break;
-    // 1 MB write to page cache + async writeback hint
+    // Write to page cache + async writeback hint.
     auto n = pwrite(fd, buf.data(), target, 0);
     benchmark::DoNotOptimize(n);
     sync_file_range(fd, 0, target, SYNC_FILE_RANGE_WRITE);
@@ -1425,10 +1402,9 @@ static void DirectHddWriteD_1MB_WeightScaled0ms(long d)  { DirectHddWriteDirectW
 
 // MEMSET-STREAM kernel: repeatedly memset a per-thread buffer too large to fit
 // in L3 (32 MB vs ~14 MB LLC). Each memset evicts L3 and writes back to DRAM,
-// generating measurable memory_bandwidth_write traffic. Round-0 v2 coverage
-// showed only SwissMap_Insert produces >5% bw_write; this kernel fills that
-// gap without depending on the allocator. Per-thread buffer = no cross-thread
-// cache contention. 20 threads × 32 MB = 640 MB total memory footprint.
+// generating memory_bandwidth_write traffic without depending on the
+// allocator. Per-thread buffer = no cross-thread cache contention.
+// 20 threads × 32 MB = 640 MB total memory footprint.
 template <size_t kBufSize, int kSleepUs, char... kTag>
 static void DirectMemsetStreamImpl(long deadline_us) {
   static thread_local std::vector<char> buf;
@@ -1456,12 +1432,9 @@ static void DirectMemset_32MB_NoSleep(long d)          { DirectMemsetStreamImpl<
 static void DirectMemset_32MB_WeightScaled50ms(long d) { DirectMemsetStreamImpl<32 * 1024 * 1024, 50000, 'm', 'a'>(d); }
 
 // STREAM-SIMD kernel: tight FMA-style loop over a per-thread aligned double
-// buffer. Compiler with -O3 -mavx512f vectorizes the loop; each iteration
-// loads 8 doubles, performs y = a*x + b (FMA), stores back. This achieves
-// HIGH IPC (≈2-3, the only stressor in our panel doing this) WHILE driving
-// real memory bandwidth (buffer >> L3 → DRAM-bound). Coverage gap: the
-// previous panel had no workload in the (high IPC × high mem BW) quadrant
-// because vectorized + memory-bound is rare.
+// buffer. With -O3 -mavx512f the loop vectorizes; each iteration loads
+// 8 doubles, computes y = a*x + b (FMA), stores back. Covers the rare
+// high-IPC (≈2-3) × high-memory-BW quadrant (vectorized + memory-bound).
 //   32 MB buffer (4M doubles) >> 14 MB LLC → DRAM streaming
 //    8 MB buffer (1M doubles) ≈ LLC-resident → mid mem BW, high L3 traffic
 template <size_t kBufBytes, int kSleepUs, char... kTag>
@@ -1502,9 +1475,8 @@ static void DirectStreamSIMD_4MB_NoSleep(long d)  { DirectStreamSIMDImpl< 4 * 10
 
 // ──────────────────────────────────────────────────────────────────────────
 // MEMCPY-STREAM kernel: per-thread src + dst buffers. memcpy generates BOTH
-// reads (src) and writes (dst), giving symmetric mid-BW when buffer ≥ LLC.
-// Fills the empty (BW_rd in [1,7] AND BW_wr in [1,7]) corner identified
-// in the v2 pool's coverage analysis.
+// reads (src) and writes (dst), giving symmetric mid read+write bandwidth
+// when buffer ≥ LLC.
 template <size_t kBufBytes, int kSleepUs, char... kTag>
 static void DirectMemcpyStreamImpl(long deadline_us) {
   static thread_local std::vector<char> src;
@@ -1533,9 +1505,8 @@ static void DirectMemcpy_32MB_NoSleep(long d) { DirectMemcpyStreamImpl<32 * 1024
 
 // ──────────────────────────────────────────────────────────────────────────
 // NT-STORE kernel: write-only DRAM traffic via _mm256_stream_si256. NT stores
-// bypass cache, so the read side is essentially zero — fills the (BW_wr in
-// [1,7] AND BW_rd < 1) corner. K=1 yields ~3 GB/s write, K=4 ~12 GB/s, scales
-// linearly until memory controller saturation.
+// bypass cache, so the read side is essentially zero. Write BW is ~3 GB/s per
+// thread and scales linearly until memory-controller saturation.
 template <size_t kBufBytes, int kSleepUs, char... kTag>
 static void DirectNTStoreImpl(long deadline_us) {
   static thread_local char* buf = nullptr;
@@ -1574,8 +1545,8 @@ static void DirectNTStore_32MB_NoSleep(long d) { DirectNTStoreImpl<32 * 1024 * 1
 // ──────────────────────────────────────────────────────────────────────────
 // SCAN kernel: read-only DRAM via _mm256_stream_load_si256 (NT load) over a
 // per-thread buffer. Reads are streaming (cache-bypassing on supported
-// platforms), so writes ≈ 0 and reads scale with K_thread. Pairs with NT-store
-// to give us independent rd-only and wr-only axes.
+// platforms), so writes ≈ 0 and reads scale with thread count. Pairs with
+// NT-store to give independent read-only and write-only axes.
 template <size_t kBufBytes, int kSleepUs, char... kTag>
 static void DirectScanImpl(long deadline_us) {
   static thread_local char* buf = nullptr;
@@ -1714,11 +1685,7 @@ static void DirectHdd4KB_Throttled10ms(long deadline_us) {
 using KernelFn = std::function<void(long)>;
 static const std::unordered_map<std::string, KernelFn>& Kernels() {
   static const std::unordered_map<std::string, KernelFn> m = {
-    // BM_HASHING_*_cold direct kernels — see InitCrcCtx() for the cold-faithful
-    // rewrite (256 MB buffer + 64 KB stride). Framework fallback is not viable
-    // here because GetNumBenchmarkItersFromExecutionPlan returns num_iters=0
-    // (kDefaultActions->second is left at 0 by ProfileActions), so the
-    // framework path runs zero iterations.
+    // Cold CRC kernels: 256 MB buffer + 64 KB stride (see InitCrcCtx).
     {"BM_HASHING_Extendcrc32cinternal_Fleet_cold", DirectExtendCrc32c},
     {"BM_HASHING_Computecrc32c_Fleet_cold",        DirectComputeCrc32c},
     // High-CPU / low-LLC variants: 16 MB fits in L3, 1 MB in L2.
@@ -1786,7 +1753,7 @@ static const std::unordered_map<std::string, KernelFn>& Kernels() {
     {"BM_DIRECTSTREAMSIMD_32MB_NoSleep",             DirectStreamSIMD_32MB_NoSleep},
     {"BM_DIRECTSTREAMSIMD_8MB_NoSleep",              DirectStreamSIMD_8MB_NoSleep},
     {"BM_DIRECTSTREAMSIMD_4MB_NoSleep",              DirectStreamSIMD_4MB_NoSleep},
-    // New mid-BW kernels for the 1-7 GB/s coverage hole.
+    // Mid-BW kernels (1-7 GB/s).
     {"BM_DIRECTMEMCPY_8MB_NoSleep",                  DirectMemcpy_8MB_NoSleep},
     {"BM_DIRECTMEMCPY_32MB_NoSleep",                 DirectMemcpy_32MB_NoSleep},
     {"BM_DIRECTNTSTORE_8MB_NoSleep",                 DirectNTStore_8MB_NoSleep},
@@ -1872,14 +1839,13 @@ void RunMimesysExecutionOrder(
 
     // ── Fair per-entry time slicing ────────────────────────────────────────
     // Each entry in execution_order gets a proportional slice of slot time
-    // instead of consuming the full remaining deadline (the prior behavior
-    // let the FIRST entry eat the whole slot). The slice is sized so that
-    // ONE pass through execution_order fills the slot exactly:
+    // rather than the full remaining deadline, sized so ONE pass through
+    // execution_order fills the slot exactly:
     //   per_entry_active_us = duration_us * duty / n_entries
     //   per_entry_sleep_us  = duration_us * (1 - duty) / n_entries
-    // This makes mixed-stressor actions actually run all the stressors with
-    // shares matching their weights (which num_iters now encodes via the
-    // ratio*100 scaling for direct kernels).
+    // Mixed-stressor actions thus run every stressor with shares matching
+    // their weights (encoded in num_iters via the ratio*100 scaling for
+    // direct kernels).
     auto time_diff_us = 0LL;
     auto prev_time_diff_us = 0LL;
     {
@@ -1891,11 +1857,10 @@ void RunMimesysExecutionOrder(
       const long per_entry_sleep_us = static_cast<long>(std::round(
           static_cast<double>(duration_us) * (1.0 - duty) / static_cast<double>(n_entries)));
 
-      // Per-stressor weight = count(spec_idx in execution_order) / 100. Used by
-      // *_BurstScaled kernels which scale target = weight × kMaxSize so that
-      // dirty-page / read-throughput rate scales with weight (option 2 — fixes
-      // the write-saturation problem where NoSleep variants peg at the
-      // writeback ceiling regardless of weight).
+      // Per-stressor weight = count(spec_idx in execution_order) / 100. Used
+      // by *_BurstScaled kernels, which scale target = weight × kMaxSize so
+      // the dirty-page / read rate scales with weight instead of pegging at
+      // the writeback ceiling.
       std::unordered_map<int, double> per_spec_weight;
       for (int idx : execution_order) per_spec_weight[idx] += 1.0;
       for (auto& kv : per_spec_weight) kv.second /= 100.0;
@@ -2120,20 +2085,15 @@ void ProfileActions(const std::vector<std::string>& action_names) {
       std::advance(it, spec_idx);
       const std::string& spec = it->first;
 
-      // For direct kernels (the common case in our setup), skip framework
-      // profiling — RunSpecifiedBenchmarks measures the slow framework path
-      // (e.g., ~4 s for cold CRC), which produces a num_iters value out of
-      // proportion with the per-iter time of OTHER direct kernels. The result
-      // is that mixed-stressor actions get a distorted weight ratio in
-      // execution_order. Assign a uniform short time_per_iter so num_iters
-      // (computed in GetNumBenchmarkItersFromExecutionPlan as round(target_time
-      // / time_per_iter)) scales cleanly with the requested weight.
+      // Direct kernels skip framework profiling: RunSpecifiedBenchmarks
+      // measures the slow framework path, producing per-iter times out of
+      // proportion with other direct kernels and distorting mixed-stressor
+      // weight ratios in execution_order. A uniform short time_per_iter makes
+      // num_iters scale cleanly with the requested weight.
       auto& dk = direct_kernels::Kernels();
       if (dk.count(spec)) {
-        it->second = 5000;   // 5 ms — close to the slowest direct kernel's
-                              // single-iter time (HddWrite_1MB ≈ 5 ms), so a
-                              // per-entry budget of 5 ms cleanly fits ONE iter
-                              // of any direct kernel.
+        it->second = 5000;   // ~single-iter time of the slowest direct kernel
+                              // (HddWrite_1MB ≈ 5 ms).
         continue;
       }
 
@@ -2161,24 +2121,21 @@ void ProfileActions(const std::vector<std::string>& action_names) {
   }
 }
 
-// ── Persistent worker pool (Q2 experiment) ──────────────────────────────────
+// ── Persistent worker pool ──────────────────────────────────────────────────
 //
-// Replaces the per-slot fork-and-spawn-N-threads pattern with a pool of N
-// long-lived threads created once and reused across all slots / plans.
-// Each worker is pinned to one CPU. Dispatch flow per slot:
+// Pool of N long-lived threads created once and reused across all slots /
+// plans, so per-slot transitions cost ~10 us (cv notify+wait round trip)
+// instead of a fork+spawn+join. Each worker is pinned to one CPU. Dispatch
+// flow per slot:
 //   parent: stash per-thread (execution_order, no_op_ratio, deadline) and bump
 //           a sequence counter, notify_all
 //   worker: wake, run RunMimesysExecutionOrder until deadline (cooperative
 //           termination — no SIGKILL), signal completion
 //   parent: wait until all done sequence counters catch up
 //
-// Tradeoffs vs fork mode:
-//   - No SIGKILL timeout enforcement: relies on cooperative deadline checks
-//     inside RunMimesysExecutionOrder's outer while loop. For one-hot CRC
-//     plans (the Q2 target) the cooperative check is sufficient.
-//   - Per-slot transitions go from ~5-10 ms (fork+spawn+join+wait) to ~10 us
-//     (cv notify+wait round trip).
-//   - Workers carry warm L1/TLB across slots (intentional for max CPU%).
+// Deadline enforcement is cooperative: it relies on the deadline checks
+// inside RunMimesysExecutionOrder. Workers carry warm L1/TLB across slots
+// (intentional for max CPU%).
 namespace persistent_pool {
 
 struct WorkerTask {
@@ -2288,9 +2245,8 @@ class WorkerPool {
       }
       long long _wake_us = NowUs();
       long long remaining = local.deadline_us - _wake_us;
-      long long _wake_latency = local.deadline_us - static_cast<long long>(local.deadline_us); // 0 baseline
-      // Worker reads deadline; how much time elapsed from main setting deadline (deadline_us - duration_us) to now (_wake_us)?
-      // We can't know duration without it being stored, so just report remaining.
+      long long _wake_latency = local.deadline_us - static_cast<long long>(local.deadline_us);
+      // Timing bookkeeping for the WORKER0 debug log below.
       long long _kernel_start = _wake_us;
       if (local.sleep_only) {
         if (remaining > 0) {
@@ -2355,7 +2311,7 @@ static void BM_Mimesys(benchmark::State& state) {
   const auto &memstrata_command_file = GetMemstrataCommandFile("memstrata");
 
   const char* env_dir = std::getenv("TACC_STATS_DIR");
-  std::string tacc_stats_dir = env_dir ? env_dir : "/users/dhkim/HPCPerfStats/monitor/src"; // fallback if env not set
+  std::string tacc_stats_dir = env_dir ? env_dir : HomeRelativePath("/HPCPerfStats/monitor/src");
 
   // Start profiler in background thread
   // int background_profiler_pid = mimesys::StartProfilingBackground(1);
@@ -2364,7 +2320,7 @@ static void BM_Mimesys(benchmark::State& state) {
     for (auto _ : state) {
       MimesysExecutionPlan plan = ReadExecutionPlanFile(file);
 
-      // Sync moved to right before StartProfiling (post-warmup). See below.
+      // Memstrata sync happens post-warmup, right before StartProfiling (below).
 
       std::vector<std::vector<int>> all_num_iters;
       std::vector<std::vector<std::vector<int>>> execution_orders;
@@ -2402,17 +2358,13 @@ static void BM_Mimesys(benchmark::State& state) {
         long long parsed = std::atoll(slot_env);
         if (parsed > 0) expected_duration_us = static_cast<unsigned int>(parsed);
       }
-      // expected_duration_us_total is only used for the time-diff floor
-      // computation later; it tracks expected_duration_us × (size+1) per iter.
-      // We initialize it for a single-iter loop and recompute below once we
-      // know execution_orders.size().
       unsigned int expected_duration_us_total = expected_duration_us * 9;
       unsigned int duration_us = expected_duration_us;
       auto count = 0;
 
 
-      // Profiling start moved to AFTER warmup (below) so sample 0 lands at
-      // the workload start (first plan step), not 5s earlier during warmup.
+      // Profiling starts after warmup (below) so sample 0 lands at the first
+      // plan step rather than during warmup.
       int profiler_pid = -1;
 
       const char* iters_env = std::getenv("MIMESYS_ITERS");
@@ -2425,14 +2377,11 @@ static void BM_Mimesys(benchmark::State& state) {
           : iteration * static_cast<unsigned int>(execution_orders.size());
 
       // ── Main-thread pre-init: trigger lazy setup (file populate, big buf
-      //    alloc) for IO-resident direct kernels BEFORE the worker pool
-      //    spins up. Running it from the main thread sequentializes the
-      //    expensive populates (e.g. 256 MB shared-file write for the
-      //    HddRead kernels) into a single block before any timed work
-      //    begins; we then trigger a TACC stats sample at warmup-end so the
-      //    first measured delta starts AFTER the populate is done.
-      //    We invoke each registered IO kernel with duty=0 and a 1 ms
-      //    deadline so it just runs its call_once init and returns.
+      //    alloc) for IO-resident direct kernels BEFORE the worker pool spins
+      //    up, sequentializing the expensive populates (e.g. the 256 MB
+      //    shared file for the HddRead kernels) before any timed work. Each
+      //    kernel is invoked with duty=0 and a 1 ms deadline so it just runs
+      //    its call_once init and returns.
       {
         double saved = direct_kernels::g_current_duty;
         direct_kernels::g_current_duty = 0.0;
@@ -2453,8 +2402,8 @@ static void BM_Mimesys(benchmark::State& state) {
       persistent_pool::g_pool.Init(pool_n);
 
       // ── Pin main thread away from worker CPUs (last logical core).
-      //    Without this, main thread + worker 0 contend for CPU 0 and the
-      //    measured per-core utilization caps around 89% even at long slots.
+      //    Otherwise the main thread and worker 0 contend for CPU 0 and
+      //    measured per-core utilization drops below steady state.
       {
         cpu_set_t main_set;
         CPU_ZERO(&main_set);
@@ -2465,13 +2414,11 @@ static void BM_Mimesys(benchmark::State& state) {
 
       // ── Kernel pre-init pass: trigger each IO-resident direct kernel's
       //    first-call setup (file allocation, shared-file populate, big buf
-      //    alloc) BEFORE the timed steady-state loop. Without this, the first
-      //    slot that hits a previously-unused weight-scaled IO kernel pays a
-      //    ~hundred-MB write tax for setup that pollutes the IO measurement.
-      //    We dispatch one slot per kernel-name with all 20 worker positions
-      //    at duty=1.0 and a 20 ms deadline — each kernel returns quickly
-      //    once its lazy-init is done; threads that don't need any setup
-      //    just spin briefly.
+      //    alloc) on every worker BEFORE the timed steady-state loop, so the
+      //    first slot to hit a weight-scaled IO kernel doesn't pay a setup
+      //    write tax that pollutes the IO measurement. One short slot is
+      //    dispatched per kernel name; each kernel returns quickly once its
+      //    lazy-init is done.
       {
         // Save current duty so we can restore (we set 1.0 here)
         double saved = direct_kernels::g_current_duty;
@@ -2497,34 +2444,28 @@ static void BM_Mimesys(benchmark::State& state) {
         direct_kernels::g_current_duty = saved;
       }
 
-      // ── Warmup dispatch: triggers worker-pool first-dispatch cv chain,
+      // ── Warmup dispatch: triggers the worker-pool first-dispatch cv chain,
       //    forces each worker's CPU pinning + set_mempolicy syscalls to run,
       //    and warms per-worker thread_local kernel state by running the
-      //    first window's execution plan.
-      //    HPCPerfStats sampler captures its first %begin row ~1.4s after
-      //    binary launch (one full sample interval). Holding the warmup for
-      //    at least that long ensures the first REAL slot (i=0) begins right
-      //    after that first sample boundary, so /proc/stat deltas measure
-      //    busy time exclusively from the steady-state slot loop. Result:
-      //    no startup-window artifact dragging the first per-core %CPU below
-      //    the steady-state 99.8%.
+      //    first window's execution plan. Holding warmup for at least one
+      //    HPCPerfStats sample interval ensures the first real slot begins
+      //    after the first sample boundary, so /proc/stat deltas measure only
+      //    steady-state slot-loop busy time.
       if (!execution_orders.empty()) {
-        // Extended 5 s warmup gives a wide buffer for the main-thread populate
-        // tail and writeback flushes to settle before the timed loop.
-        // (Earlier we also called CollectTACCStatsAsync at warmup-end to
-        // create a clean baseline paragraph, but that shifted the trace by
-        // one delta and broke the dataloader's `_prepend_zero_metric_slot`
-        // cycle-2 alignment — curr/sleep got swapped. Reverted.)
+        // 5 s warmup lets the main-thread populate tail and writeback flushes
+        // settle before the timed loop. Do NOT snapshot TACC stats at
+        // warmup-end: the extra sample shifts the trace by one delta and
+        // breaks the dataloader's `_prepend_zero_metric_slot` alignment.
         long long warmup_deadline = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count() + 5000000;  // 5s
         persistent_pool::g_pool.DispatchSlot(
             execution_orders[0], no_op_ratios[0], warmup_deadline);
       }
 
-      // (sync-fix) Barrier with the target side, AFTER our calibration + worker
-      // pool init + warmup but BEFORE StartProfiling.  Writes "1" to <file>.lock
-      // ("synth post-warmup, ready") and polls for "2" ("target ready, go").
-      // No-op when memstrata_commands/ has no file.
+      // Barrier with the target side, AFTER calibration + worker pool init +
+      // warmup but BEFORE StartProfiling. Writes "1" to <file>.lock ("synth
+      // post-warmup, ready") and polls for "2" ("target ready, go"). No-op
+      // when memstrata_commands/ has no file.
       if (!memstrata_command_file.empty()) {
         std::cerr << "[sync] post-warmup barrier: " << memstrata_command_file << std::endl;
         std::filesystem::path lock_file = memstrata_command_file;
@@ -2532,12 +2473,10 @@ static void BM_Mimesys(benchmark::State& state) {
         RunMemstrataAndWait(memstrata_command_file, lock_file);
       }
 
-      // Gate the binary's own hpcperfstatsd usage behind MIMESYS_INTERNAL_PROFILING.
-      // When this var is unset or "0", we skip StartProfiling / CollectTACCStatsAsync
-      // / StopProfiling so they don't fight with mimebench's host-side samplers over
-      // /var/log/hpcperfstats/current (which they were doing — see the conflict
-      // documented in the run-time docs).  Default off; old behavior is opt-in via
-      // MIMESYS_INTERNAL_PROFILING=1.
+      // Internal hpcperfstatsd usage is gated behind MIMESYS_INTERNAL_PROFILING
+      // (default off). When unset or "0", StartProfiling / CollectTACCStatsAsync
+      // / StopProfiling are skipped so they don't fight with host-side samplers
+      // over /var/log/hpcperfstats/current.
       const char* prof_env = std::getenv("MIMESYS_INTERNAL_PROFILING");
       bool do_internal_profiling = prof_env && std::atoi(prof_env) != 0;
       if (do_internal_profiling) {
@@ -2552,7 +2491,7 @@ static void BM_Mimesys(benchmark::State& state) {
       }
 
       // Reset slot-loop clock AFTER warmup so the drift-compensation below
-      // doesn't see "+10s behind" and clamp the next ~20 slots to half-duration.
+      // doesn't treat warmup time as lag and clamp subsequent slots short.
       start_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count();
 
@@ -2572,9 +2511,8 @@ static void BM_Mimesys(benchmark::State& state) {
           auto _t_post_dispatch = std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now().time_since_epoch()).count();
 
-          // Gated on MIMESYS_INTERNAL_PROFILING.  See block above.
-          // hpc + pqos snapshots taken at the SAME moment so the two series
-          // align 1:1 (no timestamp games downstream).
+          // Gated on MIMESYS_INTERNAL_PROFILING (see above). hpc + pqos
+          // snapshots are taken at the same moment so the two series align 1:1.
           if (do_internal_profiling) {
             CollectTACCStatsAsync(tacc_stats_dir);
             mimesys::CollectPqosSnapshot();
@@ -2740,14 +2678,13 @@ BenchmarkRegisterer br;
 // Direct IO kernels create /tmp/mimesys_*_<id> backing files. They unlink the
 // path immediately after open so the inode is freed on fd close — but if the
 // process is SIGKILL'd between open() and unlink(), the file is orphaned.
-// Repeated kills accumulate ~256 MB per leak and fill the worker disk
-// (observed: 6/8 workers hit 100 % full after a debugging session).
+// Repeated kills accumulate ~256 MB per leak and can fill the disk.
 //
 // Two-layer defense:
 //   (1) Startup sweep: at static init, remove any /tmp/mimesys_*_<pid>
 //       file whose owning <pid> is no longer alive.
-//   (2) Exit handlers (atexit + SIGTERM/SIGINT): unlink anything still
-//       matching /tmp/mimesys_*_<my_pid> on the way out.
+//   (2) atexit handler: unlink anything still matching /tmp/mimesys_* on
+//       the way out.
 namespace {
 
 static void UnlinkMyTempFiles() {

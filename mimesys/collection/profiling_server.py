@@ -22,8 +22,7 @@ from mimesys.preprocessing.pqos_parser import pqos_metrics_dict, PQOS_METRIC_KEY
 
 
 def _merge_pqos_into_metrics(profiled_metrics, stats_path):
-    """Load paired pqos.log next to stats and merge its 3 keys into profiled_metrics.
-    Caller may pass any file_path; we replace 'stats' with 'pqos' and '.txt' with '.log'."""
+    """Merge metrics from the pqos-*.log paired with stats_path into profiled_metrics."""
     import os
     pqos_path = stats_path.replace("/stats-", "/pqos-").replace(".txt", ".log")
     if not os.path.exists(pqos_path):
@@ -35,11 +34,10 @@ def _merge_pqos_into_metrics(profiled_metrics, stats_path):
     n = len(next(iter(profiled_metrics.values()))) if profiled_metrics else 0
     for k in PQOS_METRIC_KEYS:
         v = pq.get(k, [])
-        # Match the length of HPC metrics so EMD sees comparable arrays.
+        # Match the HPC metric length so EMD compares equal-length arrays.
         if len(v) == n:
             profiled_metrics[k] = list(v)
         elif len(v) > 0:
-            # Length mismatch: pad/truncate to n. Better than dropping.
             arr = list(v)[:n] + [0.0] * max(0, n - len(v))
             profiled_metrics[k] = arr
     return profiled_metrics
@@ -69,15 +67,13 @@ class ProfileRequest(BaseModel):
     io_reward_weight: float = 1.0     # multiplier on io L1 reward term (applied in _parse_local_stats)
     cpu_reward_weight: float = 1.0    # multiplier on avg_cpu_utilizations* L1 reward terms
     # Per-metric measurement slice: keep entries where (m_idx % period == offset).
-    # Defaults (3, 1) match the historical 2-window deploy ([prev_state, curr, sleep] cycle).
-    # For 1-window deploys produced when train.ddpo.skip_prev_state=True, use (2, 0)
-    # so the slice picks the `curr` entries of the [curr, sleep, curr, sleep, ...] trace.
+    # Defaults (3, 1) match the 2-window [prev_state, curr, sleep] deploy; use
+    # (2, 0) for 1-window deploys (train.ddpo.skip_prev_state=True).
     reward_slice_period: int = 3
     reward_slice_offset: int = 1
-    # If True, the reward signal (`avg_emd_results_by_batch`) per sample is the
-    # flat mean across all 23 metric keys (20 per-core CPU + io + llc + membw).
-    # Per-core CPU dominates at 20/23 ≈ 87% of the reward. Default False uses
-    # the 4-family-balanced weighted mean (cpu collapses to 1 family, ~25%).
+    # If True, the per-sample reward is the flat mean across all metric keys
+    # (per-core CPU dominates at 20/23 keys). Default False uses the
+    # family-balanced weighted mean (cpu collapses to a single family).
     use_raw_mean_reward: bool = False
 
     class Config:
@@ -140,14 +136,8 @@ class Profiler:
                 f"&& rm chunk_{host_idx}.zip"
             ))
 
-            # Forward MIMESYS_* env from controller so the worker binary runs
-            # with the intended slot/iter config AND enables its internal profiling
-            # (StopProfiling writes stats-plan_XXXXX.txt only when
-            # MIMESYS_INTERNAL_PROFILING=1).  Without this the binary skips
-            # profiling, no new stats file is written, and the pull step below
-            # picks up a STALE stats-plan_XXXXX.txt left over from a prior run —
-            # so every RL step gets the same frozen reward regardless of the
-            # plan just generated.  Mirrors process_host_fleetbench.
+            # Forward MIMESYS_* env to the worker. The binary only writes
+            # stats-plan_*.txt when MIMESYS_INTERNAL_PROFILING=1.
             mimesys_iters = os.environ.get("MIMESYS_ITERS", "4")
             internal_prof = os.environ.get("MIMESYS_INTERNAL_PROFILING", "1")
             env_prefix = f"MIMESYS_ITERS={mimesys_iters} MIMESYS_INTERNAL_PROFILING={internal_prof}"
@@ -158,10 +148,8 @@ class Profiler:
             if sleep_env is not None:
                 env_prefix += f" MIMESYS_SLEEP={sleep_env}"
 
-            # Clear stale results BEFORE running the benchmark.  If the binary
-            # silently skips writing (e.g. missing env or MIN_PLANS abort), the
-            # pull step must return nothing rather than a stale file — otherwise
-            # the RL reward collapses to a fixed target.
+            # Clear stale results first so a skipped write pulls nothing
+            # rather than a stale stats file.
             machine.run_command(client=client, command=(
                 f"sudo rm -f /users/{self.user_name}/results/stats-plan_*.txt "
                 f"/users/{self.user_name}/results/pqos-plan_*.log 2>/dev/null; true"
@@ -175,9 +163,8 @@ class Profiler:
             ))
             print(f"Chunk {host_idx}: benchmark done on {machine.hostname}")
 
-            # Pull stats AND pqos files via SFTP. _merge_pqos_into_metrics
-            # downstream needs the paired pqos-plan_*.log to inject the 3 libpqos
-            # keys; without it, pqos EMD silently drops out of the reward signal.
+            # Pull stats and paired pqos files via SFTP; the pqos logs feed
+            # _merge_pqos_into_metrics downstream.
             chunk_stats_dir = os.path.join(local_stats_dir, f"chunk_{host_idx}")
             os.makedirs(chunk_stats_dir, exist_ok=True)
             _, stdout, _ = client.exec_command(
@@ -228,21 +215,16 @@ class Profiler:
 
         print(f"File {file_path} transferred to {machine.hostname}")
 
-        # Count plans we just uploaded so the remote can verify extraction matches.
         expected_plan_count = sum(1 for _ in os.listdir(plan_path) if _.endswith(".h5"))
 
         # Run the command on the remote machine
         print(f"Start running command on {machine.hostname} with {os.path.basename(file_path)} ({expected_plan_count} plans)")
-        # Unzip the file and remove the zip file. Then verify extraction count matches.
-        # Without the count check, a partial unzip + background script start can race so
-        # the script sees only a handful of plans, silently runs them, and ships back
-        # whatever stale stats files happen to be in ~/results from a previous run.
+        # Unzip, then verify the extracted plan count — a partial unzip can
+        # otherwise race the background collection script.
         command = (
-            # Kill any leftover worker from a previous run and clear its stale
-            # stats — otherwise a detached benchmark/collect process (e.g. after the
-            # orchestrator was killed) races the new plans and stalls this chunk.
-            # [x]-bracket regex so pkill doesn't match this dispatch shell's own
-            # command line (which contains these patterns) and kill itself.
+            # Kill leftover workers from a previous run and clear stale stats.
+            # [x]-bracket regex keeps pkill from matching (and killing) this
+            # dispatch shell's own command line.
             f"sudo pkill -9 -f '[m]imesys_benchmark' 2>/dev/null; "
             f"pkill -9 -f '[c]ollect_mimesys_data' 2>/dev/null; "
             f"sudo pkill -9 -f '[b]azel.*mimesys' 2>/dev/null; "
@@ -263,14 +245,11 @@ class Profiler:
 
         print("Start collection command")
         mimesys_iters = os.environ.get("MIMESYS_ITERS", "4")
-        # Forward MIMESYS_SLOT_US / MIMESYS_SLEEP from the controller env to the
-        # worker. Worker's collect_mimesys_data.sh defaults SLOT_US=2000000 (2 s)
-        # — set MIMESYS_SLOT_US=1000000 here for 1-s slots matching the windowed-
-        # DTW deploy contract. Omitted vars fall back to worker defaults.
+        # Forward MIMESYS_SLOT_US / MIMESYS_SLEEP to the worker; omitted vars
+        # fall back to worker defaults.
         env_prefix = f"MIMESYS_ITERS={mimesys_iters}"
         # MIMESYS_INTERNAL_PROFILING=1 enables the binary's hpcperfstatsd + pqos
-        # collection. Default ON for training data collection so per-plan
-        # stats-plan_NNN.txt AND pqos-plan_NNN.log are both produced.
+        # collection (per-plan stats-plan_NNN.txt and pqos-plan_NNN.log).
         internal_prof = os.environ.get("MIMESYS_INTERNAL_PROFILING", "1")
         env_prefix += f" MIMESYS_INTERNAL_PROFILING={internal_prof}"
         slot_us = os.environ.get("MIMESYS_SLOT_US")
@@ -545,9 +524,8 @@ class Profiler:
                             m_min, m_max = trace_range.get(target_metric, (0, 0))
 
                             normalized_metrics = [(m - m_min) / (m_max - m_min + 1e-5) for m_idx, m in enumerate(metrics) if m_idx % req.reward_slice_period == req.reward_slice_offset]
-                            # Drop curr_0 (warmup-contaminated first measured slot).
-                            # Mirror the _parse_local_stats path; override with
-                            # MIMESYS_KEEP_FIRST_CURR=1 for legacy compat.
+                            # Drop the warmup-contaminated first measured slot;
+                            # override with MIMESYS_KEEP_FIRST_CURR=1.
                             if (os.environ.get("MIMESYS_KEEP_FIRST_CURR", "0") != "1"
                                     and len(normalized_metrics) > 1):
                                 normalized_metrics = normalized_metrics[1:]
@@ -661,7 +639,6 @@ class Profiler:
 
             metrics_file_pair.sort(key=lambda x: x[0])
 
-            # Per-epoch sample counter for the debug print below.
             _printed_in_epoch = 0
             for batch_idx, trial_idx, file_path, ground_truth_path in metrics_file_pair:
                 try:
@@ -703,19 +680,16 @@ class Profiler:
                         m_min, m_max = trace_range.get(target_metric, (0, 0))
                         denom = (m_max - m_min) + 1e-5
 
-                        # Keep entries at (m_idx % period == offset) — defaults
-                        # (3, 1) match the legacy 2-window (prev, curr, sleep)×ITERS
-                        # deploy. Override via ProfileRequest.reward_slice_period
-                        # / .reward_slice_offset — e.g. (2, 0) for the 1-window
-                        # (curr, sleep)×ITERS deploy emitted when skip_prev_state=True.
+                        # Keep entries at (m_idx % period == offset); see the
+                        # reward_slice_* docs on ProfileRequest.
                         norm_pred = [
                             (m - m_min) / denom
                             for m_idx, m in enumerate(metrics)
                             if m_idx % req.reward_slice_period == req.reward_slice_offset
                         ]
-                        # Drop curr_0 (warmup-contaminated first measured slot).
-                        # Same default as preprocessing/dataloader.py — override
-                        # with MIMESYS_KEEP_FIRST_CURR=1 for legacy compat.
+                        # Drop the warmup-contaminated first measured slot
+                        # (matches preprocessing/dataloader.py); override with
+                        # MIMESYS_KEEP_FIRST_CURR=1.
                         if (os.environ.get("MIMESYS_KEEP_FIRST_CURR", "0") != "1"
                                 and len(norm_pred) > 1):
                             norm_pred = norm_pred[1:]
@@ -761,15 +735,10 @@ class Profiler:
                 except Exception as e:
                     print(f"Error parsing chunk={chunk_idx} batch={batch_idx}: {e}")
 
-        # Aggregate across batches; apply per-family reward weights from ProfileRequest
-        # to the reward signal (avg_emd_results_by_batch). Keep merged_emd RAW so
-        # callers (e.g. dynamic-λ logic in the trainer) can read unweighted per-metric
-        # errors for adaptive weight updates.
-        #
-        # IMPORTANT: avg_cpu_utilizations is split into 4 sub-keys; if we treated each
-        # as its own metric in the reward mean, cpu would silently get 4× weight vs
-        # io/llc/bw. We aggregate cpu sub-keys to a single "cpu" family BEFORE applying
-        # the weight, so the reward is a balanced mean of 4 resource families.
+        # Aggregate across batches with per-family reward weights. merged_emd
+        # stays raw (unweighted, per-key) for the trainer's adaptive weight
+        # logic. cpu sub-keys collapse to a single "cpu" family before
+        # weighting so cpu doesn't dominate the family mean.
         def _family(name: str) -> str:
             if name.startswith("avg_cpu_utilizations"): return "cpu"
             return name
@@ -786,18 +755,16 @@ class Profiler:
                 merged_emd[k].append(v)
             if emd_dict:
                 if req.use_raw_mean_reward:
-                    # Per-sample RAW mean across all 23 metric keys (cpu sub-keys
-                    # NOT collapsed). CPU dominates 20/23 ≈ 87% of the reward.
+                    # Flat mean across all metric keys (cpu sub-keys not collapsed).
                     avg_emd_results_by_batch.append(
                         float(np.mean(list(emd_dict.values())))
                     )
                 else:
-                    # 1) collapse to per-family error (cpu sub-keys -> mean cpu)
+                    # Collapse to per-family error, then take the weighted mean.
                     fam_errs = defaultdict(list)
                     for m, err in emd_dict.items():
                         fam_errs[_family(m)].append(err)
                     fam_means = {f: float(np.mean(v)) for f, v in fam_errs.items()}
-                    # 2) per-family weighted mean (now exactly 4 terms: io,llc,bw,cpu)
                     weighted = [_family_weight(f) * err for f, err in fam_means.items()]
                     avg_emd_results_by_batch.append(float(np.mean(weighted)))
             else:
