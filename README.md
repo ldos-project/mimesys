@@ -1,4 +1,8 @@
+<img src="mimesys.png" alt="Mimesys" width="120">
+
 # Mimesys: Generating Realistic Executable Testing Environments from Resource Usage Traces
+
+Mimesys generates executable workloads that reproduce the hardware performance traces of target applications using a conditional diffusion model.
 
 Diffusion-based system emulation framework. Trains a conditional diffusion model to generate executable workloads that reproduce hardware performance traces of target applications.
 
