@@ -46,13 +46,18 @@ Data collection requires a cluster of machines accessible over SSH. Each node ru
 
 ### SSH configuration
 
-Fill in `worker_scripts/config.py` with your credentials and the list of worker hostnames:
+Fill in `worker_scripts/config.py` with your credentials, paths, and the list of worker hostnames:
 
 ```python
-USERNAME        = "your_username"
+USERNAME         = "your_username"
 PRIVATE_KEY_PATH = "~/.ssh/id_rsa"
-HOSTNAMES       = ["worker-01.example.com", "worker-02.example.com", ...]
+LOCAL_HOME_DIR   = "/home/your_username"       # home dir on the controller
+REMOTE_HOME_DIR  = "/users/your_username"      # home dir on the workers
+MY_HOSTNAME      = "controller.example.com"    # must be resolvable from the workers
+HOSTNAMES        = ["worker-01.example.com", "worker-02.example.com", ...]
 ```
+
+`MY_HOSTNAME` is the address workers use to `scp` results back to the controller, so it cannot be `localhost`.
 
 ### Installing dependencies on each worker
 
@@ -127,6 +132,14 @@ cd mimesys/training
 CUDA_VISIBLE_DEVICES=0 uv run python trainer.py +exps=pretrain
 ```
 
+The denoiser architecture is selected by `model_arch` — `dit` (default, a 2D DiT-style transformer where each stressor×thread cell is one token, with AdaLN-zero conditioning), `unet`, or `mlp`:
+
+```bash
+uv run python trainer.py +exps=pretrain model_arch=unet
+```
+
+Checkpoints only load into the architecture they were trained with, so pass the matching `model_arch` when resuming or serving older U-Net checkpoints.
+
 **Multi-GPU**
 
 ```bash
@@ -145,24 +158,20 @@ uv run python trainer.py +exps=pretrain \
 **Training config example**
 
 ```yaml
-# mimesys/conf/exps/concat_aug10.yaml  (train + model sections)
+# mimesys/conf/exps/pretrain.yaml  (train + model sections)
 train:
   trainer:
     trainer_model_name: MimesysTrainer
     max_epochs: 2000
     devices: 1
-    precision: 16-mixed           # inherited from base
     check_val_every_n_epoch: 500
-    ckpt_path: ""
   optim:
     lr: 1e-4
   callbacks:
     checkpoint:
-      dirpath: diffusion/concat_aug10
+      dirpath: diffusion/mimesys_pretrain_v1
       every_n_epochs: 500
       monitor: epoch
-      save_top_k: -1
-      save_last: true
   run_train: true
   run_test: false
   use_rl: false
@@ -170,15 +179,14 @@ train:
 
 model:
   unet:
-    input_dim: 20           # num_stressor_types × num_parameters
+    input_dim: 20           # thread dimension of the action grid
   context:
-    input_dim: 25           # trace feature dimension
-    action_dim: 260
+    input_dim: 23           # trace feature dimension
+    action_dim: 33
     num_heads: 4
     num_layers: 6
     hidden_dim: 256
     dropout: 0.1
-    encoder_type: concat
   diffusion:
     n_timesteps: 25
     cfg_args:
@@ -186,8 +194,8 @@ model:
       cfg_guide_w: 3
 
 log:
-  project_name: mimesys
-  run_name: diffusion/concat_aug10
+  project_name: mimesys_pretrain
+  run_name: diffusion/mimesys_pretrain_v1
 ```
 
 Training metrics are logged to [Weights & Biases](https://wandb.ai) under `log.project_name` / `log.run_name`.
@@ -215,9 +223,9 @@ train:
     max_epochs: 10000
     devices: 1
     check_val_every_n_epoch: 10
-    ckpt_path: /path/to/pretrained/diffusion-epoch=999.ckpt   # start from supervised ckpt
+    ckpt_path: <FILL_IN_CKPT_PATH>  # start from supervised ckpt
   optim:
-    lr: 3e-7                        # keep low to avoid catastrophic forgetting
+    lr: 3e-6                        # keep low to avoid catastrophic forgetting
   use_rl: true
   prev_state_lambda: 0.0
   ddpo:
@@ -228,16 +236,18 @@ train:
     kl_coef: 0.05                   # KL penalty to pretrained distribution
   callbacks:
     checkpoint:
-      dirpath: diffusion/mimesys_pretrain
+      dirpath: diffusion/mimesys_finetune_rl_v1
       every_n_epochs: 10
       monitor: epoch
       save_last: true
   async_validation: false
 
 log:
-  project_name: mimesys
-  run_name: diffusion/mimesys_pretrain
+  project_name: mimesys_rl
+  run_name: diffusion/mimesys_finetune_rl_v1
 ```
+
+If the supervised checkpoint was trained with a different architecture than the current `model_arch` default (`dit`), pass the matching one, e.g. `model_arch=unet`.
 
 The `profiler` section must be set (same SSH credentials as data collection). Remote machines run the benchmark and return the reward signal each episode.
 
@@ -274,7 +284,7 @@ uv run python -m mimesys.inference \
 | `--exp` | `pretrain` | Hydra experiment config name |
 | `--port` | `8000` | HTTP port |
 | `--host` | `0.0.0.0` | Bind address |
-| `--enable_profiling` | off | Enable `POST /profile` (requires CloudLab SSH) |
+| `--enable_profiling` | off | Enable `POST /profile` (requires SSH access to the profiling workers) |
 | `--device` | auto | Force `cuda` or `cpu` |
 
 
@@ -297,7 +307,8 @@ Using the generated `h5` file, you can run a synthetic workload on a target mach
 # Copy the h5 file to the machine first, then place it in the execution plans directory
 cp execution_plan_series.h5 fleetbench/mimesys/execution_plans/
 
-# Run the synthetic workload
+# Run the synthetic workload (HOME_PATH = directory containing fleetbench/ and HPCPerfStats/)
+HOME_PATH=$HOME
 MIMESYS_ITERS=1 MIMESYS_SLEEP=0 ACTION_PROFILING_CACHE_DIR=${HOME_PATH}/fleetbench ACTION_LIST_PATH=${HOME_PATH}/fleetbench/fleetbench/mimesys/mimesys_actions.txt TACC_STATS_DIR=${HOME_PATH}/HPCPerfStats/monitor/src sudo bazel run --config=clang --config=opt fleetbench/mimesys:mimesys_benchmark -- --benchmark_filter="BM_Mimesys"
 ```
 

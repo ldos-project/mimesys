@@ -35,7 +35,7 @@ sudo apt-get install -y \
   syslog-ng vim net-tools lsof pigz libmysqlclient-dev libpq-dev autoconf \
   automake libtool gettext librabbitmq-dev rabbitmq-server libibmad-dev \
   libibumad-dev libev-dev pkg-config libsystemd-dev zip libhdf5-dev hdf5-tools \
-  libnuma-dev
+  libnuma-dev libpqos-dev
 
 mark_stage hpcperfstats_build
 cd $HOME_PATH/HPCPerfStats/monitor && \

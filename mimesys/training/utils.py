@@ -104,7 +104,7 @@ def load_transformer_model(cfg: DictConfig, device: str = "cuda") -> Transformer
     return _load_checkpoint(model, cfg.data.transformer_ckpt_path, "trainer_model.", device)
 
 
-def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> GaussianDiffusion:
+def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "dit") -> GaussianDiffusion:
     if model_arch == "unet":
         base_model = TemporalUnetCond(
             input_dim=cfg.unet.input_dim,

@@ -310,17 +310,25 @@ def health():
     }
 
 
+_ARCH_DESCRIPTIONS = {
+    "dit":  "DiT 2D transformer denoiser + Transformer ContextEncoder (DDPM)",
+    "unet": "Temporal-UNet + Transformer ContextEncoder (DDPM)",
+    "mlp":  "MLP denoiser + Transformer ContextEncoder (DDPM)",
+}
+
+
 @app.get("/info", summary="Model, hardware, and configuration metadata")
 def info():
     engine: InferenceEngine = _state["engine"]
     cfg = _state.get("cfg")
+    arch = getattr(cfg, "model_arch", "dit") if cfg is not None else "dit"
     return {
         "model": {
             "checkpoint":      engine.ckpt_meta.get("path"),
             "epoch":           engine.ckpt_meta.get("epoch"),
             "global_step":     engine.ckpt_meta.get("global_step"),
             "weight_source":   engine.ckpt_meta.get("weight_source"),
-            "architecture":    "Temporal-UNet + Transformer ContextEncoder (DDPM)",
+            "architecture":    _ARCH_DESCRIPTIONS.get(arch, arch),
             "diffusion_steps": 25,
             "cfg_guidance":    True,
         },

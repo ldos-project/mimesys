@@ -108,7 +108,8 @@ class InferenceEngine:
         engine._build_baselines(dataloader)
 
         # Load model
-        model = initialize_diffusion_model(cfg.model, model_arch="unet").to(device)
+        model_arch = getattr(cfg, "model_arch", "dit")
+        model = initialize_diffusion_model(cfg.model, model_arch=model_arch).to(device)
         ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
 
         if "ema_state_dict" in ckpt:

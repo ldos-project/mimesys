@@ -989,7 +989,7 @@ def train(cfg: DictConfig):
         key: [float(v[0]), float(v[1])] for key, v in dataloader.trace_range.items()
     }
 
-    arch = getattr(cfg, "model_arch", "unet")
+    arch = getattr(cfg, "model_arch", "dit")
     model = initialize_diffusion_model(cfg.model, model_arch=arch)
     wandb_logger = initialize_logger(cfg.log)
     callbacks = initialize_callbacks(cfg.train.callbacks)
