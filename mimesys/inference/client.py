@@ -237,7 +237,8 @@ def _locate_pqos_file(file_path: str) -> Optional[str]:
     return cand if cand != file_path and os.path.exists(cand) else None
 
 
-def _parse_trace_file_to_steps(file_path: str, pqos_file: Optional[str] = None) -> list[dict]:
+def _parse_trace_file_to_steps(file_path: str, pqos_file: Optional[str] = None,
+                               include_pqos: bool = True) -> list[dict]:
     """Parse a TACC stats file (+ paired pqos log) into per-time-step metric dicts.
 
     Mirrors the training-side pipeline: parse_trace_file →
@@ -246,8 +247,10 @@ def _parse_trace_file_to_steps(file_path: str, pqos_file: Optional[str] = None) 
     then merge the libpqos metrics (pqos_ipc, pqos_llc_kb, pqos_misses) from the
     paired pqos-*.log. The pqos log is located via the stats-→pqos- naming
     convention unless given explicitly. Missing pqos data is zero-filled with a
-    warning — the model conditions on pqos inputs, so predictions degrade
-    without them.
+    warning — a model trained with pqos inputs degrades without them.
+
+    include_pqos=False (--no_pqos) skips the pqos merge entirely, for
+    checkpoints trained without pqos metrics (MIMESYS_USE_PQOS=0).
     """
 
     _, parsed_traces = parse_trace_file(file_path)
@@ -266,6 +269,9 @@ def _parse_trace_file_to_steps(file_path: str, pqos_file: Optional[str] = None) 
     metrics.pop("avg_cpu_utilizations_total", None)
 
     n_steps = len(next(iter(metrics.values())))
+
+    if not include_pqos:
+        return [{k: v[t] for k, v in metrics.items()} for t in range(n_steps)]
 
     pqos_path = pqos_file or _locate_pqos_file(file_path)
     pq: dict = {}
@@ -415,9 +421,10 @@ def cmd_generate_from_file(url: str, raw: bool,
                            n_chains: int, cfg_guide_w: float,
                            generation_strategy: Optional[str],
                            output: Optional[str],
-                           pqos_file: Optional[str] = None, **_):
+                           pqos_file: Optional[str] = None,
+                           no_pqos: bool = False, **_):
     """Parse a TACC stats trace file and generate an H5 execution plan series."""
-    steps = _parse_trace_file_to_steps(file, pqos_file=pqos_file)
+    steps = _parse_trace_file_to_steps(file, pqos_file=pqos_file, include_pqos=not no_pqos)
     print(f"  Parsed {len(steps)} time steps from {file}")
 
     body: dict = {
@@ -445,9 +452,10 @@ def cmd_profile_from_file(url: str, raw: bool,
                           n_chains: int, cfg_guide_w: float,
                           generation_strategy: Optional[str],
                           output: Optional[str],
-                          pqos_file: Optional[str] = None, **_):
+                          pqos_file: Optional[str] = None,
+                          no_pqos: bool = False, **_):
     """Parse a TACC stats trace file and submit a time-series profiling job."""
-    steps = _parse_trace_file_to_steps(file, pqos_file=pqos_file)
+    steps = _parse_trace_file_to_steps(file, pqos_file=pqos_file, include_pqos=not no_pqos)
     print(f"  Parsed {len(steps)} time steps from {file}")
 
     body: dict = {
@@ -469,14 +477,15 @@ def cmd_profile_batch(url: str, raw: bool,
                       generation_strategy: Optional[str],
                       n_chains: int, cfg_guide_w: float,
                       poll_interval: int,
-                      output: Optional[str], **_):
+                      output: Optional[str],
+                      no_pqos: bool = False, **_):
     """Parse a list of TACC stats files, submit as a batch, poll until done, summarize."""
 
     # ── 1. Parse all files ───────────────────────────────────────────────────
     print(f"\n  Parsing {len(files)} trace file(s)...")
     jobs_input: list[tuple[str, list[dict]]] = []
     for path in files:
-        steps = _enrich_with_cpu_total(_parse_trace_file_to_steps(path))
+        steps = _enrich_with_cpu_total(_parse_trace_file_to_steps(path, include_pqos=not no_pqos))
         jobs_input.append((path, steps))
         print(f"    {os.path.basename(path)}: {len(steps)} steps")
 
@@ -984,6 +993,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Path to a TACC stats trace file")
     gf.add_argument("--pqos_file",           default=None,
                     help="Paired pqos log; auto-located via the stats-→pqos- naming convention if omitted")
+    gf.add_argument("--no_pqos",             action="store_true",
+                    help="Skip pqos metrics (for checkpoints trained without them)")
     gf.add_argument("--method",              default="diffusion",
                     choices=["diffusion","nearest_neighbor","linear_interpolation","single_stressor"])
     gf.add_argument("--initial_prev_action",   default=None)
@@ -1001,6 +1012,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Path to a TACC stats trace file (e.g. stats-workload.txt)")
     pf.add_argument("--pqos_file",           default=None,
                     help="Paired pqos log; auto-located via the stats-→pqos- naming convention if omitted")
+    pf.add_argument("--no_pqos",             action="store_true",
+                    help="Skip pqos metrics (for checkpoints trained without them)")
     pf.add_argument("--method",              default="diffusion",
                     choices=["diffusion","nearest_neighbor","linear_interpolation","single_stressor"])
     pf.add_argument("--initial_prev_action",   default=None,
@@ -1017,6 +1030,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Submit a batch of trace files, poll until done, print/plot summary")
     pb.add_argument("--files",               required=True, nargs="+",
                     help="One or more TACC stats trace file paths (supports shell globs via quotes)")
+    pb.add_argument("--no_pqos",             action="store_true",
+                    help="Skip pqos metrics (for checkpoints trained without them)")
     pb.add_argument("--method",              default="diffusion",
                     choices=["diffusion","nearest_neighbor","linear_interpolation","single_stressor"])
     pb.add_argument("--generation_strategy", default=None,
