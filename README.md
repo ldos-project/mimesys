@@ -1,10 +1,15 @@
-<img src="mimesys.png" alt="Mimesys" width="120">
+# Mimesys
 
-# Mimesys: Generating Realistic Executable Testing Environments from Resource Usage Traces
+<p align="center">
+    <img src="mimesys.png" alt="Mimesys" width="128">
+</p>
+
+<h2><p align="center">Turn Resource Usage Traces into Executable Workloads 🧬</p></h2>
+
 
 Mimesys generates executable workloads that reproduce the hardware performance traces of target applications using a conditional diffusion model.
 
-Diffusion-based system emulation framework. Trains a conditional diffusion model to generate executable workloads that reproduce hardware performance traces of target applications.
+This repo provides the full pipeline: data collection, training, RL fine-tuning, and inference.
 
 
 ---
