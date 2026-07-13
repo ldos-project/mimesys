@@ -34,29 +34,62 @@ from mimesys.inference.baselines import (
 )
 from mimesys.training.utils import initialize_diffusion_model
 
-# Action tensor dimensions: (STRESSORS, THREADS) = (13, 20)
-ACTION_STRESSORS: int = 13
+# Action tensor dimensions: (STRESSORS, THREADS) = (20, 20)
+ACTION_STRESSORS: int = 20
 ACTION_THREADS:   int = 20
 
 # ── Trace layout ─────────────────────────────────────────────────────────────
+# 28-dim model input, sorted alphabetically to match the training-side
+# clean_trace ordering (_metrics_matrix sorts by key): 20 per-core CPU%,
+# io read/write splits, LLC, memory-BW read/write splits, and the three
+# libpqos CMT/MBM metrics merged from the paired pqos-*.log.
 METRIC_KEYS: list[str] = [
     *[f"avg_cpu_utilizations_core_{i:02d}" for i in range(20)],
-    "io",
-    "l3_cache_usage",     # socket-aggregated
-    "memory_bandwidth",   # socket-aggregated
+    "io_read",
+    "io_write",
+    "l3_cache_usage",           # CHA aggregate, socket-aggregated
+    "memory_bandwidth_read",    # socket-aggregated
+    "memory_bandwidth_write",   # socket-aggregated
+    "pqos_ipc",
+    "pqos_llc_kb",
+    "pqos_misses",
 ]
 
 METRIC_UNITS: dict[str, str] = {
     **{f"avg_cpu_utilizations_core_{i:02d}": "%" for i in range(20)},
-    "io":               "KB/s",
-    "l3_cache_usage":   "MB",
-    "memory_bandwidth": "GB/s",
+    "io_read":                "KB/s",
+    "io_write":               "KB/s",
+    "l3_cache_usage":         "MB",
+    "memory_bandwidth_read":  "GB/s",
+    "memory_bandwidth_write": "GB/s",
+    "pqos_ipc":               "instructions/cycle",
+    "pqos_llc_kb":            "KB",
+    "pqos_misses":            "misses/s",
 }
 
+# Stressor kernel per action column, in mimesys_actions.txt order (= the
+# column order of generated execution plans).
 STRESSOR_NAMES: list[str] = [
-    "brk", "dev-shm", "env", "fallocate", "llc-affinity",
-    "mmapfixed", "mmaphuge", "readahead", "seek", "stream",
-    "cpu", "vm", "io",
+    "BM_HASHING_Computecrc32c_Fleet_cold",
+    "BM_LIBC_Memcpy_Fleet_L1",
+    "BM_LIBC_Memcpy_Fleet_L2",
+    "BM_LIBC_Memcmp_Fleet_LLC",
+    "BM_SIMD_SerialDistanceComputation/num_blocks:256/enable_avx512:false/flush_cache:false",
+    "BM_SWISSMAP_InsertMiss_Cold<::absl::flat_hash_set, 64>/set_size:262144/density:0",
+    "BM_SWISSMAP_InsertMiss_Cold<::absl::node_hash_set, 64>/set_size:32768/density:0",
+    "BM_SWISSMAP_InsertManyOrdered_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:1",
+    "BM_STRESS_NG_HddRead_1MB_NoSleep",
+    "BM_STRESS_NG_HddRead_1MB_WeightScaled_50ms",
+    "BM_STRESS_NG_HddRead_256KB_WeightScaled_500ms",
+    "BM_STRESS_NG_HddWriteNF_1MB_BurstScaled",
+    "BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_50ms",
+    "BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_25ms",
+    "BM_STRESS_NG_HddWriteNF_256KB_WeightScaled_500ms",
+    "BM_DIRECTMEMSET_32MB_NoSleep",
+    "BM_DIRECTMEMSET_32MB_WeightScaled_50ms",
+    "BM_DIRECTSTREAMSIMD_32MB_NoSleep",
+    "BM_DIRECTSTREAMSIMD_8MB_NoSleep",
+    "BM_HASHING_Extendcrc32c_Fleet_L3_16MB",
 ]
 
 METHOD_NAMES = ("diffusion", "nearest_neighbor", "linear_interpolation", "single_stressor")
@@ -75,6 +108,7 @@ class InferenceEngine:
         self.device:       str  = "cpu"
         self.ckpt_meta:    dict = {}
         self.trace_range:  dict = {}
+        self.metric_keys:  list[str] = list(METRIC_KEYS)
         self.nn:           Optional[NearestNeighbor]      = None
         self.li:           Optional[LinearInterpolation]  = None
         self.ss:           Optional[SingleStressor]       = None
@@ -103,6 +137,11 @@ class InferenceEngine:
         engine = cls()
         engine.device      = device
         engine.trace_range = dataloader.trace_range
+        # The model conditions on clean_trace, whose ordering is the sorted
+        # metric-key set of the training corpus — derive it from trace_range so
+        # the layout always matches the checkpoint's corpus.
+        if engine.trace_range:
+            engine.metric_keys = sorted(engine.trace_range.keys())
 
         # Build baseline predictors from val split
         engine._build_baselines(dataloader)
@@ -148,7 +187,7 @@ class InferenceEngine:
         import math, os
         mode = os.environ.get("MIMESYS_NORM_MODE", "linear").lower()
         vec = []
-        for key in METRIC_KEYS:
+        for key in self.metric_keys:
             raw_val = raw.get(key, 0.0)
             lo, hi  = (float(self.trace_range[key][0]),
                        float(self.trace_range[key][1])) if key in self.trace_range else (0.0, 1.0)
@@ -511,4 +550,6 @@ class InferenceEngine:
 
         self.nn = NearestNeighbor(train_t, train_a)
         self.li = LinearInterpolation(train_t, train_a, k=5)
-        self.ss = SingleStressor()
+        # Infer the action grid from the corpus; stressor_idx 0 is the
+        # CPU-bound crc32c kernel (see STRESSOR_NAMES).
+        self.ss = SingleStressor.from_actions(train_a, stressor_idx=0)

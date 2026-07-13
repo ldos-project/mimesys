@@ -45,12 +45,18 @@ def _prepend_zero_metric_slot(vals, cycle):
 # ---------------------------------------------------------------------------
 # Augmentation utilities
 # ---------------------------------------------------------------------------
-# Metric vector layout (sorted alphabetically, 23-dim):
+# Metric vector layout (sorted alphabetically, 28-dim with pqos):
 #   [0:10]  avg_cpu_utilizations_core_00..09  (socket 0)
 #   [10:20] avg_cpu_utilizations_core_10..19  (socket 1)
-#   [20]    io
-#   [21]    l3_cache_usage    (socket-aggregated)
-#   [22]    memory_bandwidth  (socket-aggregated)
+#   [20]    io_read
+#   [21]    io_write
+#   [22]    l3_cache_usage           (socket-aggregated)
+#   [23]    memory_bandwidth_read    (socket-aggregated)
+#   [24]    memory_bandwidth_write   (socket-aggregated)
+#   [25]    pqos_ipc
+#   [26]    pqos_llc_kb
+#   [27]    pqos_misses
+# (legacy 23-dim corpora: [20]=io, [21]=l3_cache_usage, [22]=memory_bandwidth)
 #
 # Action label layout (after transpose): [stressors, threads=20]
 #   columns [0:10]  = socket 0 threads
@@ -152,13 +158,15 @@ def augment_dataset(data: list, aug_factor: int, intra_only: bool = False,
             })
 
     # --- high-IO oversampling (intra-socket only) ---
-    IO_IDX = 20
+    def _raw_io(rt):
+        # 28-dim layout: [20]=io_read + [21]=io_write; legacy 23-dim: [20]=io.
+        return rt[20] + rt[21] if len(rt) >= 28 else rt[20]
     if high_io_aug_factor > 1:
         n_hi_extra = high_io_aug_factor - 1
         hi_count = 0
         for item in data:
             raw_trace = np.array(item["info"]["collated_trace"])
-            if raw_trace[IO_IDX] < io_raw_threshold:
+            if _raw_io(raw_trace) < io_raw_threshold:
                 continue
             hi_count += 1
             trace    = np.array(item["clean_trace"])
@@ -651,18 +659,23 @@ class CustomDataLoader(pl.LightningDataModule):
             # Supplement with high-resource training samples stratified across
             # IO, CPU, LLC and BW. Thresholds are raw-scale, so compare against
             # info["collated_trace"] (clean_trace is normalized to [-1, 1]).
-            # Layout: [0..19]=per-core CPU%, [20]=io, [21]=l3_cache_usage (agg),
-            #         [22]=memory_bandwidth (agg).
-            IO_IDX  = 20
-            LLC_IDX = 21
-            BW_IDX  = 22
-
+            # See the metric-vector layout comment at the top of this module;
+            # combined io/bw are the read+write sums in the 28-dim layout.
             def _raw(d): return d["info"]["collated_trace"]
+            def _io(d):
+                raw = _raw(d)
+                return raw[20] + raw[21] if len(raw) >= 28 else raw[20]
+            def _llc(d):
+                raw = _raw(d)
+                return raw[22] if len(raw) >= 28 else raw[21]
+            def _bw(d):
+                raw = _raw(d)
+                return raw[23] + raw[24] if len(raw) >= 28 else raw[22]
 
-            high_io_train  = [d for d in train_data if _raw(d)[IO_IDX] > io_raw_threshold]
+            high_io_train  = [d for d in train_data if _io(d) > io_raw_threshold]
             high_cpu_train = [d for d in train_data if float(np.mean(_raw(d)[:20])) > cpu_avg_threshold]
-            high_llc_train = [d for d in train_data if _raw(d)[LLC_IDX] > llc_max_threshold]
-            high_bw_train  = [d for d in train_data if _raw(d)[BW_IDX]  > bw_max_threshold]
+            high_llc_train = [d for d in train_data if _llc(d) > llc_max_threshold]
+            high_bw_train  = [d for d in train_data if _bw(d)  > bw_max_threshold]
 
             # Budget = rl_train_ratio × max(len(test_data), rl_kmean_k); the
             # rl_kmean_k floor keeps RL usable with an empty test dir
@@ -924,15 +937,13 @@ class CustomDataLoader(pl.LightningDataModule):
             print(f"[rl-kmean] only {len(test_data)} per-sec samples available (<= K={K}); "
                   f"returning all without clustering.")
             return list(test_data)
-        feats = np.array([
-            (
-                sum(d["clean_trace"][:20]) / 20,  # avg CPU%
-                d["clean_trace"][-3],             # io
-                d["clean_trace"][-2],             # l3_cache_usage
-                d["clean_trace"][-1],             # memory_bandwidth
-            )
-            for d in test_data
-        ], dtype=np.float64)
+        def _feat(ct):
+            if len(ct) >= 28:
+                # 28-dim layout: io/bw features are the read+write sums; pqos
+                # columns are excluded from the clustering features.
+                return (sum(ct[:20]) / 20, ct[20] + ct[21], ct[22], ct[23] + ct[24])
+            return (sum(ct[:20]) / 20, ct[-3], ct[-2], ct[-1])  # legacy 23-dim
+        feats = np.array([_feat(d["clean_trace"]) for d in test_data], dtype=np.float64)
         from sklearn.cluster import KMeans
         print(f"[rl-kmean] clustering {len(test_data)} per-sec test samples → K={K} medoids ...")
         km = KMeans(n_clusters=K, n_init=4, random_state=random_state).fit(feats)

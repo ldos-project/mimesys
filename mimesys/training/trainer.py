@@ -485,8 +485,9 @@ class MimesysTrainer(pl.LightningModule):
                     # action / trajectory shape (T_diff+1, S=13, T_threads=20) -> permute last axis
                     new_trajectory = trajectory.index_select(-1, thread_perm)
 
-                    # context / prev_trace flat shape (23,): positions 0-19 are CPU cores,
-                    # [20]=io, [21]=l3_cache_usage, [22]=memory_bandwidth (all aggregated).
+                    # context / prev_trace flat trace vector: positions 0-19 are
+                    # per-core CPU (the only thread-permutable slice); the
+                    # remaining io/LLC/BW/pqos columns are socket-aggregated.
                     new_context = context.clone()
                     new_context[:20] = context[thread_perm]
                     new_prev_trace = prev_trace_i.clone()
@@ -703,8 +704,8 @@ class MimesysTrainer(pl.LightningModule):
             indices = _np.random.choice(len(self._windowed_pool), N, replace=False)
         sel = [self._windowed_pool[int(i)] for i in indices]
 
-        metric_seq = torch.tensor([s["metric_seq"] for s in sel], dtype=torch.float32, device="cuda")   # (N, W, 23)
-        prev_first = torch.tensor([s["prev_clean_trace"] for s in sel], dtype=torch.float32, device="cuda")  # (N, 23)
+        metric_seq = torch.tensor([s["metric_seq"] for s in sel], dtype=torch.float32, device="cuda")   # (N, W, D=28)
+        prev_first = torch.tensor([s["prev_clean_trace"] for s in sel], dtype=torch.float32, device="cuda")  # (N, D=28)
         raw_gt_4d  = _np.array([s["raw_metric_seq_4d"] for s in sel], dtype=_np.float64)               # (N, W, 4)
         # Per-core CPU GT (W, 20). Only used when per_core_cpu_reward=true and the pool
         # entries contain `raw_metric_seq_percore` (older cached pools may not).
@@ -789,7 +790,7 @@ class MimesysTrainer(pl.LightningModule):
             for w in range(W):
                 trajectory = chains_per_step[w][:, i]     # (T_diff+1, S, T_a)
                 log_prob   = log_probs_per_step[w][:, i]  # (T_diff,)
-                cond_w     = metric_seq[i, w]              # (23,)
+                cond_w     = metric_seq[i, w]              # (D=28,)
                 # prev_state for this window step (scaled [-1,+1]); first step = idle
                 if w == 0:
                     prev_state_w = -torch.ones_like(trajectory[0])

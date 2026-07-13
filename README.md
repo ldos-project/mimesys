@@ -296,7 +296,12 @@ uv run python -m mimesys.inference \
 
 ### Client
 
-Generate an execution plan (HDF5) from a time-series resource usage trace file. The trace file uses the [HPCPerfStats](https://github.com/TACC/HPCPerfStats) format.
+Generate an execution plan (HDF5) from a time-series resource usage trace. The model conditions on a 28-metric input: 20 per-core CPU%, IO read/write, LLC usage, memory-bandwidth read/write, plus three cache/memory metrics from [libpqos](https://github.com/intel/intel-cmt-cat) (`pqos_ipc`, `pqos_llc_kb`, `pqos_misses`). A trace is therefore a **pair of files**:
+
+- a stats file in the [HPCPerfStats](https://github.com/TACC/HPCPerfStats) format (`stats-<name>.txt`), and
+- a pqos log (`pqos-<name>.log`) sampled at 1 Hz, as produced by the benchmark's built-in pqos profiler.
+
+The client auto-locates the pqos log next to the stats file via the `stats-` → `pqos-` naming convention; use `--pqos_file` to point at one explicitly. If it's missing, the pqos inputs are zero-filled and prediction quality degrades. `GET /metrics` lists all 28 accepted metrics with units and training ranges.
 
 ```bash
 uv run python -m mimesys.inference.client generate-from-file \
