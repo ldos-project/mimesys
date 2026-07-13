@@ -1,5 +1,3 @@
-# Mimesys
-
 <p align="center">
     <img src="mimesys.png" alt="Mimesys" width="256">
 </p>
