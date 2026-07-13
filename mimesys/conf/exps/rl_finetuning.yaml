@@ -57,7 +57,7 @@ model:
     hidden_dim: 128
     dropout: 0.1
   context:
-    input_dim: 23
+    input_dim: 28
     action_dim: 33
     num_heads: 4
     num_layers: 6
@@ -65,7 +65,7 @@ model:
     dropout: 0.1
   transformer:
     input_dim: 500
-    output_dim: 23
+    output_dim: 28
     num_heads: 4
     num_layers: 6
     hidden_dim: 256
@@ -76,6 +76,6 @@ model:
       cfg_drop_prob: 0.1
       cfg_guide_w: 3
   autoencoder:
-    input_dim: 23
+    input_dim: 28
     hidden_dim: 16
     latent_dim: 10

@@ -46,6 +46,7 @@ from hydra.core.global_hydra import GlobalHydra
 from mimesys.schema.machine import Machine
 from mimesys.preprocessing.dataloader import CustomDataLoader
 from mimesys.preprocessing.parsers import parse_trace_file, process_trace_all
+from mimesys.collection.profiling_server import _merge_pqos_into_metrics
 from mimesys.inference.engine import (
     InferenceEngine,
     METRIC_KEYS, METRIC_UNITS, STRESSOR_NAMES,
@@ -92,10 +93,14 @@ class GenerateRequest(BaseModel):
         ...,
         description=(
             "Resource-usage snapshot keyed by metric name. Missing keys default to 0. "
-            "Values in raw physical units (%, KB/s, MB, GB/s). See GET /metrics."
+            "Values in raw physical units (%, KB/s, MB, GB/s, ...). Includes the "
+            "libpqos metrics (pqos_ipc, pqos_llc_kb, pqos_misses). See GET /metrics."
         ),
-        examples=[{"avg_cpu_utilizations_core_00": 72.5, "io": 3200.0,
-                   "l3_cache_usage": 8500.0, "memory_bandwidth": 12.3}],
+        examples=[{"avg_cpu_utilizations_core_00": 72.5,
+                   "io_read": 2100.0, "io_write": 1100.0,
+                   "l3_cache_usage": 8500.0,
+                   "memory_bandwidth_read": 8.2, "memory_bandwidth_write": 4.1,
+                   "pqos_ipc": 1.4, "pqos_llc_kb": 20480.0, "pqos_misses": 1.2e6}],
     )
     method: METHOD_CHOICES = Field(
         "diffusion",
@@ -265,7 +270,7 @@ async def lifespan(app: FastAPI):
     )
     _state["engine"] = engine
     print(
-        f"[server] Ready — trace_dim={len(METRIC_KEYS)}, "
+        f"[server] Ready — trace_dim={len(engine.metric_keys)}, "
         f"action=({ACTION_STRESSORS}x{ACTION_THREADS}), "
         f"epoch={engine.ckpt_meta['epoch']}"
     )
@@ -333,8 +338,8 @@ def info():
             "cfg_guidance":    True,
         },
         "input": {
-            "trace_dim":         len(METRIC_KEYS),
-            "trace_keys":        METRIC_KEYS,
+            "trace_dim":         len(engine.metric_keys),
+            "trace_keys":        engine.metric_keys,
             "prev_action_shape": [ACTION_STRESSORS, ACTION_THREADS],
             "normalization":     "linear min-max per metric (from training corpus)",
         },
@@ -389,9 +394,9 @@ def metrics():
                 "train_min": float(tr[k][0]) if k in tr else None,
                 "train_max": float(tr[k][1]) if k in tr else None,
             }
-            for k in METRIC_KEYS
+            for k in engine.metric_keys
         ],
-        "total": len(METRIC_KEYS),
+        "total": len(engine.metric_keys),
     }
 
 
@@ -690,7 +695,8 @@ def _profile_sync(req: ProfileRequest, emit) -> dict:
             result_dest = os.path.join(tmp, "results")
             os.makedirs(result_dest, exist_ok=True)
             _, stdout, _ = client.exec_command(
-                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt 2>/dev/null"
+                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt "
+                f"/users/{cfg.profiler.user_name}/results/pqos-plan_*.log 2>/dev/null"
             )
             sftp = client.open_sftp()
             for rp in stdout.read().decode().strip().splitlines():
@@ -704,11 +710,14 @@ def _profile_sync(req: ProfileRequest, emit) -> dict:
             emit("parsing", "Parsing hardware metric traces...", 95)
             hw_metrics: dict = {}
             for fname in os.listdir(result_dest):
+                if not fname.startswith("stats-"):
+                    continue
                 _header, grouped_traces = parse_trace_file(os.path.join(result_dest, fname))
                 if not grouped_traces:
                     continue
                 res = process_trace_all(grouped_traces, include_aggregated_cpu=True)
                 if res:
+                    res = _merge_pqos_into_metrics(res, os.path.join(result_dest, fname))
                     hw_metrics = {k: vals for k, vals in res.items()}
                     break
     finally:
@@ -833,7 +842,8 @@ def _profile_series_sync(req: ProfileSeriesRequest, emit) -> dict:
             result_dest = os.path.join(tmp, "results")
             os.makedirs(result_dest, exist_ok=True)
             _, stdout, _ = client.exec_command(
-                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt 2>/dev/null"
+                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt "
+                f"/users/{cfg.profiler.user_name}/results/pqos-plan_*.log 2>/dev/null"
             )
             sftp = client.open_sftp()
             for rp in stdout.read().decode().strip().splitlines():
@@ -853,12 +863,15 @@ def _profile_series_sync(req: ProfileSeriesRequest, emit) -> dict:
             emit("parsing", "Parsing time-series hardware metric traces...", 95)
             series_metrics: list[dict] = []
             for fname in sorted(os.listdir(result_dest)):
+                if not fname.startswith("stats-"):
+                    continue
                 _header, grouped_traces = parse_trace_file(os.path.join(result_dest, fname))
                 if not grouped_traces:
                     continue
                 res = process_trace_all(grouped_traces, include_aggregated_cpu=True)
                 if not res:
                     continue
+                res = _merge_pqos_into_metrics(res, os.path.join(result_dest, fname))
                 n_steps = len(next(iter(res.values())))
                 for step in range(1, n_steps):
                     d = {k: float(vals[step]) for k, vals in res.items()}
@@ -1137,7 +1150,8 @@ def _profile_series_sync_with_plan(
             result_dest = os.path.join(tmp, "results")
             os.makedirs(result_dest, exist_ok=True)
             _, stdout, _ = client.exec_command(
-                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt 2>/dev/null"
+                f"ls /users/{cfg.profiler.user_name}/results/stats-plan_*.txt "
+                f"/users/{cfg.profiler.user_name}/results/pqos-plan_*.log 2>/dev/null"
             )
             sftp = client.open_sftp()
             for rp in stdout.read().decode().strip().splitlines():
@@ -1150,12 +1164,15 @@ def _profile_series_sync_with_plan(
             emit("parsing", "Parsing time-series hardware metric traces...", 95)
             series_metrics: list[dict] = []
             for fname in sorted(os.listdir(result_dest)):
+                if not fname.startswith("stats-"):
+                    continue
                 _header, grouped_traces = parse_trace_file(os.path.join(result_dest, fname))
                 if not grouped_traces:
                     continue
                 res = process_trace_all(grouped_traces, include_aggregated_cpu=True)
                 if not res:
                     continue
+                res = _merge_pqos_into_metrics(res, os.path.join(result_dest, fname))
                 n_steps = len(next(iter(res.values())))
                 for step in range(1, n_steps):
                     series_metrics.append({k: float(vals[step]) for k, vals in res.items()})

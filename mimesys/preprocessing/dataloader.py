@@ -45,12 +45,18 @@ def _prepend_zero_metric_slot(vals, cycle):
 # ---------------------------------------------------------------------------
 # Augmentation utilities
 # ---------------------------------------------------------------------------
-# Metric vector layout (sorted alphabetically, 23-dim):
+# Metric vector layout (sorted alphabetically, 28-dim with pqos):
 #   [0:10]  avg_cpu_utilizations_core_00..09  (socket 0)
 #   [10:20] avg_cpu_utilizations_core_10..19  (socket 1)
-#   [20]    io
-#   [21]    l3_cache_usage    (socket-aggregated)
-#   [22]    memory_bandwidth  (socket-aggregated)
+#   [20]    io_read
+#   [21]    io_write
+#   [22]    l3_cache_usage           (socket-aggregated)
+#   [23]    memory_bandwidth_read    (socket-aggregated)
+#   [24]    memory_bandwidth_write   (socket-aggregated)
+#   [25]    pqos_ipc
+#   [26]    pqos_llc_kb
+#   [27]    pqos_misses
+# (legacy 23-dim corpora: [20]=io, [21]=l3_cache_usage, [22]=memory_bandwidth)
 #
 # Action label layout (after transpose): [stressors, threads=20]
 #   columns [0:10]  = socket 0 threads
@@ -152,13 +158,16 @@ def augment_dataset(data: list, aug_factor: int, intra_only: bool = False,
             })
 
     # --- high-IO oversampling (intra-socket only) ---
-    IO_IDX = 20
+    def _raw_io(rt):
+        # split layout (25/28-dim): [20]=io_read + [21]=io_write;
+        # legacy 23-dim: [20]=io.
+        return rt[20] + rt[21] if len(rt) >= 25 else rt[20]
     if high_io_aug_factor > 1:
         n_hi_extra = high_io_aug_factor - 1
         hi_count = 0
         for item in data:
             raw_trace = np.array(item["info"]["collated_trace"])
-            if raw_trace[IO_IDX] < io_raw_threshold:
+            if _raw_io(raw_trace) < io_raw_threshold:
                 continue
             hi_count += 1
             trace    = np.array(item["clean_trace"])
@@ -191,6 +200,11 @@ def augment_dataset(data: list, aug_factor: int, intra_only: bool = False,
 from mimesys.schema.stressor_action import FleetBenchAction
 from mimesys.preprocessing.system_trace import get_min_max, normalize_trace
 from mimesys.preprocessing.pqos_parser import pqos_metrics_dict, PQOS_METRIC_KEYS
+
+# MIMESYS_USE_PQOS=0 drops the three pqos metrics from the metric set, giving
+# the pre-pqos 25-dim layout (per-core CPU + io r/w + LLC + memory-BW r/w).
+# Must match the model's context input_dim (28 with pqos, 25 without).
+_USE_PQOS = os.environ.get("MIMESYS_USE_PQOS", "1") != "0"
 from mimesys.preprocessing.parsers import (
     get_tacc_stats_and_energy_from_benchmark_name,
     get_timestamp,
@@ -235,11 +249,13 @@ def read_metric_file_from_real_app(file_path: str) -> list[dict]:
 
     # pqos is collected as a paired pqos-*.log alongside each stats-*.txt.
     # Load the full per-second series once, then slice into the stats windows.
-    pqos_path = file_path.replace("/stats", "/pqos").replace("stats-", "pqos-").replace(".txt", ".log")
-    try:
-        full_pq = pqos_metrics_dict(pqos_path) if Path(pqos_path).exists() else {}
-    except Exception:
-        full_pq = {}
+    full_pq: dict = {}
+    if _USE_PQOS:
+        pqos_path = file_path.replace("/stats", "/pqos").replace("stats-", "pqos-").replace(".txt", ".log")
+        try:
+            full_pq = pqos_metrics_dict(pqos_path) if Path(pqos_path).exists() else {}
+        except Exception:
+            full_pq = {}
 
     metrics_list = []
     for win_idx, window in enumerate(trace_windows):
@@ -251,22 +267,23 @@ def read_metric_file_from_real_app(file_path: str) -> list[dict]:
             n_steps = len(next(iter(output.values()))) if output else 0
             # Bucket per-second pqos into period-2 means to match the
             # stats-side n_steps; zero-fill if missing.
-            win_start = win_idx * step_size
-            win_end = min(win_start + window_size, len(full_pq.get(PQOS_METRIC_KEYS[0], [])))
-            for k in PQOS_METRIC_KEYS:
-                series = full_pq.get(k, [])
-                if win_end > win_start and series:
-                    chunk = series[win_start:win_end]
-                    if len(chunk) >= 2 * n_steps:
-                        bucketed = [
-                            float(np.mean(chunk[i*2:(i+1)*2])) for i in range(n_steps)
-                        ]
+            if _USE_PQOS:
+                win_start = win_idx * step_size
+                win_end = min(win_start + window_size, len(full_pq.get(PQOS_METRIC_KEYS[0], [])))
+                for k in PQOS_METRIC_KEYS:
+                    series = full_pq.get(k, [])
+                    if win_end > win_start and series:
+                        chunk = series[win_start:win_end]
+                        if len(chunk) >= 2 * n_steps:
+                            bucketed = [
+                                float(np.mean(chunk[i*2:(i+1)*2])) for i in range(n_steps)
+                            ]
+                        else:
+                            # short tail: zero-pad to n_steps
+                            bucketed = (chunk + [0.0] * n_steps)[:n_steps]
+                        output[k] = bucketed
                     else:
-                        # short tail: zero-pad to n_steps
-                        bucketed = (chunk + [0.0] * n_steps)[:n_steps]
-                    output[k] = bucketed
-                else:
-                    output[k] = [0.0] * n_steps
+                        output[k] = [0.0] * n_steps
             metrics_list.append(output)
     return metrics_list
 
@@ -294,21 +311,22 @@ def read_metric_file_per_second(file_path: str) -> list[dict]:
     metrics_output.pop("io", None)
     metrics_output.pop("memory_bandwidth", None)
     metrics_output.pop("avg_cpu_utilizations_total", None)
-    pqos_path = file_path.replace("/stats", "/pqos").replace("stats-", "pqos-").replace(".txt", ".log")
-    try:
-        pq = pqos_metrics_dict(pqos_path) if Path(pqos_path).exists() else {}
-    except Exception:
-        pq = {}
-    n_steps = len(next(iter(metrics_output.values()))) if metrics_output else 0
-    for k in PQOS_METRIC_KEYS:
-        v = list(pq.get(k, []))
-        # pqos polling is often 1 sample short of HPC; pad with the last value
-        # rather than zero-filling the whole vector.
-        if len(v) < n_steps:
-            v = v + [v[-1] if v else 0.0] * (n_steps - len(v))
-        elif len(v) > n_steps:
-            v = v[:n_steps]
-        metrics_output[k] = v
+    if _USE_PQOS:
+        pqos_path = file_path.replace("/stats", "/pqos").replace("stats-", "pqos-").replace(".txt", ".log")
+        try:
+            pq = pqos_metrics_dict(pqos_path) if Path(pqos_path).exists() else {}
+        except Exception:
+            pq = {}
+        n_steps = len(next(iter(metrics_output.values()))) if metrics_output else 0
+        for k in PQOS_METRIC_KEYS:
+            v = list(pq.get(k, []))
+            # pqos polling is often 1 sample short of HPC; pad with the last value
+            # rather than zero-filling the whole vector.
+            if len(v) < n_steps:
+                v = v + [v[-1] if v else 0.0] * (n_steps - len(v))
+            elif len(v) > n_steps:
+                v = v[:n_steps]
+            metrics_output[k] = v
     return [metrics_output]
 
 
@@ -338,15 +356,16 @@ def read_metric_action_datasets_fleetbench(
         metrics_output.pop("memory_bandwidth", None)
         # Merge pqos metrics. pqos produces one sample per slot, aligned with
         # hpc; missing pqos.log yields zero-filled arrays.
-        pqos_file = metric_file.replace("/stats-plan_", "/pqos-plan_").replace(".txt", ".log")
-        try:
-            pqos_d = pqos_metrics_dict(pqos_file) if Path(pqos_file).exists() else {}
-        except Exception:
-            pqos_d = {}
-        hpc_len = len(next(iter(metrics_output.values())))
-        for k in PQOS_METRIC_KEYS:
-            v = pqos_d.get(k, [])
-            metrics_output[k] = list(v) if len(v) == hpc_len else [0.0] * hpc_len
+        if _USE_PQOS:
+            pqos_file = metric_file.replace("/stats-plan_", "/pqos-plan_").replace(".txt", ".log")
+            try:
+                pqos_d = pqos_metrics_dict(pqos_file) if Path(pqos_file).exists() else {}
+            except Exception:
+                pqos_d = {}
+            hpc_len = len(next(iter(metrics_output.values())))
+            for k in PQOS_METRIC_KEYS:
+                v = pqos_d.get(k, [])
+                metrics_output[k] = list(v) if len(v) == hpc_len else [0.0] * hpc_len
         action = FleetBenchAction.from_action_file(action_file)
         weights = action.to_2d_list(transpose=True)   # [window][stressor][thread]
         if len(action.weights) == 1:
@@ -651,18 +670,23 @@ class CustomDataLoader(pl.LightningDataModule):
             # Supplement with high-resource training samples stratified across
             # IO, CPU, LLC and BW. Thresholds are raw-scale, so compare against
             # info["collated_trace"] (clean_trace is normalized to [-1, 1]).
-            # Layout: [0..19]=per-core CPU%, [20]=io, [21]=l3_cache_usage (agg),
-            #         [22]=memory_bandwidth (agg).
-            IO_IDX  = 20
-            LLC_IDX = 21
-            BW_IDX  = 22
-
+            # See the metric-vector layout comment at the top of this module;
+            # combined io/bw are the read+write sums in the 28-dim layout.
             def _raw(d): return d["info"]["collated_trace"]
+            def _io(d):
+                raw = _raw(d)
+                return raw[20] + raw[21] if len(raw) >= 25 else raw[20]
+            def _llc(d):
+                raw = _raw(d)
+                return raw[22] if len(raw) >= 25 else raw[21]
+            def _bw(d):
+                raw = _raw(d)
+                return raw[23] + raw[24] if len(raw) >= 25 else raw[22]
 
-            high_io_train  = [d for d in train_data if _raw(d)[IO_IDX] > io_raw_threshold]
+            high_io_train  = [d for d in train_data if _io(d) > io_raw_threshold]
             high_cpu_train = [d for d in train_data if float(np.mean(_raw(d)[:20])) > cpu_avg_threshold]
-            high_llc_train = [d for d in train_data if _raw(d)[LLC_IDX] > llc_max_threshold]
-            high_bw_train  = [d for d in train_data if _raw(d)[BW_IDX]  > bw_max_threshold]
+            high_llc_train = [d for d in train_data if _llc(d) > llc_max_threshold]
+            high_bw_train  = [d for d in train_data if _bw(d)  > bw_max_threshold]
 
             # Budget = rl_train_ratio × max(len(test_data), rl_kmean_k); the
             # rl_kmean_k floor keeps RL usable with an empty test dir
@@ -849,14 +873,15 @@ class CustomDataLoader(pl.LightningDataModule):
                 continue
             file_items = per_file_index[fname]
             seq_items = file_items[t_start : t_end + 1]
-            metric_seq    = [it["clean_trace"]    for it in seq_items]            # (W, D=23|28)
+            metric_seq    = [it["clean_trace"]    for it in seq_items]            # (W, D=23|25|28)
             D = len(seq_items[0]["collated_trace"]) if seq_items else 23
             has_pqos = (D >= 28)
-            # 28-D layout with pqos columns (sorted-key order):
+            # Split layout (25/28-dim, sorted-key order):
             #   [0..19] per-core CPU, [20] io_read, [21] io_write, [22] l3_cache_usage,
-            #   [23] mem_bw_read, [24] mem_bw_write, [25] pqos_ipc, [26] pqos_llc_kb,
-            #   [27] pqos_misses. Summing io/bw recovers the legacy aggregates.
-            if has_pqos:
+            #   [23] mem_bw_read, [24] mem_bw_write, and with pqos: [25] pqos_ipc,
+            #   [26] pqos_llc_kb, [27] pqos_misses. Summing io/bw recovers the
+            #   legacy aggregates. Legacy 23-dim: [20]=io, [21]=l3, [22]=bw.
+            if D >= 25:
                 raw_seq_4d    = [(sum(it["collated_trace"][:20]) / 20,
                                   it["collated_trace"][20] + it["collated_trace"][21],
                                   it["collated_trace"][22],
@@ -865,7 +890,7 @@ class CustomDataLoader(pl.LightningDataModule):
                 raw_seq_pqos  = [(it["collated_trace"][25],
                                   it["collated_trace"][26],
                                   it["collated_trace"][27])
-                                 for it in seq_items]                              # (W, 3) raw
+                                 for it in seq_items] if has_pqos else None        # (W, 3) raw
             else:
                 raw_seq_4d    = [(sum(it["collated_trace"][:20]) / 20,
                                   it["collated_trace"][-3],
@@ -924,15 +949,13 @@ class CustomDataLoader(pl.LightningDataModule):
             print(f"[rl-kmean] only {len(test_data)} per-sec samples available (<= K={K}); "
                   f"returning all without clustering.")
             return list(test_data)
-        feats = np.array([
-            (
-                sum(d["clean_trace"][:20]) / 20,  # avg CPU%
-                d["clean_trace"][-3],             # io
-                d["clean_trace"][-2],             # l3_cache_usage
-                d["clean_trace"][-1],             # memory_bandwidth
-            )
-            for d in test_data
-        ], dtype=np.float64)
+        def _feat(ct):
+            if len(ct) >= 25:
+                # split layout (25/28-dim): io/bw features are the read+write
+                # sums; pqos columns (if present) are excluded.
+                return (sum(ct[:20]) / 20, ct[20] + ct[21], ct[22], ct[23] + ct[24])
+            return (sum(ct[:20]) / 20, ct[-3], ct[-2], ct[-1])  # legacy 23-dim
+        feats = np.array([_feat(d["clean_trace"]) for d in test_data], dtype=np.float64)
         from sklearn.cluster import KMeans
         print(f"[rl-kmean] clustering {len(test_data)} per-sec test samples → K={K} medoids ...")
         km = KMeans(n_clusters=K, n_init=4, random_state=random_state).fit(feats)

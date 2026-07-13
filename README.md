@@ -146,6 +146,15 @@ uv run python trainer.py +exps=pretrain model_arch=unet
 
 Checkpoints only load into the architecture they were trained with, so pass the matching `model_arch` when resuming or serving older U-Net checkpoints.
 
+**Metric set.** By default the model conditions on 28 metrics (20 per-core CPU%, IO read/write, LLC usage, memory-BW read/write, and three [libpqos](https://github.com/intel/intel-cmt-cat) metrics). Set `MIMESYS_USE_PQOS=0` to train without the pqos metrics (25-dim input) — e.g. when pqos logs aren't available for the corpus:
+
+```bash
+MIMESYS_USE_PQOS=0 uv run python trainer.py +exps=pretrain \
+    model.context.input_dim=25 model.autoencoder.input_dim=25 model.transformer.output_dim=25
+```
+
+The `input_dim`/`output_dim` values in the config must match the metric set (28 with pqos, 25 without). The flag changes how training data is built, so clear any cached `training_data.pkl` / `metrics_range_dict.pkl` in the data directory when switching.
+
 **Multi-GPU**
 
 ```bash
@@ -296,7 +305,14 @@ uv run python -m mimesys.inference \
 
 ### Client
 
-Generate an execution plan (HDF5) from a time-series resource usage trace file. The trace file uses the [HPCPerfStats](https://github.com/TACC/HPCPerfStats) format.
+Generate an execution plan (HDF5) from a time-series resource usage trace. The model conditions on a 28-metric input: 20 per-core CPU%, IO read/write, LLC usage, memory-bandwidth read/write, plus three cache/memory metrics from [libpqos](https://github.com/intel/intel-cmt-cat) (`pqos_ipc`, `pqos_llc_kb`, `pqos_misses`). A trace is therefore a **pair of files**:
+
+- a stats file in the [HPCPerfStats](https://github.com/TACC/HPCPerfStats) format (`stats-<name>.txt`), and
+- a pqos log (`pqos-<name>.log`) sampled at 1 Hz, as produced by the benchmark's built-in pqos profiler.
+
+The client auto-locates the pqos log next to the stats file via the `stats-` → `pqos-` naming convention; use `--pqos_file` to point at one explicitly. If it's missing, the pqos inputs are zero-filled and prediction quality degrades.
+
+The metric set follows the checkpoint: for models trained without pqos metrics (`MIMESYS_USE_PQOS=0`, 25-dim input), pass `--no_pqos` to skip the pqos merge — no pqos log is needed then. `GET /metrics` lists the metrics the loaded checkpoint actually accepts, with units and training ranges.
 
 ```bash
 uv run python -m mimesys.inference.client generate-from-file \

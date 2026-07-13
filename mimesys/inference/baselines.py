@@ -64,8 +64,8 @@ class SingleStressor:
     using a single stressor row.  No training data required.
     """
 
-    def __init__(self, stressor_idx: int = 10,
-                 n_stressors: int = 13, n_threads: int = 20) -> None:
+    def __init__(self, stressor_idx: int = 0,
+                 n_stressors: int = 20, n_threads: int = 20) -> None:
         self.stressor_idx = stressor_idx
         self.n_stressors  = n_stressors
         self.n_threads    = n_threads
