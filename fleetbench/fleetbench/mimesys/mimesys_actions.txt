@@ -1,13 +1,20 @@
-BM_COMPRESSION_ZSTD_DECOMPRESS_Fleet/compression_level:0/window_log:0
-BM_HASHING_Extendcrc32cinternal_Fleet_cold
 BM_HASHING_Computecrc32c_Fleet_cold
 BM_LIBC_Memcpy_Fleet_L1
+BM_LIBC_Memcpy_Fleet_L2
+BM_LIBC_Memcmp_Fleet_LLC
 BM_SIMD_SerialDistanceComputation/num_blocks:256/enable_avx512:false/flush_cache:false
-BM_SIMD_SerialDistanceComputation/num_blocks:512/enable_avx512:false/flush_cache:false
-BM_SWISSMAP_InsertMiss_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:0
-BM_SWISSMAP_InsertManyOrdered_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:0
+BM_SWISSMAP_InsertMiss_Cold<::absl::flat_hash_set, 64>/set_size:262144/density:0
+BM_SWISSMAP_InsertMiss_Cold<::absl::node_hash_set, 64>/set_size:32768/density:0
 BM_SWISSMAP_InsertManyOrdered_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:1
-BM_SWISSMAP_InsertManyUnordered_Cold<::absl::flat_hash_set, 64>/set_size:1048576/density:1
-BM_STRESS_NG_Readahead
-BM_STRESS_NG_Fallocate_4MB
-BM_STRESS_NG_Hdd_1MB
+BM_STRESS_NG_HddRead_1MB_NoSleep
+BM_STRESS_NG_HddRead_1MB_WeightScaled_50ms
+BM_STRESS_NG_HddRead_256KB_WeightScaled_500ms
+BM_STRESS_NG_HddWriteNF_1MB_BurstScaled
+BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_50ms
+BM_STRESS_NG_HddWriteNF_1MB_WeightScaled_25ms
+BM_STRESS_NG_HddWriteNF_256KB_WeightScaled_500ms
+BM_DIRECTMEMSET_32MB_NoSleep
+BM_DIRECTMEMSET_32MB_WeightScaled_50ms
+BM_DIRECTSTREAMSIMD_32MB_NoSleep
+BM_DIRECTSTREAMSIMD_8MB_NoSleep
+BM_HASHING_Extendcrc32c_Fleet_L3_16MB

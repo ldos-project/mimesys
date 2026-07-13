@@ -672,12 +672,10 @@ def _print_json(data):
 
 
 _METRIC_LABELS = {
-    "l3_cache_usage_socket_0":    ("L3 Cache S0",  "MB/s"),
-    "l3_cache_usage_socket_1":    ("L3 Cache S1",  "MB/s"),
-    "memory_bandwidth_socket_0":  ("MemBW S0",     "GB/s"),
-    "memory_bandwidth_socket_1":  ("MemBW S1",     "GB/s"),
-    "io":                         ("IO",            "KB/s"),
-    "avg_cpu_utilizations_total": ("CPU total",    "%"),
+    "l3_cache_usage":             ("L3 Cache",  "MB/s"),
+    "memory_bandwidth":           ("MemBW",     "GB/s"),
+    "io":                         ("IO",        "KB/s"),
+    "avg_cpu_utilizations_total": ("CPU total", "%"),
 }
 
 

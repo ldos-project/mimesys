@@ -225,6 +225,23 @@ def get_memory_bandwidth_from_grouped_trace_per_socket(grouped_trace):
     return [traces_by_socket[s]["read"] + traces_by_socket[s]["write"] for s in traces_by_socket]
 
 
+def get_memory_bandwidth_read_write_per_socket(grouped_trace):
+    """Same as above but returns ([read_bytes_per_socket], [write_bytes_per_socket])."""
+    imc_traces = _select_traces(grouped_trace, _IMC_TRACE_TYPES)
+    traces_by_socket = defaultdict(lambda: defaultdict(int))
+    for channel in imc_traces:
+        data = channel.split()
+        if len(data) < 10:
+            continue
+        socket_id = data[1].split("/")[0]
+        traces_by_socket[socket_id]["read"] += int(data[6]) * 64
+        traces_by_socket[socket_id]["write"] += int(data[7]) * 64
+    traces_by_socket = dict(sorted(traces_by_socket.items()))
+    reads  = [traces_by_socket[s]["read"]  for s in traces_by_socket]
+    writes = [traces_by_socket[s]["write"] for s in traces_by_socket]
+    return reads, writes
+
+
 def get_l3_cache_usage_from_grouped_trace(grouped_trace):
     total = 0
     timestamp = float(grouped_trace["timestamp"][0].split()[0])
@@ -357,10 +374,12 @@ def num_sectors_to_kb(num_sectors: int, sector_size: int = 512) -> int:
 
 
 def calculate_io_utilization_from_list(io_data_list):
+    # Disk device naming varies across hosts (the workload SSD may be sda or
+    # sdb), so sum both; the inactive device idles near zero.
     read_kb_sum = write_kb_sum = 0
     for io_trace in io_data_list:
         line = io_trace.split()
-        if line[1] == "sda":
+        if line[1] in ("sda", "sdb"):
             read_kb_sum += num_sectors_to_kb(int(line[4]))
             write_kb_sum += num_sectors_to_kb(int(line[8]))
     return read_kb_sum, write_kb_sum
@@ -503,7 +522,8 @@ def process_trace_granular(
         if not trace:
             continue
         timestamp = get_timestamp(trace)
-        memory_bandwidths = get_memory_bandwidth_from_grouped_trace_per_socket(trace)
+        bw_reads_per_socket, bw_writes_per_socket = \
+            get_memory_bandwidth_read_write_per_socket(trace)
         try:
             l3_cache_usages = get_l3_cache_usage_from_grouped_trace_per_socket(trace)
         except ValueError as e:
@@ -518,11 +538,18 @@ def process_trace_granular(
             continue
         read_kb_sum, write_kb_sum = calculate_io_utilization_from_list(trace["block"])
 
+        # Aggregate across sockets — per-socket attribution is unreliable on
+        # dual-socket cache-resident workloads (CHA winner-takes-most artifact).
+        memory_bandwidth_read_total  = sum(bw_reads_per_socket)
+        memory_bandwidth_write_total = sum(bw_writes_per_socket)
+        l3_cache_usage_total = sum(l3_cache_usages)
+
         if prev["timestamp"] == 0:
             prev.update({
                 "timestamp": timestamp,
-                **{f"memory_bandwidth_socket_{i}": bw for i, bw in enumerate(memory_bandwidths)},
-                **{f"l3_cache_usage_socket_{i}": lu for i, lu in enumerate(l3_cache_usages)},
+                "memory_bandwidth_read":  memory_bandwidth_read_total,
+                "memory_bandwidth_write": memory_bandwidth_write_total,
+                "l3_cache_usage":   l3_cache_usage_total,
                 "qpi_usage": qpi_usage,
                 "pcie_usage": pcie_usage,
                 "cpu_utilization": cpu_utilization,
@@ -535,27 +562,35 @@ def process_trace_granular(
         if period is not None and delta_time <= period - epsilon:
             continue
 
-        for socket_id, memory_bandwidth in enumerate(memory_bandwidths):
-            bandwidth_diff = (memory_bandwidth - prev[f"memory_bandwidth_socket_{socket_id}"]) / 1e9
-            metrics[f"memory_bandwidth_socket_{socket_id}"].append(
-                bandwidth_diff / delta_time / float(system_spec["Memory BW"]) * 100
-            )
-        for socket_id, l3_cache_usage in enumerate(l3_cache_usages):
-            l3_cache_diff = (l3_cache_usage - prev[f"l3_cache_usage_socket_{socket_id}"]) / 1e6
-            metrics[f"l3_cache_usage_socket_{socket_id}"].append(l3_cache_diff / delta_time)
+        # read/write come from separate iMC counters; combined
+        # `memory_bandwidth` = read+write is kept for backwards compat.
+        bw_read_diff  = (memory_bandwidth_read_total  - prev["memory_bandwidth_read"])  / 1e9
+        bw_write_diff = (memory_bandwidth_write_total - prev["memory_bandwidth_write"]) / 1e9
+        peak_bw = float(system_spec["Memory BW"])
+        bw_read_pct  = bw_read_diff  / delta_time / peak_bw * 100
+        bw_write_pct = bw_write_diff / delta_time / peak_bw * 100
+        metrics["memory_bandwidth_read"].append(bw_read_pct)
+        metrics["memory_bandwidth_write"].append(bw_write_pct)
+        metrics["memory_bandwidth"].append(bw_read_pct + bw_write_pct)
+
+        l3_cache_diff = (l3_cache_usage_total - prev["l3_cache_usage"]) / 1e6
+        metrics["l3_cache_usage"].append(l3_cache_diff / delta_time)
 
         cpu_util_per_core = average_cpu_utilization(prev["cpu_utilization"], cpu_utilization)
         for cpu_id, util in enumerate(cpu_util_per_core):
             metrics[f"avg_cpu_utilizations_core_{cpu_id:02d}"].append(util)
 
-        metrics["io"].append(
-            ((read_kb_sum - prev["read_kb_sum"]) + (write_kb_sum - prev["write_kb_sum"])) / delta_time
-        )
+        io_read_kbps  = (read_kb_sum  - prev["read_kb_sum"])  / delta_time
+        io_write_kbps = (write_kb_sum - prev["write_kb_sum"]) / delta_time
+        metrics["io_read"].append(io_read_kbps)
+        metrics["io_write"].append(io_write_kbps)
+        metrics["io"].append(io_read_kbps + io_write_kbps)
 
         prev.update({
             "timestamp": timestamp,
-            **{f"memory_bandwidth_socket_{i}": bw for i, bw in enumerate(memory_bandwidths)},
-            **{f"l3_cache_usage_socket_{i}": lu for i, lu in enumerate(l3_cache_usages)},
+            "memory_bandwidth_read":  memory_bandwidth_read_total,
+            "memory_bandwidth_write": memory_bandwidth_write_total,
+            "l3_cache_usage":   l3_cache_usage_total,
             "qpi_usage": qpi_usage,
             "pcie_usage": pcie_usage,
             "cpu_utilization": cpu_utilization,

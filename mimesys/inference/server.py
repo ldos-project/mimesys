@@ -95,7 +95,7 @@ class GenerateRequest(BaseModel):
             "Values in raw physical units (%, KB/s, MB, GB/s). See GET /metrics."
         ),
         examples=[{"avg_cpu_utilizations_core_00": 72.5, "io": 3200.0,
-                   "l3_cache_usage_socket_0": 8500.0, "memory_bandwidth_socket_0": 12.3}],
+                   "l3_cache_usage": 8500.0, "memory_bandwidth": 12.3}],
     )
     method: METHOD_CHOICES = Field(
         "diffusion",
@@ -310,17 +310,25 @@ def health():
     }
 
 
+_ARCH_DESCRIPTIONS = {
+    "dit":  "DiT 2D transformer denoiser + Transformer ContextEncoder (DDPM)",
+    "unet": "Temporal-UNet + Transformer ContextEncoder (DDPM)",
+    "mlp":  "MLP denoiser + Transformer ContextEncoder (DDPM)",
+}
+
+
 @app.get("/info", summary="Model, hardware, and configuration metadata")
 def info():
     engine: InferenceEngine = _state["engine"]
     cfg = _state.get("cfg")
+    arch = getattr(cfg, "model_arch", "dit") if cfg is not None else "dit"
     return {
         "model": {
             "checkpoint":      engine.ckpt_meta.get("path"),
             "epoch":           engine.ckpt_meta.get("epoch"),
             "global_step":     engine.ckpt_meta.get("global_step"),
             "weight_source":   engine.ckpt_meta.get("weight_source"),
-            "architecture":    "Temporal-UNet + Transformer ContextEncoder (DDPM)",
+            "architecture":    _ARCH_DESCRIPTIONS.get(arch, arch),
             "diffusion_steps": 25,
             "cfg_guidance":    True,
         },
@@ -455,7 +463,7 @@ def generate_series(req: SeriesRequest):
 async def profile(req: ProfileRequest):
     """
     Submits a profiling job and returns a **job_id** immediately (HTTP 202).
-    The job generates a plan, deploys it to a CloudLab worker, runs the
+    The job generates a plan, deploys it to a profiling worker, runs the
     benchmark, and collects measured hardware metrics — all in the background.
 
     **Requires** `--enable_profiling` at server startup.
@@ -555,7 +563,7 @@ async def profile_result(job_id: str):
 async def profile_series(req: ProfileSeriesRequest):
     """
     Generates T actions from T traces (autoregressive diffusion), packs them into
-    a single H5 execution plan, and runs the benchmark on a CloudLab worker with
+    a single H5 execution plan, and runs the benchmark on a profiling worker with
     ``MIMESYS_ITERS=1 MIMESYS_SLEEP=0`` so each slot is executed
     exactly once without an inter-slot sleep.
 

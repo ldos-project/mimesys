@@ -23,7 +23,20 @@ from dataclasses import dataclass
 
 import paramiko
 
-import config
+# Host config: override via MIMESYS_WORKER_CONFIG_PATH or --config-path
+# (defaults to config.py next to this script); loaded under the name `config`.
+_CFG_PATH = os.environ.get("MIMESYS_WORKER_CONFIG_PATH")
+if "--config-path" in sys.argv:
+    _ci = sys.argv.index("--config-path")
+    _CFG_PATH = sys.argv[_ci + 1]
+    del sys.argv[_ci:_ci + 2]
+if _CFG_PATH:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("config", _CFG_PATH)
+    config = _ilu.module_from_spec(_spec); _spec.loader.exec_module(config)
+    print(f"[config] using {_CFG_PATH}  HOSTS={len(config.HOSTNAMES)}")
+else:
+    import config
 
 
 # Path to the per-host status file written by install_executor.sh.

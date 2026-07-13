@@ -1,4 +1,4 @@
-HOME_PATH=${HOME_PATH:-/users/dhkim}
+HOME_PATH=${HOME_PATH:-$HOME}
 
 # ─── Progress / status tracking ────────────────────────────────────────────
 # Writes a single-line status to $STATUS_FILE so install_remote_dependencies.py
@@ -34,7 +34,8 @@ sudo apt-get install -y \
   libmpfr-dev libsctp-dev libxxhash-dev zlib1g-dev netcat supervisor rsync \
   syslog-ng vim net-tools lsof pigz libmysqlclient-dev libpq-dev autoconf \
   automake libtool gettext librabbitmq-dev rabbitmq-server libibmad-dev \
-  libibumad-dev libev-dev pkg-config libsystemd-dev zip libhdf5-dev hdf5-tools
+  libibumad-dev libev-dev pkg-config libsystemd-dev zip libhdf5-dev hdf5-tools \
+  libnuma-dev libpqos-dev
 
 mark_stage hpcperfstats_build
 cd $HOME_PATH/HPCPerfStats/monitor && \
@@ -70,11 +71,19 @@ bazel version
 
 mark_stage clone_mimesys
 cd $HOME_PATH
-GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone git@github.com:ldos-project/mimesys.git
-cd mimesys
-
-cd $HOME_PATH
-mv mimesys/fleetbench fleetbench
+if [ "${SKIP_CLONE_MIMESYS:-0}" = "1" ]; then
+    # Controller has already rsync'd the local fleetbench to $HOME_PATH/fleetbench.
+    if [ ! -d "$HOME_PATH/fleetbench" ]; then
+        echo "ERROR: SKIP_CLONE_MIMESYS=1 set but $HOME_PATH/fleetbench is missing" >&2
+        exit 1
+    fi
+    echo "  [clone_mimesys] using pre-staged fleetbench at $HOME_PATH/fleetbench"
+else
+    GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone git@github.com:ldos-project/mimesys.git
+    cd mimesys
+    cd $HOME_PATH
+    mv mimesys/fleetbench fleetbench
+fi
 cd fleetbench
 mkdir -p fleetbench/mimesys/execution_plans
 # The mimesys BUILD globs execution_plans/** with allow_empty=False, so we
@@ -97,6 +106,9 @@ python generate_plans.py
 cd -
 mv fleetbench/mimesys/execution_plans .
 mkdir fleetbench/mimesys/execution_plans
+# Re-seed the BUILD-glob placeholder so later `bazel build` invocations
+# succeed; the benchmark skips the empty plan_0.h5.
+touch fleetbench/mimesys/execution_plans/plan_0.h5
 
 mark_stage disable_cpu_freq_scaling
 bash scripts/disable_cpu_freq_scaling.sh

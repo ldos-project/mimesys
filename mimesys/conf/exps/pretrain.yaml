@@ -1,36 +1,36 @@
 # @package _global_
 data:
-  data_path: /home/dhkim/mimesys_training_data/v1
-  action_path: /home/dhkim/mimesys_training_data/v1
-  test_data_path: /home/dhkim/mimesys/artifacts/traces
+  data_path: <FILL_IN_DATA_PATH>
+  action_path: <FILL_IN_DATA_PATH>
+  test_data_path: <FILL_IN_TEST_DATA_PATH>
   aug_factor: 5
   intra_only_aug: true
-  high_io_aug_factor: 10
+  high_io_aug_factor: 1
   io_raw_threshold: 1000.0
   batch_size: 1024
   dataset_size: 100
   test_batch_size: 1
   test_machines:
-  - c220g2-011110.wisc.cloudlab.us
+  - <FILL_IN_TEST_MACHINE_HOSTNAME>
 log:
   project_name: mimesys_pretrain
   run_name: diffusion/mimesys_pretrain_v1
 profiler:
-  user_name: dhkim
-  private_key_path: /home/dhkim/.ssh/id_rsa
+  user_name: <FILL_IN_USERNAME>
+  private_key_path: ~/.ssh/id_rsa
   my_hostname: <FILL_IN_HOSTNAME>
-  destination_path: /home/dhkim/mimesys_profiling_results
-  validation_destination_path: /home/dhkim/mimesys_validation_results
+  destination_path: <FILL_IN_PROFILING_RESULTS_PATH>
+  validation_destination_path: <FILL_IN_VALIDATION_RESULTS_PATH>
 model:
   autoencoder:
     hidden_dim: 16
-    input_dim: 25
+    input_dim: 23
     latent_dim: 10
   context:
     action_dim: 33
     dropout: 0.1
     hidden_dim: 256
-    input_dim: 25
+    input_dim: 23
     num_heads: 4
     num_layers: 6
   diffusion:

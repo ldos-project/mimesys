@@ -1,3 +1,4 @@
+import os
 from functools import partial
 from typing import Union
 from collections import defaultdict, deque
@@ -96,6 +97,73 @@ class MetricsOnlyContextEncoder(nn.Module):
         return self.encoder(context_cond['metric'])
 
 
+class TransformerMetricsOnlyEncoder(nn.Module):
+    """Like TransformerContextEncoder but ignores prev_action: tokenizes the
+    metric vector as M scalar tokens, self-attends across them, mean-pools,
+    projects to context_dim."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.input_dim = int(cfg.input_dim)         # e.g., 28
+        h = int(cfg.hidden_dim)
+        # Per-metric scalar → hidden embedding (shared linear + position id).
+        self.token_proj  = nn.Linear(1, h)
+        self.metric_pos  = nn.Embedding(self.input_dim, h)
+        layers = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=h, nhead=int(cfg.num_heads),
+                dim_feedforward=h * 4, dropout=cfg.dropout,
+                activation="gelu", batch_first=True,
+            ),
+            num_layers=int(cfg.num_layers),
+        )
+        self.encoder = layers
+        self.head = nn.Linear(h, int(cfg.context_dim))
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']                          # (B, M)
+        B, M = metric.shape
+        x = self.token_proj(metric.unsqueeze(-1))                # (B, M, H)
+        pos = torch.arange(M, device=metric.device)
+        x = x + self.metric_pos(pos).unsqueeze(0)                # (B, M, H)
+        x = self.encoder(x)                                       # (B, M, H)
+        x = x.mean(dim=1)                                         # mean-pool tokens
+        return self.head(x)                                       # (B, context_dim)
+
+
+class PerPositionFiLMEncoder(nn.Module):
+    """Encodes per-thread conditioning. Output: (B, context_dim, num_threads).
+    Each position i gets its own context vector derived from:
+      • the per-core CPU% at index i (scalar)
+      • the full global metric vector (23-d, replicated across positions)
+      • a learnable position embedding for index i
+    Inputs are assumed [-1, 1] normalized (as used throughout the pipeline).
+    """
+    def __init__(self, cfg: DictConfig, num_threads: int = 20):
+        super().__init__()
+        self.num_threads = num_threads
+        self.num_metrics = int(cfg.input_dim)
+        hidden = int(cfg.hidden_dim)
+        self.position_embed = nn.Embedding(num_threads, hidden)
+        in_dim = 1 + self.num_metrics + hidden
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.Mish(),
+            nn.Linear(hidden, hidden), nn.Mish(),
+            nn.Linear(hidden, int(cfg.context_dim)),
+        )
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']                                 # (B, M=23)
+        B = metric.shape[0]
+        per_core = metric[:, :self.num_threads].unsqueeze(-1)           # (B, T, 1)
+        global_m = metric.unsqueeze(1).expand(-1, self.num_threads, -1) # (B, T, M)
+        pos_ids  = torch.arange(self.num_threads, device=metric.device)
+        pos_emb  = self.position_embed(pos_ids).unsqueeze(0).expand(B, -1, -1)  # (B, T, H)
+        x = torch.cat([per_core, global_m, pos_emb], dim=-1)            # (B, T, 1+M+H)
+        out = self.encoder(x)                                            # (B, T, context_dim)
+        return out.transpose(1, 2)                                       # (B, context_dim, T)
+
+
 class ConcatContextEncoder(nn.Module):
     """Concat: flatten full action + metrics, project through MLP."""
     def __init__(self, cfg: DictConfig):
@@ -113,6 +181,149 @@ class ConcatContextEncoder(nn.Module):
         action = context_cond['prev_action']     # (B, H, C)
         x = torch.cat([action.flatten(1), metric], dim=-1)
         return self.head(x)
+
+
+class ConcatSymContextEncoder(nn.Module):
+    """Concat with symmetric (sum_row + sum_col) action encoding: permutation-
+    invariant on threads and stressors.
+    Expects action_dim = num_threads + num_stressors (e.g., 20 + 13 = 33)."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(cfg.action_dim + cfg.input_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']          # (B, input_dim)
+        action = context_cond['prev_action']     # (B, H, C)  H=stressors, C=threads
+        sum_row = action.sum(dim=1)              # (B, C)  per-thread total
+        sum_col = action.sum(dim=2)              # (B, H)  per-stressor total
+        action_sym = torch.cat([sum_row, sum_col], dim=1)  # (B, H+C=33)
+        x = torch.cat([action_sym, metric], dim=-1)
+        return self.head(x)
+
+
+class ResidualPrevContextEncoder(nn.Module):
+    """Metrics-only backbone plus a gated additive prev_action residual.
+
+    Supports warm-starting from a prev_none checkpoint: `self.encoder` mirrors
+    MetricsOnlyContextEncoder's architecture and submodule names so its weights
+    load verbatim; `prev_head` starts at zero output."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(cfg.input_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+        # prev_action residual head (full 260-D flattened action → context_dim)
+        self.prev_head = nn.Sequential(
+            nn.Linear(cfg.action_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+        # Zero-init only the residual's last layer so initial output equals
+        # metrics_only. The gate must start non-zero: if both gate and
+        # prev_head's last layer are zero, their gradients are mutually dead
+        # and the pathway can never leave zero.
+        nn.init.zeros_(self.prev_head[-1].weight)
+        nn.init.zeros_(self.prev_head[-1].bias)
+        self.gate = nn.Parameter(torch.ones(1))
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']
+        action = context_cond['prev_action'].flatten(1)   # (B, S*T = 260)
+        base = self.encoder(metric)
+        delta = self.prev_head(action)
+        return base + self.gate * delta
+
+
+class TransformerFullContextEncoder(nn.Module):
+    """Same architecture as TransformerContextEncoder, but feeds the full
+    flattened prev_action through the action projection instead of the 33-D
+    [sum_row, sum_col] aggregation.
+    Expects action_dim = num_stressors * num_threads (e.g., 13 * 20 = 260)."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.metric_encoder = nn.Linear(cfg.input_dim,  cfg.hidden_dim)
+        self.action_encoder = nn.Linear(cfg.action_dim, cfg.hidden_dim)
+        self.encoder = nn.Sequential(
+            nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=cfg.hidden_dim,
+                    nhead=cfg.num_heads,
+                    dim_feedforward=cfg.hidden_dim * 4,
+                    dropout=cfg.dropout,
+                    activation="gelu",
+                ),
+                num_layers=cfg.num_layers,
+            ),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, lam=0.1, sensitivity_drop_p=0.0):
+        metric = context_cond['metric']
+        action = context_cond['prev_action']     # (B, H=stressors, C=threads)
+        metric = metric * (torch.rand_like(metric) > sensitivity_drop_p)
+        metric_emb = self.metric_encoder(metric)
+
+        action_flat = action.flatten(1)          # (B, H*C = 260)
+        action_emb = self.action_encoder(action_flat)
+
+        x = (1 - lam) * metric_emb + lam * action_emb
+        x = nn.Mish()(x)
+        return self.encoder(x)
+
+
+class TransformerTokensContextEncoder(nn.Module):
+    """Multi-token transformer encoder over per-thread tokens.
+
+    Tokenizes prev_action as 20 per-thread tokens (each a 13-D stressor
+    vector), prepends a [METRIC] token, adds learnable positional embeddings,
+    and runs a self-attention stack. The [METRIC] token output is the context
+    embedding; unlike ConcatTransformerContextEncoder there is no raw-concat
+    skip.
+    Expects action_dim = num_stressors * num_threads (e.g., 260)."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.n_stressors = int(cfg.get("n_stressors", 13))
+        self.n_threads   = int(cfg.get("n_threads",   20))
+        H = cfg.hidden_dim
+
+        self.thread_proj = nn.Linear(self.n_stressors, H)
+        self.metric_proj = nn.Linear(cfg.input_dim,    H)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_threads + 1, H))
+        nn.init.normal_(self.pos_embed, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=H, nhead=cfg.num_heads,
+            dim_feedforward=H * 4, dropout=cfg.dropout,
+            activation="gelu", batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.num_layers)
+        self.head = nn.Linear(H, cfg.context_dim)
+
+    def forward(self, context_cond, lam=0.1, sensitivity_drop_p=0.0):
+        metric = context_cond['metric']                   # (B, input_dim)
+        action = context_cond['prev_action']              # (B, C=n_stressors, H=n_threads)
+        metric = metric * (torch.rand_like(metric) > sensitivity_drop_p)
+
+        thread_input = action.transpose(1, 2)             # (B, H=n_threads, C=n_stressors)
+        thread_tok = self.thread_proj(thread_input)       # (B, H, hidden_dim)
+        metric_tok = self.metric_proj(metric).unsqueeze(1)  # (B, 1, hidden_dim)
+        x = torch.cat([metric_tok, thread_tok], dim=1)    # (B, H+1, hidden_dim)
+        x = x + self.pos_embed
+        x = self.encoder(x)                               # (B, H+1, hidden_dim)
+        pooled = x[:, 0]                                  # [METRIC] token output
+        return self.head(pooled)
 
 
 class FiLMContextEncoder(nn.Module):
@@ -137,6 +348,103 @@ class FiLMContextEncoder(nn.Module):
         fused = ea * (1 + gamma) + beta                 # (B, hidden_dim)
 
         return self.head(F.mish(fused))                 # (B, context_dim)
+
+
+class AdditionContextEncoder(nn.Module):
+    """Addition: project action and metric to same hidden dim, sum, MLP head."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.metric_proj = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+        self.action_proj = nn.Linear(cfg.action_dim, cfg.hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']
+        action = context_cond['prev_action'].flatten(1)
+        em = self.metric_proj(metric)
+        ea = self.action_proj(action)
+        return self.head(F.mish(em + ea))
+
+
+class GatedContextEncoder(nn.Module):
+    """Gated addition: metric produces a sigmoid gate over the action embedding."""
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.metric_proj = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+        self.action_proj = nn.Linear(cfg.action_dim, cfg.hidden_dim)
+        self.gate_fc     = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.Mish(),
+            nn.Linear(cfg.hidden_dim, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, **kwargs):
+        metric = context_cond['metric']
+        action = context_cond['prev_action'].flatten(1)
+        em = self.metric_proj(metric)
+        ea = self.action_proj(action)
+        gate = torch.sigmoid(self.gate_fc(metric))
+        return self.head(F.mish(em + gate * ea))
+
+
+class ConcatTransformerContextEncoder(nn.Module):
+    """Per-thread transformer + raw concat skip → MLP head.
+
+    Transformer attends over (H+1) tokens: one [METRIC] token plus one token
+    per thread (C-dim stressor vector projected to hidden_dim). The pooled
+    [METRIC] output is concatenated with the raw flat action + raw metric and
+    projected to context_dim.
+    """
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.n_stressors = int(cfg.get("n_stressors", 13))
+        self.n_threads   = int(cfg.get("n_threads",   20))
+        H = cfg.hidden_dim
+
+        self.thread_proj = nn.Linear(self.n_stressors, H)
+        self.metric_proj = nn.Linear(cfg.input_dim, H)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_threads + 1, H))
+        nn.init.normal_(self.pos_embed, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=H, nhead=cfg.num_heads,
+            dim_feedforward=H * 4, dropout=cfg.dropout,
+            activation="gelu", batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.num_layers)
+
+        head_in = H + cfg.action_dim + cfg.input_dim
+        self.head = nn.Sequential(
+            nn.Linear(head_in, H),
+            nn.Mish(),
+            nn.Linear(H, H),
+            nn.Mish(),
+            nn.Linear(H, cfg.context_dim),
+        )
+
+    def forward(self, context_cond, lam=0.1, sensitivity_drop_p=0.0):
+        metric = context_cond['metric']           # (B, input_dim)
+        action = context_cond['prev_action']      # (B, C=n_stressors, H=n_threads)
+        if sensitivity_drop_p > 0:
+            metric = metric * (torch.rand_like(metric) > sensitivity_drop_p)
+
+        thread_input = action.transpose(1, 2)             # (B, H, C)
+        thread_tok = self.thread_proj(thread_input)       # (B, H, hidden_dim)
+        metric_tok = self.metric_proj(metric).unsqueeze(1)
+        x = torch.cat([metric_tok, thread_tok], dim=1)    # (B, H+1, hidden_dim)
+        x = x + self.pos_embed
+        x = self.encoder(x)                               # (B, H+1, hidden_dim)
+        pooled = x[:, 0]                                  # [METRIC] token output
+
+        flat_action = action.flatten(1)                   # (B, C*H)
+        skip = torch.cat([pooled, flat_action, metric], dim=-1)
+        return self.head(skip)
 
 
 class ActionAutoencoder(nn.Module):
@@ -311,28 +619,38 @@ class TemporalResnetBlockCond(nn.Module):
         norm_fn=RMSNorm,
         dropout=0.0,
         use_scale_shift=True,
+        kernel_size=None,
     ):
         super().__init__()
         self.use_scale_shift = use_scale_shift
+        # Env override for kernel size: MIMESYS_RES_KERNEL=1 → pointwise (no
+        # spatial mixing across the categorical stressor axis). Default 3.
+        if kernel_size is None:
+            kernel_size = int(os.environ.get("MIMESYS_RES_KERNEL", "3"))
+        pad = (kernel_size - 1) // 2
 
         self.block1 = nn.ModuleList(
             [
-                nn.Conv1d(in_chn, out_chn, kernel_size=3, padding=1),
+                nn.Conv1d(in_chn, out_chn, kernel_size=kernel_size, padding=pad),
                 norm_fn(out_chn),
                 nn.Mish(),
                 nn.Dropout(dropout),
             ]
         )
         self.block2 = nn.Sequential(
-            nn.Conv1d(out_chn, out_chn, kernel_size=3, padding=1),
+            nn.Conv1d(out_chn, out_chn, kernel_size=kernel_size, padding=pad),
             norm_fn(out_chn),
             nn.Mish(),
             nn.Dropout(dropout),
         )
+        # Shared FiLM head for both broadcast (2D context) and per-position
+        # (3D context) paths; the rearrange to (B, C, L) happens in
+        # _project_film() since it depends on the context shape. Checkpoints
+        # saved with the old Sequential(Mish, Linear, Rearrange) layout still
+        # load (Rearrange had no params).
         self.time_context_mlp = nn.Sequential(
             nn.Mish(),
             nn.Linear(time_context_dim, out_chn * 2 if use_scale_shift else out_chn),
-            Rearrange("b c -> b c 1"),
         )
         self.residual_conv = (
             nn.Conv1d(in_chn, out_chn, kernel_size=1)
@@ -340,22 +658,36 @@ class TemporalResnetBlockCond(nn.Module):
             else nn.Identity()
         )
 
+    def _project_film(self, t, context):
+        """Returns FiLM proj of shape (B, C, L). L=1 for broadcast, L=position-count for per-position."""
+        if context.dim() == 3:
+            # Per-position: context (B, context_dim, L). Apply the SAME Linear per-position.
+            B, _, L = context.shape
+            t_ext = t.unsqueeze(-1).expand(-1, -1, L)            # (B, time_dim, L)
+            tc = torch.cat((t_ext, context), dim=1)              # (B, time_dim+context_dim, L)
+            tc = tc.transpose(1, 2)                               # (B, L, time_dim+context_dim)
+            out = self.time_context_mlp(tc)                       # (B, L, 2*out_chn)
+            return out.transpose(1, 2)                            # (B, 2*out_chn, L)
+        else:
+            tc = torch.cat((t, context), dim=1)                  # (B, time_dim+context_dim)
+            return self.time_context_mlp(tc).unsqueeze(-1)        # (B, 2*out_chn, 1)
+
     def forward(self, x, t, context):
         """
         x: batch_size x state_chn x horizon
         t: batch_size x time_dim
-        context: batch_size x context_dim
+        context: batch_size x context_dim  (broadcast FiLM)
+                 or batch_size x context_dim x L  (per-position FiLM)
         """
-        t_context = torch.cat((t, context), dim=1)
-
         out = x.clone()
         for layer in self.block1:
             if isinstance(layer, nn.Mish):
+                proj = self._project_film(t, context)
                 if self.use_scale_shift:
-                    scale, shift = self.time_context_mlp(t_context).chunk(2, dim=1)
+                    scale, shift = proj.chunk(2, dim=1)
                     out = out * (1 + scale) + shift
                 else:
-                    out = out + self.time_context_mlp(t_context)
+                    out = out + proj
             out = layer(out)
 
         out = self.block2(out)
@@ -390,6 +722,22 @@ class TemporalUnetCond(nn.Module):
             self.context_encoding = FiLMContextEncoder(context_args)
         elif _encoder_type == 'concat':
             self.context_encoding = ConcatContextEncoder(context_args)
+        elif _encoder_type == 'concat_sym':
+            self.context_encoding = ConcatSymContextEncoder(context_args)
+        elif _encoder_type == 'addition':
+            self.context_encoding = AdditionContextEncoder(context_args)
+        elif _encoder_type == 'gated':
+            self.context_encoding = GatedContextEncoder(context_args)
+        elif _encoder_type == 'concat_transformer':
+            self.context_encoding = ConcatTransformerContextEncoder(context_args)
+        elif _encoder_type == 'transformer_full':
+            self.context_encoding = TransformerFullContextEncoder(context_args)
+        elif _encoder_type == 'transformer_metrics_only':
+            self.context_encoding = TransformerMetricsOnlyEncoder(context_args)
+        elif _encoder_type == 'transformer_tokens':
+            self.context_encoding = TransformerTokensContextEncoder(context_args)
+        elif _encoder_type == 'residual_prev':
+            self.context_encoding = ResidualPrevContextEncoder(context_args)
         else:  # 'transformer' (default, existing behaviour)
             self.context_encoding = TransformerContextEncoder(context_args)
 
@@ -425,6 +773,12 @@ class TemporalUnetCond(nn.Module):
                 nn.Linear(time_dim * 4, time_dim),
             )
 
+        # Pointwise mode (MIMESYS_RES_KERNEL=1) → skip spatial downsampling too
+        # since the stressor axis has no neighbor structure to aggregate.
+        _pointwise = int(os.environ.get("MIMESYS_RES_KERNEL", "3")) == 1
+        _DownCls   = nn.Identity if _pointwise else DownSample
+        _UpCls     = nn.Identity if _pointwise else UpSample
+
         self.down_layers = nn.ModuleList([])
         for index, (in_dim, out_dim) in enumerate(in_out):
             self.down_layers.append(
@@ -434,10 +788,9 @@ class TemporalUnetCond(nn.Module):
                         t_res_block(out_dim, out_dim),
                         Residual(PreNorm(RMSNorm(out_dim), attn_block(out_dim))),
                         (
-                            DownSample(out_dim)
-                            if index < len(in_out) - 1
+                            _DownCls(out_dim) if _DownCls is not nn.Identity
                             else nn.Identity()
-                        ),
+                        ) if index < len(in_out) - 1 else nn.Identity(),
                     ]
                 )
             )
@@ -464,22 +817,73 @@ class TemporalUnetCond(nn.Module):
                             )
                         ),
                         (
-                            UpSample(in_dim)
-                            if index < len(in_out) - 1
+                            _UpCls(in_dim) if _UpCls is not nn.Identity
                             else nn.Identity()
-                        ),  # if condition will always be true
+                        ) if index < len(in_out) - 1 else nn.Identity(),
                     ]
                 )
             )
 
         in_dim, out_dim = in_out[0]
+        _ok = int(os.environ.get("MIMESYS_RES_KERNEL", "3"))
+        _opad = (_ok - 1) // 2
         self.output_layer = nn.Sequential(
-            nn.Conv1d(out_dim, out_dim, kernel_size=3, padding=1),
+            nn.Conv1d(out_dim, out_dim, kernel_size=_ok, padding=_opad),
             RMSNorm(out_dim),
             nn.Mish(),
             nn.Dropout(dropout),
             nn.Conv1d(out_dim, in_dim, kernel_size=1),
         )
+
+        # Optional socket-id positional embedding (see forward for details).
+        self.use_socket_embed = bool(getattr(context_args, 'use_socket_embed', False))
+        if self.use_socket_embed:
+            self.socket_id_embed = nn.Embedding(3, input_dim)
+
+        # Optional per-thread channel conditioning: adds 1 input channel with
+        # the per-core CPU value at each thread's position plus 3 broadcast
+        # channels for global io / l3 / bw, so the first conv sees per-core
+        # conditioning aligned with thread positions. cond["metric"] is ordered
+        # alphabetically by metric name: indices 0..19 = per-core CPU
+        # core_00..core_19, 20 = io, 21 = l3_cache_usage, 22 = memory_bandwidth.
+        self.use_per_thread_cond = bool(getattr(context_args, 'use_per_thread_cond', False))
+        if self.use_per_thread_cond:
+            self._per_thread_n_extra = 4    # per-core (1) + io (1) + llc (1) + bw (1)
+            # 1x1 conv back to input_dim so the U-Net body is unchanged.
+            self.input_proj = nn.Conv1d(input_dim + self._per_thread_n_extra,
+                                         input_dim, kernel_size=1)
+
+        # Optional per-position FiLM: a 3D context (B, context_dim, num_threads)
+        # is downsampled in sync with x and injected as scale/shift at every
+        # resnet block. The global ContextEncoder is still built (legacy
+        # broadcast path); with this flag on, blocks receive the per-position
+        # context instead.
+        self.use_per_position_film = bool(getattr(context_args, 'use_per_position_film', False))
+        if self.use_per_position_film:
+            self.per_position_encoder = PerPositionFiLMEncoder(context_args)
+
+        # Optional per-thread cross-attention conditioning: each thread position
+        # gets a learned query that attends over the metric tokens (one token
+        # per metric, with learned positional embedding); the attention output
+        # (B, T_threads, D_extra) is concatenated to the input action as extra
+        # channels.
+        self.use_cross_attn_cond = bool(getattr(context_args, 'use_cross_attn_cond', False))
+        if self.use_cross_attn_cond:
+            num_threads = int(getattr(context_args, 'cross_attn_num_threads', 20))
+            num_metrics = int(getattr(context_args, 'input_dim', 23))
+            xa_dim      = int(getattr(context_args, 'cross_attn_dim', 64))
+            xa_heads    = int(getattr(context_args, 'cross_attn_heads', 4))
+            xa_extra    = int(getattr(context_args, 'cross_attn_extra_channels', 8))
+            self._cross_attn_num_threads = num_threads
+            self._cross_attn_num_metrics = num_metrics
+            self.metric_token_proj = nn.Linear(1, xa_dim)
+            self.metric_token_pos = nn.Embedding(num_metrics, xa_dim)
+            self.thread_query = nn.Parameter(torch.randn(num_threads, xa_dim) * 0.02)
+            self.cross_attn = nn.MultiheadAttention(xa_dim, xa_heads, batch_first=True)
+            self.cross_attn_out = nn.Linear(xa_dim, xa_extra)
+            self._cross_attn_xa_extra = xa_extra
+            self.cross_attn_input_proj = nn.Conv1d(input_dim + xa_extra,
+                                                   input_dim, kernel_size=1)
 
     def forward(self, x, t, context_cond, cfg_mask):
         """
@@ -491,33 +895,106 @@ class TemporalUnetCond(nn.Module):
         current_h = x.shape[2]
 
         next_power_of_2 = 2 ** (current_h - 1).bit_length()
+        # Build per-thread conditioning channels before padding so the per-core
+        # values stay aligned with thread positions.
+        if self.use_per_thread_cond:
+            metric = context_cond.get("metric")     # (B, 23) — alphabetical order
+            B = metric.shape[0]
+            # cfg_mask drops the conditioning (matches the context drop below).
+            cfg_mask_v = cfg_mask.view(-1, 1)
+            per_core = metric[:, :20] * cfg_mask_v          # (B, 20), aligned 1:1 with threads
+            io_b   = (metric[:, 20] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
+            l3_b   = (metric[:, 21] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
+            bw_b   = (metric[:, 22] * cfg_mask.view(-1)).unsqueeze(-1).expand(-1, current_h)
+            extra = torch.stack([per_core[:, :current_h], io_b, l3_b, bw_b], dim=1)  # (B, 4, L)
+            x = torch.cat([x, extra], dim=1)               # (B, input_dim+4, L)
+
+        # Per-thread cross-attention to metric tokens.
+        if self.use_cross_attn_cond:
+            metric = context_cond.get("metric")    # (B, num_metrics)
+            B = metric.shape[0]
+            cfg_mask_v = cfg_mask.view(-1, 1, 1)
+            tokens = self.metric_token_proj(metric.unsqueeze(-1))  # (B, num_metrics, xa_dim)
+            pos_ids = torch.arange(self._cross_attn_num_metrics, device=metric.device)
+            tokens = tokens + self.metric_token_pos(pos_ids).unsqueeze(0)
+            tokens = tokens * cfg_mask_v
+            q = self.thread_query.unsqueeze(0).expand(B, -1, -1)   # (B, num_threads, xa_dim)
+            attn_out, _ = self.cross_attn(q, tokens, tokens)        # (B, num_threads, xa_dim)
+            extra = self.cross_attn_out(attn_out)                   # (B, num_threads, xa_extra)
+            extra = extra.transpose(1, 2)                           # (B, xa_extra, num_threads)
+            # Match unpadded thread length (current_h == num_threads expected)
+            extra = extra[..., :current_h]
+            x = torch.cat([x, extra], dim=1)                        # (B, input_dim+xa_extra, L)
+
         if current_h != next_power_of_2:
             # Calculate the padding needed for both sides (left and right)
             pad_size = next_power_of_2 - current_h
             # Apply padding to reach the next power of 2
             x = F.pad(x, (0, pad_size))
 
+        if self.use_per_thread_cond:
+            # Project back to input_dim channels.
+            x = self.input_proj(x)
+        elif self.use_cross_attn_cond:
+            x = self.cross_attn_input_proj(x)
+
+        # Inject socket-id embedding (positional) into the channel dim of x.
+        if self.use_socket_embed:
+            L = x.shape[2]
+            pos = torch.arange(L, device=x.device)
+            socket_ids = torch.where(
+                pos < 10, torch.tensor(0, device=x.device, dtype=torch.long),
+                torch.where(pos < 20, torch.tensor(1, device=x.device, dtype=torch.long),
+                                       torch.tensor(2, device=x.device, dtype=torch.long))
+            )
+            emb = self.socket_id_embed(socket_ids)         # (L, input_dim)
+            # Broadcast-add to x of shape (B, input_dim, L): transpose emb → (input_dim, L)
+            x = x + emb.T.unsqueeze(0)
+
         t = self.time_encoding(t)
 
         context = self.context_encoding(context_cond)
         context[cfg_mask == 0] = 0
 
+        # Per-position context (B, context_dim, num_threads), padded to x's
+        # length and pooled in lockstep with x through the U-Net. The global
+        # ContextEncoder output is additively merged so both encoders'
+        # parameters are exercised (otherwise DDP flags the unused encoder).
+        if self.use_per_position_film:
+            pp_ctx = self.per_position_encoder(context_cond)               # (B, C, T_threads)
+            pp_ctx = pp_ctx + context.unsqueeze(-1)                         # +(B, C, 1) broadcast
+            pp_ctx = pp_ctx * cfg_mask.view(-1, 1, 1)                       # zero out masked
+            if pp_ctx.shape[-1] != next_power_of_2:
+                pp_ctx = F.pad(pp_ctx, (0, next_power_of_2 - pp_ctx.shape[-1]))
+        else:
+            pp_ctx = None
+
+        def _ctx(at_layer):
+            """Return the context tensor a resnet block should use at its current
+            spatial resolution: per-position when enabled, else the global vector."""
+            return pp_ctx if self.use_per_position_film else context
+
         h = []
         for block1, block2, attention, downsample in self.down_layers:
-            x = block1(x, t, context)
-            x = block2(x, t, context)
+            x = block1(x, t, _ctx(None))
+            x = block2(x, t, _ctx(None))
             x = attention(x)
             h.append(x)
             x = downsample(x)
-        x = self.middle_layers[0](x, t, context)
+            # Pool the per-position context to match the new spatial dim of x.
+            if self.use_per_position_film and not isinstance(downsample, nn.Identity):
+                pp_ctx = F.avg_pool1d(pp_ctx, kernel_size=2, stride=2)
+        x = self.middle_layers[0](x, t, _ctx(None))
         x = self.middle_layers[1](x)
-        x = self.middle_layers[2](x, t, context)
+        x = self.middle_layers[2](x, t, _ctx(None))
 
         for block1, block2, attention, upsample in self.up_layers:
-            x = block1(torch.cat((x, h.pop()), dim=1), t, context)
-            x = block2(x, t, context)
+            x = block1(torch.cat((x, h.pop()), dim=1), t, _ctx(None))
+            x = block2(x, t, _ctx(None))
             x = attention(x)
             x = upsample(x)
+            if self.use_per_position_film and not isinstance(upsample, nn.Identity):
+                pp_ctx = F.interpolate(pp_ctx, scale_factor=2.0, mode='nearest')
 
         x = self.output_layer(x)
         # If we padded earlier, remove the padding now to return to original size

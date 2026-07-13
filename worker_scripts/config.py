@@ -14,14 +14,11 @@ LOCAL_HOME_DIR = "/home/<FILLME>"
 REMOTE_HOME_DIR = "/users/<FILLME>"
 
 # Controller hostname/IP that workers scp results back to. Must be reachable
-# from each worker (so don't use "localhost").
+# from each worker (so don't use "localhost" — use the public DNS the workers
+# can resolve, or an IP).
 MY_HOSTNAME = "<FILLME>"
 
 # Hosts to initialize (install_remote_dependencies.py) and to profile against
 # during active-learning rounds (collect_training_data.py).
 HOSTNAMES = [
 ]
-
-# Plans-per-machine per data collection round. Round size is
-# PER_MACHINE_BATCH * len(HOSTNAMES) (e.g. 16 * 4 hosts = 64 plans/round).
-PER_MACHINE_BATCH = 16

@@ -17,7 +17,7 @@ Usage
     )
 
     pred = engine.generate_step(
-        trace_raw={"io": 3000, "l3_cache_usage_socket_0": 9000},
+        trace_raw={"io": 3000, "l3_cache_usage": 9000},
         method="diffusion",
     )
 """
@@ -42,19 +42,15 @@ ACTION_THREADS:   int = 20
 METRIC_KEYS: list[str] = [
     *[f"avg_cpu_utilizations_core_{i:02d}" for i in range(20)],
     "io",
-    "l3_cache_usage_socket_0",
-    "l3_cache_usage_socket_1",
-    "memory_bandwidth_socket_0",
-    "memory_bandwidth_socket_1",
+    "l3_cache_usage",     # socket-aggregated
+    "memory_bandwidth",   # socket-aggregated
 ]
 
 METRIC_UNITS: dict[str, str] = {
     **{f"avg_cpu_utilizations_core_{i:02d}": "%" for i in range(20)},
-    "io":                        "KB/s",
-    "l3_cache_usage_socket_0":   "MB",
-    "l3_cache_usage_socket_1":   "MB",
-    "memory_bandwidth_socket_0": "GB/s",
-    "memory_bandwidth_socket_1": "GB/s",
+    "io":               "KB/s",
+    "l3_cache_usage":   "MB",
+    "memory_bandwidth": "GB/s",
 }
 
 STRESSOR_NAMES: list[str] = [
@@ -112,7 +108,8 @@ class InferenceEngine:
         engine._build_baselines(dataloader)
 
         # Load model
-        model = initialize_diffusion_model(cfg.model, model_arch="unet").to(device)
+        model_arch = getattr(cfg, "model_arch", "dit")
+        model = initialize_diffusion_model(cfg.model, model_arch=model_arch).to(device)
         ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
 
         if "ema_state_dict" in ckpt:
@@ -146,14 +143,22 @@ class InferenceEngine:
         """
         Convert ``{metric_name: raw_value}`` → normalised (trace_dim,) float32 in [−1, 1].
         Missing keys default to 0; values outside the training range are clipped to ±1.
+        Mode is read from ``MIMESYS_NORM_MODE`` (linear|log) to match training.
         """
+        import math, os
+        mode = os.environ.get("MIMESYS_NORM_MODE", "linear").lower()
         vec = []
         for key in METRIC_KEYS:
             raw_val = raw.get(key, 0.0)
             lo, hi  = (float(self.trace_range[key][0]),
                        float(self.trace_range[key][1])) if key in self.trace_range else (0.0, 1.0)
             if hi > lo:
-                norm = max(-1.0, min(1.0, (raw_val - lo) / (hi - lo) * 2 - 1))
+                if mode == "log":
+                    log_max = math.log1p(hi - lo)
+                    s = max(0.0, raw_val - lo)
+                    norm = max(-1.0, min(1.0, math.log1p(s) / log_max * 2 - 1))
+                else:
+                    norm = max(-1.0, min(1.0, (raw_val - lo) / (hi - lo) * 2 - 1))
             else:
                 norm = 0.0
             vec.append(norm)

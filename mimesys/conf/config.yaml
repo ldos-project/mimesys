@@ -4,3 +4,6 @@ defaults:
   - data: base
   - log: base
   - profiler: base
+
+# Denoiser architecture: dit (default) | unet | mlp
+model_arch: dit

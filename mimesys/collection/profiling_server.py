@@ -18,6 +18,29 @@ import re
 import numpy as np
 
 from mimesys.preprocessing.parsers import parse_trace_file, process_trace_all
+from mimesys.preprocessing.pqos_parser import pqos_metrics_dict, PQOS_METRIC_KEYS
+
+
+def _merge_pqos_into_metrics(profiled_metrics, stats_path):
+    """Merge metrics from the pqos-*.log paired with stats_path into profiled_metrics."""
+    import os
+    pqos_path = stats_path.replace("/stats-", "/pqos-").replace(".txt", ".log")
+    if not os.path.exists(pqos_path):
+        return profiled_metrics
+    try:
+        pq = pqos_metrics_dict(pqos_path)
+    except Exception:
+        return profiled_metrics
+    n = len(next(iter(profiled_metrics.values()))) if profiled_metrics else 0
+    for k in PQOS_METRIC_KEYS:
+        v = pq.get(k, [])
+        # Match the HPC metric length so EMD compares equal-length arrays.
+        if len(v) == n:
+            profiled_metrics[k] = list(v)
+        elif len(v) > 0:
+            arr = list(v)[:n] + [0.0] * max(0, n - len(v))
+            profiled_metrics[k] = arr
+    return profiled_metrics
 
 import json
 from collections import defaultdict
@@ -39,6 +62,19 @@ class ProfileRequest(BaseModel):
     logger: Optional[Logger] = None
     model_type: str = "ema"
     low_resource_penalty_weight: float = 0.0  # blend in relative L1 to penalize low-target errors more
+    membw_reward_weight: float = 1.0  # multiplier on memory_bandwidth L1 reward term (socket-aggregated)
+    llc_reward_weight: float = 1.0    # multiplier on l3_cache_usage L1 reward term (socket-aggregated)
+    io_reward_weight: float = 1.0     # multiplier on io L1 reward term (applied in _parse_local_stats)
+    cpu_reward_weight: float = 1.0    # multiplier on avg_cpu_utilizations* L1 reward terms
+    # Per-metric measurement slice: keep entries where (m_idx % period == offset).
+    # Defaults (3, 1) match the 2-window [prev_state, curr, sleep] deploy; use
+    # (2, 0) for 1-window deploys (train.ddpo.skip_prev_state=True).
+    reward_slice_period: int = 3
+    reward_slice_offset: int = 1
+    # If True, the per-sample reward is the flat mean across all metric keys
+    # (per-core CPU dominates at 20/23 keys). Default False uses the
+    # family-balanced weighted mean (cpu collapses to a single family).
+    use_raw_mean_reward: bool = False
 
     class Config:
         arbitrary_types_allowed = True
@@ -100,19 +136,40 @@ class Profiler:
                 f"&& rm chunk_{host_idx}.zip"
             ))
 
+            # Forward MIMESYS_* env to the worker. The binary only writes
+            # stats-plan_*.txt when MIMESYS_INTERNAL_PROFILING=1.
+            mimesys_iters = os.environ.get("MIMESYS_ITERS", "4")
+            internal_prof = os.environ.get("MIMESYS_INTERNAL_PROFILING", "1")
+            env_prefix = f"MIMESYS_ITERS={mimesys_iters} MIMESYS_INTERNAL_PROFILING={internal_prof}"
+            slot_us = os.environ.get("MIMESYS_SLOT_US")
+            if slot_us:
+                env_prefix += f" MIMESYS_SLOT_US={slot_us}"
+            sleep_env = os.environ.get("MIMESYS_SLEEP")
+            if sleep_env is not None:
+                env_prefix += f" MIMESYS_SLEEP={sleep_env}"
+
+            # Clear stale results first so a skipped write pulls nothing
+            # rather than a stale stats file.
+            machine.run_command(client=client, command=(
+                f"sudo rm -f /users/{self.user_name}/results/stats-plan_*.txt "
+                f"/users/{self.user_name}/results/pqos-plan_*.log 2>/dev/null; true"
+            ))
+
             # Run benchmark synchronously (waits for completion)
             print(f"Chunk {host_idx}: running benchmark on {machine.hostname} ({len(plan_files)} plans)...")
             machine.run_command(client=client, command=(
                 f"cd /users/{self.user_name}/fleetbench && "
-                f"bash collect_mimesys_data.sh > ~/benchmark.log 2>&1"
+                f"{env_prefix} bash collect_mimesys_data.sh > ~/benchmark.log 2>&1"
             ))
             print(f"Chunk {host_idx}: benchmark done on {machine.hostname}")
 
-            # Pull stats files via SFTP
+            # Pull stats and paired pqos files via SFTP; the pqos logs feed
+            # _merge_pqos_into_metrics downstream.
             chunk_stats_dir = os.path.join(local_stats_dir, f"chunk_{host_idx}")
             os.makedirs(chunk_stats_dir, exist_ok=True)
             _, stdout, _ = client.exec_command(
-                f"ls /users/{self.user_name}/results/stats-plan_*.txt 2>/dev/null"
+                f"ls /users/{self.user_name}/results/stats-plan_*.txt "
+                f"/users/{self.user_name}/results/pqos-plan_*.log 2>/dev/null"
             )
             remote_files = stdout.read().decode().strip().splitlines()
             count = 0
@@ -123,7 +180,7 @@ class Profiler:
                 local_path = os.path.join(chunk_stats_dir, os.path.basename(remote_path))
                 sftp.get(remote_path, local_path)
                 count += 1
-            print(f"Chunk {host_idx}: pulled {count} stats files from {machine.hostname}")
+            print(f"Chunk {host_idx}: pulled {count} stats+pqos files from {machine.hostname}")
             return count
         finally:
             machine.close_connection(scp=sftp, client=client)
@@ -158,20 +215,52 @@ class Profiler:
 
         print(f"File {file_path} transferred to {machine.hostname}")
 
+        expected_plan_count = sum(1 for _ in os.listdir(plan_path) if _.endswith(".h5"))
+
         # Run the command on the remote machine
-        print(f"Start running command on {machine.hostname} with {os.path.basename(file_path)}")
-        # Unzip the file and remove the zip file
-        command=f"cd {remote_execution_plan_path} && rm *.h5 2>/dev/null || true && unzip -o {os.path.basename(file_path)} && rm {os.path.basename(file_path)}"
+        print(f"Start running command on {machine.hostname} with {os.path.basename(file_path)} ({expected_plan_count} plans)")
+        # Unzip, then verify the extracted plan count — a partial unzip can
+        # otherwise race the background collection script.
+        command = (
+            # Kill leftover workers from a previous run and clear stale stats.
+            # [x]-bracket regex keeps pkill from matching (and killing) this
+            # dispatch shell's own command line.
+            f"sudo pkill -9 -f '[m]imesys_benchmark' 2>/dev/null; "
+            f"pkill -9 -f '[c]ollect_mimesys_data' 2>/dev/null; "
+            f"sudo pkill -9 -f '[b]azel.*mimesys' 2>/dev/null; "
+            f"rm -rf /users/{self.user_name}/results/* 2>/dev/null; "
+            f"cd {remote_execution_plan_path} && "
+            f"rm -f *.h5 && "
+            f"unzip -o {os.path.basename(file_path)} && "
+            f"rm -f {os.path.basename(file_path)} && "
+            f"actual=$(ls plan_*.h5 2>/dev/null | wc -l) && "
+            f'if [ "$actual" -ne {expected_plan_count} ]; then '
+            f'echo "PLAN_COUNT_MISMATCH expected={expected_plan_count} actual=$actual" >&2; exit 9; '
+            f'fi'
+        )
         machine.run_command(
             client=client,
             command=command,
         )
 
         print("Start collection command")
-        mimesys_iters = os.environ.get("MIMESYS_ITERS", "1")
+        mimesys_iters = os.environ.get("MIMESYS_ITERS", "4")
+        # Forward MIMESYS_SLOT_US / MIMESYS_SLEEP to the worker; omitted vars
+        # fall back to worker defaults.
+        env_prefix = f"MIMESYS_ITERS={mimesys_iters}"
+        # MIMESYS_INTERNAL_PROFILING=1 enables the binary's hpcperfstatsd + pqos
+        # collection (per-plan stats-plan_NNN.txt and pqos-plan_NNN.log).
+        internal_prof = os.environ.get("MIMESYS_INTERNAL_PROFILING", "1")
+        env_prefix += f" MIMESYS_INTERNAL_PROFILING={internal_prof}"
+        slot_us = os.environ.get("MIMESYS_SLOT_US")
+        if slot_us:
+            env_prefix += f" MIMESYS_SLOT_US={slot_us}"
+        sleep_env = os.environ.get("MIMESYS_SLEEP")
+        if sleep_env is not None:
+            env_prefix += f" MIMESYS_SLEEP={sleep_env}"
         machine.run_command_background(
             client=client,
-            command=f"cd /users/{self.user_name} && MIMESYS_ITERS={mimesys_iters} bash collect_mimesys_metrics.sh {self.user_name} {self.my_hostname} {destination_path} {host_idx} > collect_mimesys_metrics.log 2>&1"
+            command=f"cd /users/{self.user_name} && {env_prefix} bash collect_mimesys_metrics.sh {self.user_name} {self.my_hostname} {destination_path} {host_idx} > collect_mimesys_metrics.log 2>&1"
         )
 
         print("Sent collection command")
@@ -309,7 +398,7 @@ class Profiler:
 
                     header, parsed_traces = parse_trace_file(stat_fpath)
                     # profiled_metrics = process_trace_fine_grained(parsed_traces, period, duration, include_aggregated_cpu=True)
-                    profiled_metrics = process_trace_all(parsed_traces, include_aggregated_cpu=True)
+                    profiled_metrics = process_trace_all(parsed_traces, include_aggregated_cpu=True); profiled_metrics = _merge_pqos_into_metrics(profiled_metrics, file_path)
                     if not profiled_metrics:
                         continue
 
@@ -349,7 +438,9 @@ class Profiler:
                     med_metrics_list = [value for metrics in med_metrics.values() for value in metrics.values()]
                     std_metrics_list = [value for metrics in std_metrics.values() for value in metrics.values()]
 
-                    plan_stat_pairs.append((actions, avg_metrics_list, med_metrics_list, std_metrics_list))
+                    plan_stat_pairs.append(
+                        (actions, avg_metrics_list, med_metrics_list, std_metrics_list)
+                    )
 
             return plan_stat_pairs
 
@@ -407,7 +498,7 @@ class Profiler:
                 metrics_std_list = []
                 for batch_idx, trial_idx, file_path, ground_truth_path in metrics_file_pair:
                     header, parsed_traces = parse_trace_file(file_path)
-                    profiled_metrics = process_trace_all(parsed_traces)
+                    profiled_metrics = process_trace_all(parsed_traces); profiled_metrics = _merge_pqos_into_metrics(profiled_metrics, file_path)
 
                     with open(ground_truth_path, "r") as f:
                         ground_truth = json.load(f)
@@ -421,13 +512,23 @@ class Profiler:
                         continue
 
                     metrics_weight = [1.0] * len(profiled_metrics)
+                    for _wi, _name in enumerate(profiled_metrics.keys()):
+                        if _name == "memory_bandwidth":
+                            metrics_weight[_wi] = req.membw_reward_weight
+                        elif _name == "l3_cache_usage":
+                            metrics_weight[_wi] = req.llc_reward_weight
 
                     for metric_idx, (target_metric, metrics) in enumerate(profiled_metrics.items()):
                         if target_metric in ground_truth:
                             # emd = wasserstein_distance(metrics, ground_truth[target_metric])
                             m_min, m_max = trace_range.get(target_metric, (0, 0))
 
-                            normalized_metrics = [(m - m_min) / (m_max - m_min + 1e-5) for m_idx, m in enumerate(metrics) if m_idx % 3 == 1]
+                            normalized_metrics = [(m - m_min) / (m_max - m_min + 1e-5) for m_idx, m in enumerate(metrics) if m_idx % req.reward_slice_period == req.reward_slice_offset]
+                            # Drop the warmup-contaminated first measured slot;
+                            # override with MIMESYS_KEEP_FIRST_CURR=1.
+                            if (os.environ.get("MIMESYS_KEEP_FIRST_CURR", "0") != "1"
+                                    and len(normalized_metrics) > 1):
+                                normalized_metrics = normalized_metrics[1:]
                             # normalized_metrics = [m for m in normalized_metrics if m > 0]
                             normalized_ground_truth = [(m - m_min) / (m_max - m_min + 1e-5) for m in ground_truth[target_metric]]
 
@@ -538,10 +639,11 @@ class Profiler:
 
             metrics_file_pair.sort(key=lambda x: x[0])
 
+            _printed_in_epoch = 0
             for batch_idx, trial_idx, file_path, ground_truth_path in metrics_file_pair:
                 try:
                     header, parsed_traces = parse_trace_file(file_path)
-                    profiled_metrics = process_trace_all(parsed_traces)
+                    profiled_metrics = process_trace_all(parsed_traces); profiled_metrics = _merge_pqos_into_metrics(profiled_metrics, file_path)
 
                     with open(ground_truth_path) as f:
                         ground_truth = json.load(f)
@@ -556,17 +658,41 @@ class Profiler:
                     if profiled_metrics is None:
                         continue
 
+                    # Debug: print per-window measured-vs-GT for first N samples
+                    # per epoch (MIMESYS_RL_PRINT_PROFILE=N, default 0 = off).
+                    N_print = int(os.environ.get("MIMESYS_RL_PRINT_PROFILE", "0"))
+                    if N_print > 0 and _printed_in_epoch < N_print:
+                        def _fmt(seq, w=6, p=1):
+                            if not seq: return "[]"
+                            return "[" + ", ".join(f"{float(v):>{w}.{p}f}" for v in seq[:8]) + ("...]" if len(seq) > 8 else "]")
+                        def _g(name): return ground_truth.get(name, [])
+                        def _p(name): return profiled_metrics.get(name, [])
+                        print(f"\n[rl-profile] step={req.step} batch={batch_idx} trial={trial_idx} (sample {_printed_in_epoch+1}/{N_print}):", flush=True)
+                        for k in ("avg_cpu_utilizations_core_00", "io_read", "io_write",
+                                  "l3_cache_usage", "memory_bandwidth_read", "memory_bandwidth_write",
+                                  "pqos_ipc", "pqos_llc_kb", "pqos_misses"):
+                            print(f"    {k:<32}  gt={_fmt(_g(k))}  meas={_fmt(_p(k))}", flush=True)
+                        _printed_in_epoch += 1
+
                     for target_metric, metrics in profiled_metrics.items():
                         if target_metric not in ground_truth:
                             continue
                         m_min, m_max = trace_range.get(target_metric, (0, 0))
                         denom = (m_max - m_min) + 1e-5
 
-                        # idx % 3 == 1 corresponds to the "current action" segment
+                        # Keep entries at (m_idx % period == offset); see the
+                        # reward_slice_* docs on ProfileRequest.
                         norm_pred = [
                             (m - m_min) / denom
-                            for m_idx, m in enumerate(metrics) if m_idx % 3 == 1
+                            for m_idx, m in enumerate(metrics)
+                            if m_idx % req.reward_slice_period == req.reward_slice_offset
                         ]
+                        # Drop the warmup-contaminated first measured slot
+                        # (matches preprocessing/dataloader.py); override with
+                        # MIMESYS_KEEP_FIRST_CURR=1.
+                        if (os.environ.get("MIMESYS_KEEP_FIRST_CURR", "0") != "1"
+                                and len(norm_pred) > 1):
+                            norm_pred = norm_pred[1:]
                         norm_gt = [(m - m_min) / denom for m in ground_truth[target_metric]]
 
                         if aggregate_time_series:
@@ -609,13 +735,40 @@ class Profiler:
                 except Exception as e:
                     print(f"Error parsing chunk={chunk_idx} batch={batch_idx}: {e}")
 
-        # Aggregate across batches
-        merged_emd: dict = defaultdict(list)
+        # Aggregate across batches with per-family reward weights. merged_emd
+        # stays raw (unweighted, per-key) for the trainer's adaptive weight
+        # logic. cpu sub-keys collapse to a single "cpu" family before
+        # weighting so cpu doesn't dominate the family mean.
+        def _family(name: str) -> str:
+            if name.startswith("avg_cpu_utilizations"): return "cpu"
+            return name
+        def _family_weight(fam: str) -> float:
+            if fam == "memory_bandwidth": return float(req.membw_reward_weight)
+            if fam == "l3_cache_usage":   return float(req.llc_reward_weight)
+            if fam == "io":                return float(req.io_reward_weight)
+            if fam == "cpu":               return float(req.cpu_reward_weight)
+            return 1.0
+        merged_emd: dict = defaultdict(list)   # raw per-key (still includes cpu sub-keys)
         avg_emd_results_by_batch = []
         for emd_dict in emd_results:
             for k, v in emd_dict.items():
                 merged_emd[k].append(v)
-            avg_emd_results_by_batch.append(float(np.mean(list(emd_dict.values()))) if emd_dict else 0.0)
+            if emd_dict:
+                if req.use_raw_mean_reward:
+                    # Flat mean across all metric keys (cpu sub-keys not collapsed).
+                    avg_emd_results_by_batch.append(
+                        float(np.mean(list(emd_dict.values())))
+                    )
+                else:
+                    # Collapse to per-family error, then take the weighted mean.
+                    fam_errs = defaultdict(list)
+                    for m, err in emd_dict.items():
+                        fam_errs[_family(m)].append(err)
+                    fam_means = {f: float(np.mean(v)) for f, v in fam_errs.items()}
+                    weighted = [_family_weight(f) * err for f, err in fam_means.items()]
+                    avg_emd_results_by_batch.append(float(np.mean(weighted)))
+            else:
+                avg_emd_results_by_batch.append(0.0)
 
         avg_emd_by_metrics = dict(merged_emd)
         return avg_emd_by_metrics, avg_emd_results_by_batch, metrics_std_by_batch

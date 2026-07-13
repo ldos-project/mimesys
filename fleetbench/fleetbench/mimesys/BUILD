@@ -172,7 +172,7 @@ cc_library(
         "swissmap/swissmap_benchmark.h",
     ],
     visibility = ["//fleetbench:__pkg__"],
-    linkopts = ["-lpapi"],
+    linkopts = ["-lpapi", "-lpqos", "-lnuma"],
     data = glob(["hashing_distributions/**", "libc_distributions/**", "execution_plans/**", "memstrata_commands/**"]),
     deps = [
         "//fleetbench:dynamic_registrar",

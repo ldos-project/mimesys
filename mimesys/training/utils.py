@@ -1,3 +1,4 @@
+import os
 import h5py
 import numpy as np
 import torch
@@ -103,7 +104,7 @@ def load_transformer_model(cfg: DictConfig, device: str = "cuda") -> Transformer
     return _load_checkpoint(model, cfg.data.transformer_ckpt_path, "trainer_model.", device)
 
 
-def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> GaussianDiffusion:
+def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "dit") -> GaussianDiffusion:
     if model_arch == "unet":
         base_model = TemporalUnetCond(
             input_dim=cfg.unet.input_dim,
@@ -113,6 +114,17 @@ def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> Gau
             dropout=cfg.unet.dropout,
             context_args=cfg.context,
         )
+    elif model_arch == "dit":
+        # DiT 2D transformer denoiser: each (s, t) cell is one token, AdaLN-zero
+        # modulation by (time + context) at every block. Thread count comes from
+        # cfg.unet.input_dim (default 20).
+        from mimesys.models.dit_cond import DiTCond
+        n_threads = int(getattr(cfg.unet, "input_dim", 20))
+        base_model = DiTCond(
+            num_stressors=20,
+            num_threads=n_threads,
+            context_args=cfg.context,
+        )
     else:
         base_model = MLPCond(
             input_dim=cfg.mlp.input_dim,
@@ -120,12 +132,21 @@ def initialize_diffusion_model(cfg: DictConfig, model_arch: str = "unet") -> Gau
             dropout=cfg.mlp.dropout,
             context_args=cfg.context,
         )
-    return GaussianDiffusion(
+    diffusion = GaussianDiffusion(
         model=base_model,
         n_timesteps=cfg.diffusion.n_timesteps,
         clipped_denoised=cfg.diffusion.clipped_denoised,
         **cfg.diffusion.cfg_args,
     )
+    # Optional auxiliary losses (0.0 disables): row-sum→CPU% supervision and an
+    # asymmetric sparsity penalty on idle positions.
+    diffusion.row_sum_aux_weight = float(
+        getattr(cfg.diffusion, "row_sum_aux_weight", 0.0)
+    )
+    diffusion.sparsity_aux_weight = float(
+        getattr(cfg.diffusion, "sparsity_aux_weight", 0.0)
+    )
+    return diffusion
 
 
 def load_model(cfg: DictConfig, model_type: str, model_path: str, device: str):
@@ -167,6 +188,7 @@ def initialize_callbacks(cfg: DictConfig) -> list:
         save_top_k=cfg.checkpoint.save_top_k,
         every_n_epochs=cfg.checkpoint.every_n_epochs,
         save_last=cfg.checkpoint.get("save_last", False),
+        save_on_train_epoch_end=cfg.checkpoint.get("save_on_train_epoch_end", None),
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
     return [checkpoint_callback, lr_monitor]

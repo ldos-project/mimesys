@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import h5py
@@ -20,12 +21,21 @@ class FleetBenchAction:
         return cls(weights=actions)
 
     def to_2d_list(self, num_max_threads: int = 20, transpose: bool = False) -> list[list[float]]:
+        # Plans may differ in stressor count; MIMESYS_PAD_STRESSORS pads each
+        # per-thread vector to that length so batches stack. Default 0 = no padding.
+        target_S = int(os.environ.get("MIMESYS_PAD_STRESSORS", "0"))
         num_actions = len(self.weights[0][0])
-        zero_weights = [0.0] * (num_actions)
+        if target_S > num_actions:
+            pad_per_thread = target_S - num_actions
+        else:
+            pad_per_thread = 0
+        zero_weights = [0.0] * (num_actions + pad_per_thread)
 
         padded_weights_3d = []
         for w in self.weights:
-            padded_weights = w.copy()
+            padded_weights = []
+            for row in w:
+                padded_weights.append(list(row) + [0.0] * pad_per_thread)
             while len(padded_weights) < num_max_threads:
                 padded_weights.append(zero_weights)
             if transpose:

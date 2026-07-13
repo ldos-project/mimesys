@@ -1,6 +1,8 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torch.distributions import Normal
 
@@ -97,11 +99,16 @@ class GaussianDiffusion(nn.Module):
         self.model = model
         self.cfg_drop_prob = cfg_drop_prob
         self.cfg_guide_w = cfg_guide_w
+        # Variance-matching aux loss weight (counters collapse to the
+        # conditional mean); set via env var MIMESYS_DIVERSITY_WEIGHT.
+        self.diversity_weight = float(os.environ.get("MIMESYS_DIVERSITY_WEIGHT", "0"))
 
         if self.cfg_drop_prob > 0:
             print(f"Training with CFG with dropout probability of {self.cfg_drop_prob}")
         if self.cfg_guide_w > 0:
             print(f"Evaluating with CFG with guidance weight of {self.cfg_guide_w}")
+        if self.diversity_weight > 0:
+            print(f"Training with variance-matching aux loss (weight={self.diversity_weight})")
 
     def update_threshold(self, new_threshold):
         """
@@ -283,6 +290,53 @@ class GaussianDiffusion(nn.Module):
         assert noise.shape == noise_pred.shape
 
         loss = self.loss_fn(noise_pred, noise)
+
+        # Variance-matching aux loss: match per-feature variance of predictions
+        # to that of the noise targets, to counter collapse to the conditional
+        # mean (averaging multi-modal actions per cond).
+        if self.diversity_weight > 0.0 and noise_pred.shape[0] > 1:
+            pred_var = noise_pred.flatten(1).var(dim=0)
+            target_var = noise.flatten(1).var(dim=0)
+            diversity_aux = F.mse_loss(pred_var, target_var)
+            loss = loss + self.diversity_weight * diversity_aux
+
+        # Aux supervision on the decoded x0: row_sum matches per-thread stressor
+        # totals to the per-core CPU% target (metric layout is alphabetical:
+        # indices [0:20] = per-core CPU 0..19); enabled when the trainer sets
+        # row_sum_aux_weight / sparsity_aux_weight > 0.
+        row_sum_w = getattr(self, "row_sum_aux_weight", 0.0)
+        sparsity_w = getattr(self, "sparsity_aux_weight", 0.0)
+        if row_sum_w > 0.0 or sparsity_w > 0.0:
+            x0_pred = (
+                xt - extract(self.sqrt_one_minus_alpha_hat, t, x0.shape) * noise_pred
+            ) / extract(self.sqrt_alpha_hat, t, x0.shape)
+            # Label layout: (B, S=stressors, T=threads); S is 13 legacy / 19 v2 / 20 v3.
+            if x0_pred.dim() == 3 and x0_pred.shape[1] in (13, 19, 20) and x0_pred.shape[-1] == 20:
+                # Clamp to [0,1] weight space; without the upper clamp, noise-
+                # prediction errors at high timesteps explode row_sums and let
+                # this aux dominate the base MSE.
+                action_pred = ((x0_pred + 1.0) * 0.5).clamp(0.0, 1.0)
+                row_sums = action_pred.sum(dim=1)                        # sum over stressors -> (B, T=20)
+                # Conditioning is [-1, 1] normalized (v2 dataloader); map back
+                # to [0, 1] to match row_sums' scale.
+                metric = context_cond["metric"]
+                if metric.dim() == 2 and metric.shape[1] >= 20:
+                    cpu_target = ((metric[:, :20] + 1.0) * 0.5).clamp(0, 1)  # (B, 20)
+                    sample_mask = cfg_mask.view(-1, 1)                       # (B, 1)
+
+                    # row_sum aux: symmetric L1 between row_sum and target CPU.
+                    if row_sum_w > 0.0:
+                        aux = F.l1_loss(row_sums * sample_mask,
+                                        cpu_target * sample_mask)
+                        loss = loss + row_sum_w * aux
+
+                    # Sparsity aux: asymmetric — penalize stressor weight on
+                    # threads whose core the cond marks idle (weighted by
+                    # 1 - cpu_target), pushing inactive positions to zero.
+                    if sparsity_w > 0.0:
+                        idle_weight = (1.0 - cpu_target)                     # (B, 20)
+                        sparsity_aux = ((row_sums * idle_weight) * sample_mask).mean()
+                        loss = loss + sparsity_w * sparsity_aux
 
         return loss
 
