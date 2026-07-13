@@ -1,9 +1,8 @@
 # Mimesys
 
 <p align="center">
-    <img src="mimesys.png" alt="Mimesys" width="128">
+    <img src="mimesys.png" alt="Mimesys" width="256">
 </p>
-
 <h2><p align="center">Turn Resource Usage Traces into Executable Workloads 🧬</p></h2>
 
 
