@@ -65,6 +65,29 @@ os.environ["MIMESYS_SLOT_US"] = "1000000"  # 1 s
 os.environ["MIMESYS_ITERS"]   = "4"
 os.environ["MIMESYS_SLEEP"]   = "1"
 
+# ───── prev-action variant sampling (mirrors collect_training_data.py) ─────
+# Per selected curr in round r, we ALSO emit K prev-variant plans [prev, curr]
+# where prev is drawn from the reference pool (rounds 0..r-1, none-current only)
+# via the pipeline:
+#   1. high-resource filter: union of top PREV_HIGH_RESOURCE_FRAC by L3, mem_bw, and
+#      io. Concentrates prev candidates in the strong-carry-over regime.
+#   2. FPS shortlist across (LLC, BW, IO) inside that subset.
+#   3. per-curr random draw of K prevs from the shortlist.
+#
+# Prev-variant plans in prior rounds are excluded from the AL scoring pool
+# (their curr metrics carry prev-carryover contamination) but stay on disk for
+# training downstream.
+#
+# Env-driven; PREV_VARIANTS=0 (default) disables the whole thing → curr-only rounds.
+#
+# PREV_SHORTLIST_MULT — target shortlist size = K * PREV_SHORTLIST_MULT. Larger
+#   values give FPS more candidates to diversify across, so prevs spread further
+#   across the (LLC, BW, IO) space; smaller values concentrate prevs near the
+#   FPS farthest-points. 10 = ~50-200 shortlist for K=2..20.
+K_PREV_VARIANTS     = int(os.environ.get("PREV_VARIANTS",       "0"))   # 0 disables
+PREV_SHORTLIST_MULT = int(os.environ.get("PREV_SHORTLIST_MULT", "10"))
+PREV_HIGH_RESOURCE_FRAC  = float(os.environ.get("PREV_HIGH_RESOURCE_FRAC","0.5"))
+
 
 # ───── seed round_0 from existing collection ─────
 def seed_round0():
@@ -156,28 +179,44 @@ def _load_round_pairs(round_dir):
                     except Exception:
                         pass
                 mets = _merge_pqos_into_metrics(mets, stats_p)
+                # Slot cycle length = n_windows + 1 (each window profiled + one sleep).
+                # For 1-window (none-current) plans: cycle=[curr, sleep], curr at idx 0.
+                # For 2-window (prev-variant) plans: cycle=[prev, curr, sleep], curr at idx 1.
+                n_windows     = int(ep.shape[0])
+                num_slots     = n_windows + 1
+                curr_slot_idx = n_windows - 1
+                is_variant    = (n_windows > 1)
                 metric_vec = []
                 for k in METRIC_KEYS:
                     vals = mets.get(k, [])
-                    # 1-window deploy: (curr, sleep) cycle; take median of curr slots [0::2]
-                    curr = vals[0::2] if len(vals) >= 2 else vals
+                    curr = vals[curr_slot_idx::num_slots] if len(vals) > curr_slot_idx else vals
                     metric_vec.append(float(np.median(curr[1:])) if len(curr) > 1 else 0.0)
-                pairs.append((action, np.array(metric_vec, dtype=np.float32)))
+                pairs.append((action, np.array(metric_vec, dtype=np.float32), is_variant))
             except Exception as e:
                 print(f"  [parse fail] {h5}: {e}")
     return pairs
 
 
 def load_ref_through_round(max_round):
-    """Load (action, raw_metric) pairs from round_0 .. round_max_round."""
+    """Load NONE-CURRENT (action, raw_metric) pairs from round_0 .. round_max_round.
+
+    Prev-variant plans (n_windows>1 h5 files) are skipped for the AL reference
+    pool — their curr metrics carry prev-carryover and would poison hull/FPS
+    scoring. They remain on disk for the training pipeline.
+    """
     all_a, all_m = [], []
     for r in range(max_round + 1):
         rd = f"{OUT_DIR}/round_{r}"
         if not os.path.exists(rd): continue
         pairs = _load_round_pairs(rd)
-        for a, m in pairs:
-            all_a.append(a); all_m.append(m)
-        print(f"  [load] round_{r}: {len(pairs)} samples")
+        n_none = n_var = 0
+        for a, m, is_variant in pairs:
+            if is_variant:
+                n_var += 1
+                continue
+            all_a.append(a); all_m.append(m); n_none += 1
+        tag = f" ({n_var} prev-variants skipped for AL ref)" if n_var else ""
+        print(f"  [load] round_{r}: {n_none} none-current samples{tag}")
     A = np.stack(all_a) if all_a else np.zeros((0, NUM_STRESSORS, NUM_THREADS), np.float32)
     M = np.stack(all_m) if all_m else np.zeros((0, len(METRIC_KEYS)), np.float32)
     return A, M
@@ -813,21 +852,119 @@ def select_top_K(candidates_action, ref_action, ref_metric_raw, K):
     return np.array(sel)
 
 
+# ───── prev-action variant sampling (mirrors collect_training_data.build_prev_variants) ─────
+import random
+
+def _fps_indices(X, k):
+    """Farthest-point sampling: k row indices of X spread across the normalized
+    metric space (maximin → reaches the extremes). Copied from
+    collect_training_data._fps_indices."""
+    X = np.asarray(X, dtype=float)
+    n = len(X)
+    if n <= k:
+        return list(range(n))
+    mn, mx = X.min(0), X.max(0)
+    rng = np.where(mx - mn > 0, mx - mn, 1.0)
+    Xn = (X - mn) / rng
+    chosen = [int(np.argmax(np.linalg.norm(Xn - Xn.mean(0), axis=1)))]  # farthest from centroid
+    for _ in range(k - 1):
+        d = np.min([np.linalg.norm(Xn - Xn[c], axis=1) for c in chosen], axis=0)
+        chosen.append(int(np.argmax(d)))
+    return chosen
+
+
+def _prev_filter_axes(ref_M):
+    """Return (llc, bw, io) 1-D arrays per pool sample from ref_M (N, 28)."""
+    idx = {k: i for i, k in enumerate(METRIC_KEYS)}
+    def _col(name): return ref_M[:, idx[name]] if name in idx else np.zeros(ref_M.shape[0])
+    def _sum_cols(names): return sum(_col(n) for n in names)
+    llc = _col("l3_cache_usage")
+    bw  = _sum_cols(("memory_bandwidth_read", "memory_bandwidth_write"))
+    io  = _sum_cols(("io_read", "io_write"))
+    return llc, bw, io
+
+
+def build_prev_variants(curr_TS_list, ref_A, ref_M,
+                        k=None, shortlist_mult=None,
+                        high_resource_frac=None,
+                        seed=0):
+    """For each chosen curr, build one variant plan [prev, curr] per drawn prev.
+
+    Pipeline:
+      1. high-resource filter: union of top `high_resource_frac` by LLC, BW, and IO.
+      2. FPS-diverse shortlist over the (LLC, BW, IO) subspace within that subset
+         (~k * shortlist_mult prevs).
+      3. draw k prevs at random per curr → k variant plans per curr.
+
+    Args:
+      curr_TS_list: list of (T=20, S=20) list-of-lists curr-action windows
+                     (already write-ready).
+      ref_A:  (N_pool, S, T) reference pool of collected NONE-CURRENT actions.
+      ref_M:  (N_pool, len(METRIC_KEYS)) matching metric vectors.
+
+    Returns list of [prev_TS, curr_TS] 2-window plans, both (T, S) lists, ready
+    for write_actions_to_execution_plans. Returns [] if k<=0 or pool empty.
+    """
+    k              = K_PREV_VARIANTS     if k              is None else k
+    shortlist_mult = PREV_SHORTLIST_MULT if shortlist_mult is None else shortlist_mult
+    high_resource_frac  = PREV_HIGH_RESOURCE_FRAC  if high_resource_frac  is None else high_resource_frac
+
+    if k <= 0 or ref_A is None or ref_A.shape[0] == 0:
+        return []
+
+    N_pool = ref_A.shape[0]
+    llc, bw, io = _prev_filter_axes(ref_M)
+
+    # 1. high-resource union across LLC, BW, IO
+    keep = max(k, int(np.ceil(N_pool * high_resource_frac)))
+    top_llc = set(np.argsort(llc)[-keep:].tolist())
+    top_bw  = set(np.argsort(bw)[-keep:].tolist())
+    top_io  = set(np.argsort(io)[-keep:].tolist())
+    hi_idx  = np.array(sorted(top_llc | top_bw | top_io), dtype=int)
+
+    # 2. FPS shortlist over (LLC, BW, IO) inside the subset
+    axis_sub = np.stack([llc[hi_idx], bw[hi_idx], io[hi_idx]], axis=1)
+    n_short = min(len(hi_idx), max(k, k * shortlist_mult))
+    short_local = _fps_indices(axis_sub, n_short)
+    short_idxs = [int(hi_idx[i]) for i in short_local]
+
+    llcs = [float(llc[i]) for i in short_idxs]
+    bws  = [float(bw[i])  for i in short_idxs]
+    ios  = [float(io[i])  for i in short_idxs]
+    print(f"  [prev] pool={N_pool}, hi-subset={len(hi_idx)}, "
+          f"shortlist={n_short} (k={k}, mult={shortlist_mult})")
+    print(f"  [prev] shortlist LLC {min(llcs):.0f}-{max(llcs):.0f}  "
+          f"BW {min(bws):.1f}-{max(bws):.1f}  IO {min(ios):.0f}-{max(ios):.0f}")
+
+    # 3. per-curr random draw of k prevs
+    rng = random.Random(seed)
+    variants = []
+    for curr_TS in curr_TS_list:
+        for prev_idx in rng.sample(short_idxs, min(k, len(short_idxs))):
+            prev_TS = ref_A[prev_idx].T.tolist()   # (S, T) → (T, S) write layout
+            variants.append([prev_TS, curr_TS])
+    print(f"  [prev] emitted {len(variants)} variant plans "
+          f"({len(curr_TS_list)} currs × {k} prevs)")
+    return variants
+
+
 # ───── dispatch helpers ─────
-def write_round(round_idx, selected_actions):
-    """selected_actions: (K, 19, 20) raw [0,1]. Wrap as [NONE_PREV, curr] in (T=20, S=19)
-    layout and write to chunks 0..H-1."""
-    plans_for_dispatch = []
-    for sa in selected_actions:
-        # (S=19, T=20) -> need to write to h5 as (W, T=20, S=19) — match the existing convention
-        curr = sa.T.tolist()                        # (T=20, S=19)
-        plans_for_dispatch.append([NONE_PREV, curr])
+def write_round(round_idx, plans_list):
+    """plans_list: iterable of [prev_window, curr_window] python lists where each
+    window is (T=20, S=20) list-of-lists. A prev_window equal to NONE_PREV
+    (all-zero) is dropped by write_actions_to_execution_plans so none-current
+    plans become 1-window h5; real prev-variant plans stay 2-window."""
     dest = f"{OUT_DIR}/round_{round_idx}"
     os.makedirs(dest, exist_ok=True)
-    write_actions_to_execution_plans(plans_for_dispatch, dest, HOSTS)
+    write_actions_to_execution_plans(list(plans_list), dest, HOSTS)
     n_h5 = len(glob.glob(f"{dest}/chunk_*/plans/plan_*.h5"))
     print(f"  [write] round_{round_idx}: {n_h5} h5 files across {H} chunks")
     return dest
+
+
+def _wrap_none_current(actions_STK):
+    """Wrap (K, S, T) actions as list of [NONE_PREV, (T, S) list-of-lists]."""
+    return [[NONE_PREV, sa.T.tolist()] for sa in actions_STK]
 
 
 def preclean_workers():
@@ -893,14 +1030,15 @@ def main():
         my_hostname=worker_config.MY_HOSTNAME,
     ))
 
-    # Round 0: fresh random-sample collection (no REF, no selector).
+    # Round 0: fresh random-sample collection (no REF, no selector). Curr-only
+    # sweep — prev-variants only fire from round_1 once a pool exists.
     r0_chosen = seed_round0()
     if r0_chosen is not None:
         round_dir = f"{OUT_DIR}/round_0"
         print(f"[round_0] selected K_thread mean=⟨{((r0_chosen.sum(1) > 0.5).sum(1)).mean():.2f}⟩  "
               f"K_stressor mean=⟨{((r0_chosen.sum(2) > 0.5).sum(1)).mean():.2f}⟩  "
               f"max_w=⟨{r0_chosen.max(axis=(1,2)).mean():.3f}⟩")
-        write_round(0, r0_chosen)
+        write_round(0, _wrap_none_current(r0_chosen))
         print(f"[round_0] pre-cleaning stale validation zips on workers …")
         preclean_workers()
         stop_event = threading.Event()
@@ -915,12 +1053,23 @@ def main():
         np.save(f"{round_dir}/chosen_actions.npy", r0_chosen)
         print(f"[round_0] done")
 
+    # Total plans per round = curr-only (N_SELECT) + K prev-variants each.
+    plans_per_round = N_SELECT * (1 + K_PREV_VARIANTS)
+
     for r in range(1, N_ROUNDS_NEW + 1):
         round_dir = f"{OUT_DIR}/round_{r}"
         if os.path.exists(round_dir):
             n_stats = len(glob.glob(f"{round_dir}/chunk_*/results/stats-plan_*.txt"))
-            if n_stats >= N_SELECT * 0.9:
-                print(f"\n=== round_{r} already done ({n_stats} stats) — skipping ===")
+            # `chosen_actions.npy` is written at the very end of a completed
+            # round → treat its presence as "done under whatever config ran",
+            # so pre-existing rounds (collected before PREV_VARIANTS was set)
+            # aren't re-attempted just because the new expected plan count is
+            # higher. n_stats check remains as a fallback for rounds that
+            # landed without the marker.
+            done_marker = os.path.exists(f"{round_dir}/chosen_actions.npy")
+            if done_marker or n_stats >= plans_per_round * 0.9:
+                reason = "marker" if done_marker else f"{n_stats}/{plans_per_round} stats"
+                print(f"\n=== round_{r} already done ({reason}) — skipping ===")
                 continue
 
         print(f"\n=== Round {r} ===")
@@ -998,9 +1147,32 @@ def main():
               f"K_stressor mean=⟨{((chosen.sum(2) > 0.5).sum(1)).mean():.2f}⟩  "
               f"max_w=⟨{chosen.max(axis=(1,2)).mean():.3f}⟩")
 
+        # 3b. (Optional) build K prev-variants per curr from the current REF
+        #     pool. Variants are [prev, curr] 2-window plans; the "curr" side
+        #     matches the chosen curr, and prev is drawn from an FPS-shortlist
+        #     spanning the high-resource region of the pool (LLC + BW + IO).
+        #
+        #     Interleave contiguous-per-curr so each curr's plans land on the
+        #     SAME worker chunk (write_actions_to_execution_plans slices the
+        #     batch sequentially across HOSTS). Same-host NONE↔PREV kills the
+        #     host-id confound in carry-over measurement.
+        curr_TS_list = [sa.T.tolist() for sa in chosen]     # (T=20, S=20)
+        none_plans   = [[NONE_PREV, c] for c in curr_TS_list]
+        prev_variants = build_prev_variants(curr_TS_list, ref_A, ref_M, seed=r) \
+                        if K_PREV_VARIANTS > 0 else []
+
+        batch = []
+        for i in range(len(curr_TS_list)):
+            batch.append(none_plans[i])
+            batch.extend(prev_variants[i * K_PREV_VARIANTS : (i + 1) * K_PREV_VARIANTS])
+        if prev_variants:
+            print(f"[round_{r}] batch: {len(none_plans)} curr-only + {len(prev_variants)} "
+                  f"prev-variants = {len(batch)} plans (contiguous-per-curr, "
+                  f"same-host NONE↔PREV)")
+
         # 4. Write h5 + dispatch + start parallel puller before profile_actions
         #    (otherwise profile_actions blocks waiting for validation-N.zip)
-        write_round(r, chosen)
+        write_round(r, batch)
         print(f"[round_{r}] pre-cleaning stale validation zips on workers …")
         preclean_workers()
         stop_event = threading.Event()
