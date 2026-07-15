@@ -27,7 +27,7 @@ model:
     input_dim: 28
     latent_dim: 10
   context:
-    action_dim: 33
+    action_dim: 40   # default 'transformer' encoder: stressor sums (20) + thread sums (20)
     dropout: 0.1
     hidden_dim: 256
     input_dim: 28

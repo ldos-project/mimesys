@@ -197,7 +197,7 @@ model:
     input_dim: 20           # thread dimension of the action grid
   context:
     input_dim: 23           # trace feature dimension
-    action_dim: 33
+    action_dim: 40
     num_heads: 4
     num_layers: 6
     hidden_dim: 256
@@ -326,7 +326,11 @@ Using the generated `h5` file, you can run a synthetic workload on a target mach
 ```bash
 # From the `fleetbench` directory on the target machine:
 
-# Copy the h5 file to the machine first, then place it in the execution plans directory
+# Copy the h5 file to the machine first, then place it in the execution plans directory.
+# Remove the empty plan_0.h5 placeholder left by the installer — the benchmark
+# aborts on non-HDF5 files (the placeholder only exists to satisfy the BUILD glob,
+# which any real plan satisfies too).
+rm -f fleetbench/mimesys/execution_plans/plan_0.h5
 cp execution_plan_series.h5 fleetbench/mimesys/execution_plans/
 
 # Run the synthetic workload (HOME_PATH = directory containing fleetbench/ and HPCPerfStats/)

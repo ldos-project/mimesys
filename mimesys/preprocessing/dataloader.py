@@ -609,6 +609,24 @@ class CustomDataLoader(pl.LightningDataModule):
         data, metrics_range_dict = self._load_or_build_training_data(file_path, max_time_steps)
         self.trace_range = metrics_range_dict
 
+        # Optional tail-focused oversampling: MIMESYS_TAIL_OVERSAMPLE=K
+        # (default 1, off) duplicates, K-1 extra times and BEFORE augmentation,
+        # the samples listed in <data_path>/ablation_eval_sets.pkl 'tail'
+        # (has-prev samples whose measured curr metrics shifted >3x the
+        # profiling-noise floor vs their no-prev anchor). These are the only
+        # samples where prev conditioning demonstrably matters; without
+        # reweighting they are ~3% of the gradient and the prev pathway is
+        # never learned. Indices refer to the cached training_data.pkl order.
+        _tail_ovs = int(os.environ.get("MIMESYS_TAIL_OVERSAMPLE", "1"))
+        if _tail_ovs > 1:
+            import pickle as _pkl
+            with open(Path(file_path) / "ablation_eval_sets.pkl", "rb") as _f:
+                _tail_idx = _pkl.load(_f)["tail"]
+            extra = [data[i] for i in _tail_idx for _ in range(_tail_ovs - 1)]
+            data = data + extra
+            print(f"[tail-oversample] x{_tail_ovs}: {len(_tail_idx)} tail samples "
+                  f"→ +{len(extra)} duplicates, {len(data)} total (pre-aug)")
+
         if aug_factor > 1 or high_io_aug_factor > 1:
             mode = "intra-socket only" if intra_only_aug else "intra-socket + socket-swap"
             print(f"Augmenting training data by {aug_factor}x ({mode}), "
@@ -636,6 +654,19 @@ class CustomDataLoader(pl.LightningDataModule):
         random.shuffle(data)
         val_data   = data[: len(data) // 10]
         train_data = data[len(data) // 10 :]
+
+        # Optional has-prev oversampling: MIMESYS_PREV_OVERSAMPLE=K (default 1,
+        # off) duplicates every train sample that carries a real prev_label
+        # K-1 extra times. Only ~25% of collected samples have a prev and its
+        # metric effect is second-order, so the prev-conditioning pathway is
+        # otherwise gradient-starved (models learn to ignore prev).
+        _prev_ovs = int(os.environ.get("MIMESYS_PREV_OVERSAMPLE", "1"))
+        if _prev_ovs > 1:
+            extra = [d for d in train_data if d.get("prev_label") is not None] * (_prev_ovs - 1)
+            train_data = train_data + extra
+            random.shuffle(train_data)
+            print(f"[prev-oversample] x{_prev_ovs}: +{len(extra)} has-prev duplicates "
+                  f"→ {len(train_data)} train samples")
 
         # Optional importance weights for WeightedRandomSampler:
         # MIMESYS_DENSITY_TARGET_PCMEAN (default 0, no weighting) biases sampling

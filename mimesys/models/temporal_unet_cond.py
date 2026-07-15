@@ -183,6 +183,42 @@ class ConcatContextEncoder(nn.Module):
         return self.head(x)
 
 
+class PrevSumsContextEncoder(nn.Module):
+    """metrics_only context + zero-init additive embedding of the prev action's
+    per-stressor sums.
+
+    Motivated by union_v2 data analysis (2026-07): the systematic effect of
+    prev on curr metrics is (a) second-order — mostly below the profiling
+    noise floor, with an ~11% tail of large LLC/BW/IPC shifts — and (b) fully
+    captured by the prev's per-stressor aggregate composition (ridge R^2 of
+    delta-metrics from 20-dim stressor sums matches the full 400-dim grid;
+    per-thread layout carries nothing). So:
+      * prev enters as 20 sums in weight space ([0,1]; no-prev == all zeros),
+        avoiding the mostly-constant flattened-grid input that makes
+        ConcatContextEncoder ill-conditioned under DiT/AdaLN;
+      * the prev head's output layer is zero-init, so the model starts exactly
+        equivalent to metrics_only and learns to use prev only where the data
+        supports it.
+    """
+    def __init__(self, cfg: DictConfig, num_stressors: int = 20):
+        super().__init__()
+        self.metrics = MetricsOnlyContextEncoder(cfg)
+        h = int(cfg.hidden_dim)
+        self.prev_head = nn.Sequential(
+            nn.Linear(num_stressors, h),
+            nn.Mish(),
+            nn.Linear(h, int(cfg.context_dim)),
+        )
+        nn.init.zeros_(self.prev_head[-1].weight)
+        nn.init.zeros_(self.prev_head[-1].bias)
+
+    def forward(self, context_cond, **kwargs):
+        ctx = self.metrics(context_cond)
+        prev = context_cond['prev_action']              # (B, S, T) in [-1, 1]
+        sums = ((prev + 1.0) * 0.5).sum(dim=2) / prev.shape[2]   # (B, S) in [0, 1]
+        return ctx + self.prev_head(sums)
+
+
 class ConcatSymContextEncoder(nn.Module):
     """Concat with symmetric (sum_row + sum_col) action encoding: permutation-
     invariant on threads and stressors.
