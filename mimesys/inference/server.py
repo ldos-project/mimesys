@@ -678,6 +678,14 @@ def _profile_sync(req: ProfileRequest, emit) -> dict:
                 f"cd /users/{cfg.profiler.user_name}/fleetbench/execution_plans/ "
                 f"&& rm -f *.h5 && unzip -o chunk_0.zip && rm chunk_0.zip"
             ))
+            # Clear stale results from any previous run: the result filenames
+            # (stats-plan_*.txt) are reused across jobs, so leftovers would be
+            # collected as if they were this run's output if the benchmark
+            # produced nothing.
+            machine.run_command(client=client, command=(
+                f"rm -f /users/{cfg.profiler.user_name}/results/stats-plan_*.txt "
+                f"/users/{cfg.profiler.user_name}/results/pqos-plan_*.log"
+            ))
 
             # ── 5. Benchmark ─────────────────────────────────────────────────
             emit("benchmarking", "Starting benchmark on remote worker...", 30)
@@ -685,6 +693,7 @@ def _profile_sync(req: ProfileRequest, emit) -> dict:
                 client=client,
                 command=(
                     f"cd /users/{cfg.profiler.user_name}/fleetbench && "
+                    f"MIMESYS_INTERNAL_PROFILING=1 "
                     f"bash collect_mimesys_data.sh 2>&1"
                 ),
                 emit=emit,
@@ -824,6 +833,12 @@ def _profile_series_sync(req: ProfileSeriesRequest, emit) -> dict:
                 f"cd /users/{cfg.profiler.user_name}/fleetbench/execution_plans/ "
                 f"&& rm -f *.h5 && unzip -o chunk_0.zip && rm chunk_0.zip"
             ))
+            # Clear stale results (filenames are reused across jobs — see the
+            # same guard in the single-shot profile path).
+            machine.run_command(client=client, command=(
+                f"rm -f /users/{cfg.profiler.user_name}/results/stats-plan_*.txt "
+                f"/users/{cfg.profiler.user_name}/results/pqos-plan_*.log"
+            ))
 
             # ── 6. Benchmark — ITERS=1 SLEEP=0 ──────────────────────────────
             emit("benchmarking", "Starting time-series benchmark on remote worker...", 33)
@@ -831,7 +846,7 @@ def _profile_series_sync(req: ProfileSeriesRequest, emit) -> dict:
                 client=client,
                 command=(
                     f"cd /users/{cfg.profiler.user_name}/fleetbench && "
-                    f"MIMESYS_ITERS=1 MIMESYS_SLEEP=0 "
+                    f"MIMESYS_ITERS=1 MIMESYS_SLEEP=0 MIMESYS_INTERNAL_PROFILING=1 "
                     f"bash collect_mimesys_data.sh 2>&1"
                 ),
                 emit=emit,
@@ -1134,13 +1149,18 @@ def _profile_series_sync_with_plan(
                 f"cd /users/{cfg.profiler.user_name}/fleetbench/execution_plans/ "
                 f"&& rm -f *.h5 && unzip -o chunk_0.zip && rm chunk_0.zip"
             ))
+            # Clear stale results (filenames are reused across jobs).
+            machine.run_command(client=client, command=(
+                f"rm -f /users/{cfg.profiler.user_name}/results/stats-plan_*.txt "
+                f"/users/{cfg.profiler.user_name}/results/pqos-plan_*.log"
+            ))
 
             emit("benchmarking", "Starting benchmark on remote worker...", 33)
             bench_lines = _run_benchmark_streaming(
                 client=client,
                 command=(
                     f"cd /users/{cfg.profiler.user_name}/fleetbench && "
-                    f"MIMESYS_ITERS=1 MIMESYS_SLEEP=0 "
+                    f"MIMESYS_ITERS=1 MIMESYS_SLEEP=0 MIMESYS_INTERNAL_PROFILING=1 "
                     f"bash collect_mimesys_data.sh 2>&1"
                 ),
                 emit=emit,

@@ -26,6 +26,7 @@ from mimesys.models.temporal_unet_cond import (
     TransformerFullContextEncoder,
     PerPositionFiLMEncoder,
     ConcatContextEncoder,
+    PrevSumsContextEncoder,
 )
 
 
@@ -43,6 +44,8 @@ def _build_encoder(context_args):
         return PerPositionFiLMEncoder(context_args), True   # returns per-thread
     if enc_type == "concat":
         return ConcatContextEncoder(context_args), False
+    if enc_type == "prev_sums":
+        return PrevSumsContextEncoder(context_args), False
     raise ValueError(f"DiTCond: unsupported encoder_type {enc_type}")
 
 
@@ -210,6 +213,33 @@ class DiTCond(nn.Module):
                 self.context_encoding = PerPositionFiLMEncoder(context_args)
                 self._ctx_is_per_position = True
 
+        # Prev-action conditioning. 'none' (default) — prev_action reaches the
+        # model only if the context encoder consumes it. 'token' — each (s, t)
+        # token additionally receives its own prev_action[s, t] scalar through a
+        # shared Linear(1, d) head added to the token embedding. This keeps prev
+        # conditioning spatially aligned with the token grid and avoids the
+        # flattened-400-dim concat pathway: with mostly-(-1) sparse prev grids,
+        # a global concat MLP develops a 400-wide coherent bias direction whose
+        # gradient is ~400x a normal bias's, which AdaLN then amplifies
+        # multiplicatively (no post-modulation norm) — unstable at lr=1e-4.
+        self.prev_cond_mode = os.environ.get(
+            "MIMESYS_DIT_PREV_COND",
+            str(getattr(context_args, "prev_cond_mode", "none")))
+        if self.prev_cond_mode == "token":
+            self.prev_proj = nn.Sequential(
+                nn.Linear(1, d_model), nn.Mish(),
+                nn.Linear(d_model, d_model),
+            )
+            # MIMESYS_PREV_FREEZE=1: ablation control — keep the prev_proj
+            # module but hard-wire its input to the all-(-1) "no prev" grid,
+            # so the module can only act as learned per-token structure and
+            # never sees real history. Separates architectural-prior gains
+            # from genuine history conditioning.
+            self.prev_freeze = os.environ.get("MIMESYS_PREV_FREEZE", "0") == "1"
+            print(f"[dit] prev_cond_mode=token — per-token prev_action bias active"
+                  f"{' (FROZEN to -1)' if self.prev_freeze else ''}",
+                  flush=True)
+
         self.cond_dim = time_dim + context_dim
         self.blocks   = nn.ModuleList([
             DiTBlock(d_model, num_heads, mlp_ratio, dropout, self.cond_dim)
@@ -248,6 +278,16 @@ class DiTCond(nn.Module):
                 thread_bias = thread_bias * self._bias_stressor_mask.view(1, S, 1, 1)
             thread_bias = thread_bias.reshape(B, S * T, self.d_model)
             tokens = tokens + thread_bias
+
+        # 'token' prev conditioning: add each cell's prev weight to its token.
+        # CFG-masked like the rest of the conditioning so the unconditional
+        # branch stays truly unconditional.
+        if self.prev_cond_mode == "token":
+            prev = context_cond['prev_action']
+            if getattr(self, "prev_freeze", False):
+                prev = torch.full_like(prev, -1.0)
+            prev = prev.reshape(B, S * T, 1)                          # (B, N, 1)
+            tokens = tokens + self.prev_proj(prev) * cfg_mask.view(-1, 1, 1)
 
         # Time + (CFG-masked) context → cond.
         time_emb = self.time_encoding(t)                            # (B, time_dim)

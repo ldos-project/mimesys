@@ -58,7 +58,7 @@ model:
     dropout: 0.1
   context:
     input_dim: 28
-    action_dim: 33
+    action_dim: 40
     num_heads: 4
     num_layers: 6
     hidden_dim: 256
