@@ -351,3 +351,24 @@ uv run python -m mimesys.inference.client profile-from-file \
     --output metrics.png
 ```
 
+
+---
+
+## Citation
+
+If you use Mimesys in your research, please cite our [OSDI '26 paper](https://www.usenix.org/conference/osdi26/presentation/kim-donghyun):
+
+```bibtex
+@inproceedings{mimesys-osdi26,
+	author = {Donghyun Kim and Zichao Hu and Joydeep Biswas and Aditya Akella and Daehyeok Kim},
+	title = {Mimesys: Generating Realistic Executable Testing Environments from Resource Usage Traces},
+	booktitle = {20th USENIX Symposium on Operating Systems Design and Implementation (OSDI 26)},
+	year = {2026},
+	isbn = {978-1-939133-55-7},
+	address = {Seattle, WA},
+	pages = {2205--2221},
+	url = {https://www.usenix.org/conference/osdi26/presentation/kim-donghyun},
+	publisher = {USENIX Association},
+	month = jul
+}
+```
