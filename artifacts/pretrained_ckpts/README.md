@@ -1,4 +1,4 @@
-# Pretrained checkpoints — union_v2 (2026-07)
+# Pretrained checkpoints (CloudLab c220g5)
 
 DiT diffusion denoisers pretrained for 300 epochs (61 collection rounds, 17,448 samples, aug ×20).
 Given a 28-metric hardware trace, the model generates a mimesys
